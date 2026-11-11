@@ -58,3 +58,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-windows-tests.ps1
 # Rust 命令桥白名单单测
 cargo test --manifest-path desktop\src-tauri\Cargo.toml
 ```
+
+---
+
+## 4. 跟进上游
+
+仓库的 `upstream` 分支只保存上游 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 中与本项目相关的文件子集（`AGENTS.md`、`LICENSE`、`README.md`、`SECURITY.md`、`windows/`、`tests/windows-*.ps1`），`main` 在它之上做 EnvGuard 改动，因此可以用 Git 三方合并跟进上游。工具页的「检查上游更新」会列出还没合并的上游提交。
+
+在仓库根目录执行（用独立 worktree 导入上游，不动主工作区）：
+
+```powershell
+$up = "$env:TEMP\cs-upstream"
+git clone https://github.com/YOURSJEYO/claude-switcher.git $up   # 之后改用: git -C $up pull
+$wt = "$env:TEMP\eg-upstream"
+git worktree add $wt upstream
+Push-Location $wt
+git --git-dir="$up\.git" --work-tree=. checkout origin/main -- AGENTS.md LICENSE README.md SECURITY.md windows ':(glob)tests/windows-*.ps1'
+git add -A
+git commit -m "upstream: import claude-switcher main@<短哈希> (Windows release subset)"
+Pop-Location
+git -C $up reset -q
+git worktree remove $wt
+git merge upstream
+```
+
+上游若删除了子集中的文件，导入时要在 worktree 里同步 `git rm`。合并后把 `windows\claude-switch.ps1` 中的 `$UPSTREAM_MERGED` 改成上游 main 的完整哈希，跑通全部测试再提交。

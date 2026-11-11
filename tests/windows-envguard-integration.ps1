@@ -20,7 +20,7 @@ foreach ($path in @($core, $install)) {
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ('cs-envguard-it-' + [guid]::NewGuid().ToString('N'))
 $savedEnv = @{}
-foreach ($name in @('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'TZ', 'ANTHROPIC_API_KEY')) {
+foreach ($name in @('USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'TZ', 'ANTHROPIC_API_KEY', 'ENVGUARD_APP_VERSION')) {
     $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 $env:USERPROFILE = Join-Path $root 'user'
@@ -30,6 +30,7 @@ $env:TEMP = Join-Path $root 'temp'
 $env:TMP = $env:TEMP
 [Environment]::SetEnvironmentVariable('TZ', $null)
 [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', $null)
+[Environment]::SetEnvironmentVariable('ENVGUARD_APP_VERSION', $null)
 foreach ($d in @($env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA, $env:TEMP)) {
     New-Item -ItemType Directory -Path $d -Force | Out-Null
 }
@@ -364,6 +365,56 @@ try {
     [System.IO.File]::WriteAllText($runtimePath, ($badRuntime | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
     $state = Read-UiState (Invoke-CoreProcess $bundled @('uistate') '' $profileC)
     Assert '运行时配置中的非法国家与时区被忽略' ($state -and $state.country_target -eq 'JP' -and $state.iana_tz_target -eq 'Asia/Tokyo')
+
+    # 诊断导出：版本号取 EnvGuard 自身，检查结果与日志里的 IP 不进诊断包
+    $profileD = Join-Path $root 'user-d'
+    $baseD = Join-Path $profileD '.claude-switcher'
+    New-Item -ItemType Directory -Path (Join-Path $baseD 'logs') -Force | Out-Null
+    [System.IO.File]::WriteAllLines((Join-Path $baseD 'last-check.txt'), [string[]]@('出口IP=ok:203.0.113.9', '时区=ok'), (New-Object System.Text.UTF8Encoding($true)))
+    [System.IO.File]::WriteAllText((Join-Path $baseD 'logs\client.log'), "2026-11-11T00:00:00Z version=2.0.0 command=uistate exit=0 duration_ms=12`n2026-11-11T00:00:01Z version=2.0.0 command=uistate exit=0 duration_ms=12 出口IP=203.0.113.9`n", (New-Object System.Text.UTF8Encoding($false)))
+    $zip = Join-Path $root 'diagnostics.zip'
+    $env:ENVGUARD_APP_VERSION = '2.0.0'
+    $r = Invoke-CoreProcess $core @('export-diagnostics', "`"$zip`"") '' $profileD
+    [Environment]::SetEnvironmentVariable('ENVGUARD_APP_VERSION', $null)
+    $unzipped = Join-Path $root 'diagnostics'
+    if (Test-Path -LiteralPath $zip) { Expand-Archive -LiteralPath $zip -DestinationPath $unzipped -Force }
+    $packed = if (Test-Path -LiteralPath $unzipped) { (Get-ChildItem -LiteralPath $unzipped -File | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n" } else { '' }
+    $envJson = if (Test-Path -LiteralPath (Join-Path $unzipped 'environment.json')) { Get-Content -LiteralPath (Join-Path $unzipped 'environment.json') -Raw | ConvertFrom-Json } else { $null }
+    Assert '诊断包导出成功且版本取 EnvGuard 自身' ($r.Exit -eq 0 -and $envJson -and $envJson.app_version -eq '2.0.0') "输出=$($r.Out) 错误=$($r.Err)"
+    Assert '诊断包不含检查结果与日志里的 IP' ($packed -and $packed -notmatch '203\.0\.113\.9' -and $packed -match 'command=uistate')
+
+    # 版本号与上游更新检查（订阅打桩）
+    $env:ENVGUARD_APP_VERSION = '2.0.0'
+    Assert 'EnvGuard 调用时版本取应用自身' ((Get-AppVersion) -eq '2.0.0')
+    $env:ENVGUARD_APP_VERSION = 'x;Remove-Item'
+    Assert '非法版本号不被采用' ((Get-AppVersion) -eq 'unknown')
+    [Environment]::SetEnvironmentVariable('ENVGUARD_APP_VERSION', $null)
+    function New-AtomFeed([string[]]$Shas) {
+        $entries = foreach ($sha in $Shas) {
+            $title = if ($sha.StartsWith('a')) { 'fix(windows): sample fix' } else { 'docs: sample note' }
+            "<entry><id>tag:github.com,2008:Grit::Commit/$sha</id><updated>2026-11-12T01:00:00Z</updated><title>$title</title></entry>"
+        }
+        return '<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom">' + ($entries -join '') + '</feed>'
+    }
+    $script:feed = ''
+    $script:feedFails = $false
+    function Invoke-WebRequest {
+        [CmdletBinding()]
+        param($Uri, $UserAgent, [switch]$UseBasicParsing, $TimeoutSec)
+        if ($script:feedFails) { throw 'offline' }
+        [pscustomobject]@{ Content = $script:feed }
+    }
+    $script:feed = New-AtomFeed @($UPSTREAM_MERGED, ('b' * 40))
+    Assert '上游没有新提交时报告已同步' ((@(Invoke-UpstreamStatus))[0] -match '^OK:.*暂无新提交')
+    $script:feed = New-AtomFeed @(('a' * 40), ('c' * 40), $UPSTREAM_MERGED)
+    $out = @(Invoke-UpstreamStatus)
+    Assert '列出未合并的上游提交并统计 Windows 相关' ($out[0] -match '^WARN:上游 main 有 2 个新提交.*其中 1 个' -and ($out -join "`n") -match 'aaaaaaa fix\(windows\)') "输出=$($out -join ' | ')"
+    $script:feed = New-AtomFeed @(('d' * 40), ('e' * 40))
+    Assert '订阅里找不到已合并提交时只报下限' ((@(Invoke-UpstreamStatus))[0] -match '至少有 2 个新提交')
+    $script:feedFails = $true
+    $script:exitCode = 0
+    $out = @(Invoke-UpstreamStatus)
+    Assert '读不到订阅时返回 FAIL' ($out[0] -match '^FAIL:' -and $script:exitCode -eq 1)
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }

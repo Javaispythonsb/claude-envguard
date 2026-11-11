@@ -119,7 +119,7 @@ $CLASH_DIR = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
 # check-update / rules-status / diagnose-proxy / 只读 uistate 不在检查路径上创建任何目录
-if ($args.Count -eq 0 -or ($args[0] -notin @('check-update','rules-status','diagnose-proxy') -and -not ($args[0] -eq 'uistate' -and ($args.Count -lt 2 -or $args[1] -ne '--fresh')))) {
+if ($args.Count -eq 0 -or ($args[0] -notin @('check-update','rules-status','diagnose-proxy','upstream-status') -and -not ($args[0] -eq 'uistate' -and ($args.Count -lt 2 -or $args[1] -ne '--fresh')))) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
 }
 
@@ -127,6 +127,8 @@ function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Out-File -Ap
 
 # 当前安装版本(安装器/更新器写入 version.txt,缺失视为 unknown)
 function Get-AppVersion {
+    # 由 EnvGuard 调用时以应用自身版本为准:version.txt 属于旧版切换器的安装
+    if ($env:ENVGUARD_APP_VERSION -match '^[0-9][A-Za-z0-9._-]{0,39}$') { return $env:ENVGUARD_APP_VERSION }
     $vf = Join-Path $BASE "version.txt"
     if (Test-Path -LiteralPath $vf) {
         try {
@@ -3289,6 +3291,43 @@ function Invoke-UiState([bool]$Fresh = $false) {
     ([pscustomobject]$stateObj) | ConvertTo-Json -Depth 6 -Compress
 }
 
+# 本引擎已合并到的上游 YOURSJEYO/claude-switcher main 提交;每次合并 upstream 分支后同步更新
+$UPSTREAM_MERGED = 'cf474a23bd4c7467163721399082568f0cb95cf7'
+
+# 只读:读上游 main 的提交订阅(github.com 网页端,不受 API 按出口 IP 限流影响),列出尚未合并的提交
+function Invoke-UpstreamStatus {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-WebRequest -Uri 'https://github.com/YOURSJEYO/claude-switcher/commits/main.atom' -UserAgent 'EnvGuard' -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        $entries = @(([xml]$response.Content).feed.entry)
+        if ($entries.Count -eq 0) { throw '订阅为空' }
+    } catch {
+        $script:exitCode = 1
+        'FAIL:无法读取上游提交记录(GitHub 不可达或被限流),请稍后再试'
+        return
+    }
+    $newer = @()
+    $reached = $false
+    foreach ($entry in $entries) {
+        $sha = ([string]$entry.id) -replace '^.*/', ''
+        if ($sha -eq $UPSTREAM_MERGED) { $reached = $true; break }
+        $title = $entry.title
+        if ($title -isnot [string]) { $title = [string]$title.'#text' }
+        $date = ([string]$entry.updated) -replace 'T.*$', ''
+        $newer += [pscustomobject]@{ Line = "  $date $($sha.Substring(0, [Math]::Min(7, $sha.Length))) $($title.Trim())"; Windows = ($title -match '(?i)windows') }
+    }
+    $merged = $UPSTREAM_MERGED.Substring(0, 7)
+    if ($reached -and $newer.Count -eq 0) {
+        "OK:引擎已合并上游 main@$merged,上游暂无新提交"
+        return
+    }
+    $count = if ($reached) { "有 $($newer.Count) 个" } else { "至少有 $($newer.Count) 个" }
+    $windows = @($newer | Where-Object { $_.Windows }).Count
+    "WARN:上游 main $($count)新提交未合并(其中 $windows 个标题提及 Windows),引擎停在 main@$merged"
+    $newer | Select-Object -First 10 | ForEach-Object { $_.Line }
+    'INFO:合并方法见 desktop\README.md 的「跟进上游」'
+}
+
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 $command = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
@@ -3336,6 +3375,7 @@ try {
             Invoke-SafeLaunch $launchTarget $launchExtra
         }
         'shield-restore' { Invoke-ShieldRestore }
+        'upstream-status' { Invoke-UpstreamStatus }
         'uistate' {
             $fresh = ($args.Count -gt 1 -and [string]$args[1] -eq '--fresh')
             Invoke-UiState $fresh

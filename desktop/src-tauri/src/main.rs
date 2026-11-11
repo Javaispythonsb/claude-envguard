@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(target_os = "windows")]
@@ -189,11 +190,13 @@ fn execute_core_blocking(
     script: PathBuf,
     args: Vec<String>,
     stdin_payload: Option<String>,
+    app_version: String,
 ) -> Result<CommandOutcome, String> {
     let mut cmd = Command::new("powershell.exe");
     cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&script)
         .args(&args)
+        .env("ENVGUARD_APP_VERSION", app_version)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -248,9 +251,54 @@ async fn run_core_with_stdin_async(
     stdin_payload: Option<String>,
 ) -> Result<CommandOutcome, String> {
     let script = resolve_core_script(app)?;
-    tauri::async_runtime::spawn_blocking(move || execute_core_blocking(script, args, stdin_payload))
-        .await
-        .map_err(|e| format!("后台任务执行异常: {e}"))?
+    let app_version = app.package_info().version.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        execute_core_blocking(script, args, stdin_payload, app_version)
+    })
+    .await
+    .map_err(|e| format!("后台任务执行异常: {e}"))?
+}
+
+// UTC timestamp file name; never derived from caller input.
+fn diagnostics_file_name(now: SystemTime) -> String {
+    let secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let rem = secs % 86_400;
+    format!(
+        "envguard-diagnostics-{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z.zip",
+        rem / 3_600,
+        (rem % 3_600) / 60,
+        rem % 60
+    )
+}
+
+// Days since 1970-01-01 to (year, month, day), Howard Hinnant's civil_from_days.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn tool_args(tool: &str, arg: Option<String>) -> Result<Vec<String>, String> {
+    match tool.trim() {
+        "set-region" => Ok(vec!["set-region".to_string()]),
+        "rules-status" => Ok(vec!["rules-status".to_string()]),
+        "fingerprint" => Ok(vec!["fingerprint".to_string()]),
+        "upstream-status" => Ok(vec!["upstream-status".to_string()]),
+        "open-safe" => {
+            let raw_url = arg.ok_or_else(|| "缺少要隔离打开的链接".to_string())?;
+            let valid_url = validate_safe_url(&raw_url)?;
+            Ok(vec!["open-safe".to_string(), valid_url])
+        }
+        _ => Err("拒绝执行未授权的工具命令".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -356,18 +404,34 @@ async fn run_tool(
     arg: Option<String>,
 ) -> Result<CommandOutcome, String> {
     let _lease = BusyLease::try_acquire(&guard.busy)?;
-    let args = match tool.trim() {
-        "set-region" => vec!["set-region".to_string()],
-        "rules-status" => vec!["rules-status".to_string()],
-        "fingerprint" => vec!["fingerprint".to_string()],
-        "open-safe" => {
-            let raw_url = arg.ok_or_else(|| "缺少要隔离打开的链接".to_string())?;
-            let valid_url = validate_safe_url(&raw_url)?;
-            vec!["open-safe".to_string(), valid_url]
-        }
-        _ => return Err("拒绝执行未授权的工具命令".to_string()),
-    };
+    let args = tool_args(&tool, arg)?;
     run_core_async(&app, args).await
+}
+
+#[tauri::command]
+async fn export_diagnostics(
+    app: AppHandle,
+    guard: State<'_, OpGuard>,
+) -> Result<CommandOutcome, String> {
+    let _lease = BusyLease::try_acquire(&guard.busy)?;
+    let dir = app
+        .path()
+        .desktop_dir()
+        .or_else(|_| app.path().download_dir())
+        .map_err(|_| "无法定位桌面或下载目录".to_string())?;
+    let target = dir.join(diagnostics_file_name(SystemTime::now()));
+    let mut outcome = run_core_async(
+        &app,
+        vec![
+            "export-diagnostics".to_string(),
+            target.to_string_lossy().into_owned(),
+        ],
+    )
+    .await?;
+    if outcome.exit_code == 0 {
+        outcome.output = format!("{}\n已保存到: {}", outcome.output, target.display());
+    }
+    Ok(outcome)
 }
 
 fn main() {
@@ -383,7 +447,8 @@ fn main() {
             set_client_mode,
             set_flclash_port,
             save_check_config,
-            run_tool
+            run_tool,
+            export_diagnostics
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude EnvGuard");
@@ -426,6 +491,38 @@ mod tests {
         assert!(validate_safe_url("javascript:alert(1)").is_err());
         assert!(validate_safe_url("file:///C:/Windows/win.ini").is_err());
         assert!(validate_safe_url("https://example.com/\" --evil").is_err());
+    }
+
+    #[test]
+    fn diagnostics_file_name_is_utc_timestamp() {
+        use std::time::Duration;
+        assert_eq!(
+            diagnostics_file_name(UNIX_EPOCH),
+            "envguard-diagnostics-19700101T000000Z.zip"
+        );
+        assert_eq!(
+            diagnostics_file_name(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
+            "envguard-diagnostics-20240229T000000Z.zip"
+        );
+        assert_eq!(
+            diagnostics_file_name(UNIX_EPOCH + Duration::from_secs(1_794_411_000)),
+            "envguard-diagnostics-20261111T153000Z.zip"
+        );
+    }
+
+    #[test]
+    fn tool_whitelist() {
+        assert_eq!(
+            tool_args("upstream-status", None).unwrap(),
+            vec!["upstream-status"]
+        );
+        assert_eq!(
+            tool_args("open-safe", Some("https://claude.ai/".to_string())).unwrap(),
+            vec!["open-safe", "https://claude.ai/"]
+        );
+        assert!(tool_args("open-safe", None).is_err());
+        assert!(tool_args("update-now", None).is_err());
+        assert!(tool_args("export-diagnostics", None).is_err());
     }
 
     #[test]

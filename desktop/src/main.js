@@ -337,7 +337,10 @@ function wireDesktopEvents() {
       const tool = card.dataset.tool;
       document.getElementById('consoleBar').textContent = `OUTPUT // ${tool}`;
       document.getElementById('consoleOut').textContent = `正在执行 ${tool}…`;
-      const res = await handleAction(tool, () => invoke('run_tool', { tool, arg: null }), tool === 'set-region');
+      const run = tool === 'export-diagnostics'
+        ? () => invoke('export_diagnostics')
+        : () => invoke('run_tool', { tool, arg: null });
+      const res = await handleAction(tool, run, tool === 'set-region');
       if (res) {
         document.getElementById('consoleOut').textContent = res.output || '(无输出)';
       }
