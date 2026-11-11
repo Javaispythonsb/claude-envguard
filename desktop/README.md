@@ -55,9 +55,14 @@ pnpm tauri build
 # PowerShell 核心脚本：上游 Windows 回归 + EnvGuard 新增能力
 powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-windows-tests.ps1
 
+# 手机自检判定逻辑（Node 自带测试运行器）
+pnpm --dir desktop test
+
 # Rust 命令桥白名单单测
 cargo test --manifest-path desktop\src-tauri\Cargo.toml
 ```
+
+推送到 GitHub 后，`.github/workflows/windows.yml` 会在 `windows-latest` 上依次跑以上三组测试并执行 `pnpm tauri build`，把免安装 exe、NSIS 与 MSI 安装包作为构建产物上传。
 
 ---
 

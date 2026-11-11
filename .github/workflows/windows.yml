@@ -1,0 +1,58 @@
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell 集成测试（Windows PowerShell 5.1）
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-windows-tests.ps1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+
+      - name: 安装前端依赖
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: 手机自检单测
+        working-directory: desktop
+        run: pnpm test
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Rust 命令桥单测
+        working-directory: desktop/src-tauri
+        run: cargo test
+
+      - name: 打包桌面端（exe + NSIS + MSI）
+        working-directory: desktop
+        run: pnpm tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: envguard-windows
+          path: |
+            desktop/src-tauri/target/release/claude-envguard.exe
+            desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
