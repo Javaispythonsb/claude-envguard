@@ -6,7 +6,7 @@
   - 时区与区域格式按系统设置判定，属于硬性项。Claude 桌面版的 Chromium 渲染进程在 Windows 上不读 `TZ` 环境变量，MSIX 版经 shell 激活也不继承它，进程级注入骗不过网页端，所以桌面版必须把系统时区设为目标；收工时用「退出护盾」还原原时区。
   - 启动 CLI 时额外向子进程注入目标 IANA 时区（`TZ`）。
   - 「退出护盾」需 5 秒内二次确认：先关闭 Claude 桌面版与所有 Claude Code CLI（含 npm/bun 版），任一未退出则不撤防。
-- **移动端（静态 Web / PWA 零安装防漏自检页）**：手机连好代理后打开即测 6 项实时信号（出口 IP 归属、浏览器时区与 UTC 偏移、WebRTC STUN 候选泄漏、IPv6 双栈暴露、DoH 加密 DNS、WebGL/Canvas 硬件摘要）。
+- **移动端（静态 Web / PWA 零安装防漏自检页）**：手机连好代理后打开即测 6 项实时信号（出口 IP 归属、浏览器时区与 UTC 偏移、WebRTC 候选泄漏（含 IPv6 候选）、IPv6 双栈暴露、DNS 泄漏（经 ipleak.net 查明实际解析器归属）、WebGL/Canvas 硬件摘要）。
 - **双主题切换**：内置 `终端黑客绿 (Terminal)` 与 `赛博霓虹 (Cyber)` 两套极客主题。
 
 ---

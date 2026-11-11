@@ -421,7 +421,7 @@ function wireMobileEvents() {
       document.getElementById('mHeroDesc').textContent = '未发现真实国内 IP 泄漏，留意下方黄色提示项即可。';
     } else {
       document.getElementById('mHeroTitle').textContent = '6/6 防漏自检全部通过';
-      document.getElementById('mHeroDesc').textContent = '当前浏览器网络出口、WebRTC、IPv6 与时区均无异常暴露。';
+      document.getElementById('mHeroDesc').textContent = '当前浏览器网络出口、DNS、WebRTC、IPv6 与时区均无异常暴露。';
     }
     runBtn.disabled = false;
     runBtn.textContent = '↻ 重新执行 6 项防漏自检';

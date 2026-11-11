@@ -37,6 +37,108 @@ function maskIp(ip) {
   return ip;
 }
 
+function randomHex(length) {
+  const bytes = new Uint8Array(Math.ceil(length / 2));
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, length);
+}
+
+// 198.18.0.0/15 是 Clash/Shadowrocket 等 Fake-IP 与 TUN 网卡常用网段；CGNAT、链路本地、组播等都不是公网出口
+export function classifyIpv4(ip) {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(String(ip))) return 'invalid';
+  const octets = String(ip).split('.').map(Number);
+  if (octets.some((n) => n > 255)) return 'invalid';
+  const [a, b] = octets;
+  if (a === 198 && (b === 18 || b === 19)) return 'fake';
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return 'private';
+  if (a === 169 && b === 254) return 'private';
+  if (a === 172 && b >= 16 && b <= 31) return 'private';
+  if (a === 192 && b === 168) return 'private';
+  if (a === 100 && b >= 64 && b <= 127) return 'private';
+  return 'public';
+}
+
+// 只把 2000::/3 全球单播算公网；链路本地、ULA、组播、文档段都不算
+export function isPublicIpv6(ip) {
+  const v = String(ip || '').toLowerCase().split('%')[0];
+  if (!v.includes(':') || /^2001:0?db8:/.test(v)) return false;
+  const first = parseInt(v.split(':')[0], 16);
+  if (Number.isNaN(first)) return false;
+  return (first & 0xe000) === 0x2000;
+}
+
+// ICE 候选：第 5 段是地址，srflx/relay 还可能带 raddr（本机基础地址）
+export function extractCandidateIps(candidates) {
+  const v4 = new Set();
+  const v6 = new Set();
+  let mdns = false;
+  for (const line of candidates) {
+    const parts = String(line || '').trim().split(/\s+/);
+    const addresses = [parts[4]];
+    const raddr = parts.indexOf('raddr');
+    if (raddr > 0) addresses.push(parts[raddr + 1]);
+    for (const addr of addresses) {
+      if (!addr) continue;
+      if (addr.endsWith('.local')) mdns = true;
+      else if (addr.includes(':')) v6.add(addr.toLowerCase());
+      else if (classifyIpv4(addr) !== 'invalid') v4.add(addr);
+    }
+  }
+  return { v4: [...v4], v6: [...v6], mdns };
+}
+
+export async function evaluateWebRtc(found, { exitIp = '', exitIpv6 = '' } = {}, countryOf = async () => '') {
+  const publicV4 = found.v4.filter((ip) => classifyIpv4(ip) === 'public');
+  const publicV6 = found.v6.filter(isPublicIpv6);
+  if (!publicV4.length && !publicV6.length) {
+    return {
+      state: 'ok',
+      detail: found.mdns ? '未暴露公网候选（mDNS 混淆已生效）' : '未暴露公网候选（仅内网或 Fake-IP 地址）'
+    };
+  }
+  const v6Leaks = publicV6.filter((ip) => ip !== String(exitIpv6).toLowerCase());
+  if (v6Leaks.length) {
+    return { state: 'fail', detail: `暴露 IPv6 候选: ${v6Leaks.map(maskIp).join(', ')}` };
+  }
+  const v4Others = publicV4.filter((ip) => ip !== exitIp);
+  if (!v4Others.length) {
+    return { state: 'ok', detail: `候选地址与代理出口一致 (${maskIp(publicV4[0] || publicV6[0])})` };
+  }
+  const countries = await Promise.all(v4Others.slice(0, 3).map((ip) => countryOf(ip).catch(() => '')));
+  if (countries.includes('CN')) {
+    return { state: 'fail', detail: `暴露国内 UDP 出口: ${v4Others.map(maskIp).join(', ')}` };
+  }
+  if (countries.length && countries.every(Boolean)) {
+    return {
+      state: 'warn',
+      detail: `UDP 出口与 HTTP 出口不同（${[...new Set(countries)].join('/')} · ${v4Others.map(maskIp).join(', ')}）`
+    };
+  }
+  return { state: 'fail', detail: `发现归属未知的非代理出口候选: ${v4Others.map(maskIp).join(', ')}` };
+}
+
+export function evaluateDnsResolvers(resolvers) {
+  if (!resolvers.length) return { state: 'warn', detail: '检测服务未记录到 DNS 解析器' };
+  const domestic = resolvers.filter((r) => r.country === 'CN');
+  if (domestic.length) {
+    return {
+      state: 'fail',
+      detail: `DNS 经国内解析器: ${domestic.map((r) => `${maskIp(r.ip)}${r.isp ? ` (${r.isp})` : ''}`).join(', ')}`
+    };
+  }
+  if (resolvers.some((r) => !r.country)) {
+    return { state: 'warn', detail: `部分解析器归属未知: ${resolvers.map((r) => maskIp(r.ip)).join(', ')}` };
+  }
+  const countries = [...new Set(resolvers.map((r) => r.country))];
+  return { state: 'ok', detail: `解析器位于 ${countries.join('/')}（${resolvers.length} 个，无国内解析器）` };
+}
+
+async function lookupCountry(ip) {
+  const r = await fetchWithTimeout(`https://ipinfo.io/${encodeURIComponent(ip)}/json`, 3500);
+  if (!r.ok) return '';
+  return String((await r.json()).country || '').toUpperCase();
+}
+
 async function checkEgress() {
   try {
     const r = await fetchWithTimeout('https://ipinfo.io/json', 4500);
@@ -89,13 +191,10 @@ function checkBrowserRegion(egressCountry) {
   };
 }
 
-async function checkWebRtc(exitIp) {
+async function gatherWebRtcCandidates() {
   const RTCPeer = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-  if (!RTCPeer) {
-    return { state: 'ok', detail: '当前浏览器已禁用 WebRTC API' };
-  }
-  const ips = new Set();
-  let hasMdns = false;
+  if (!RTCPeer) return null;
+  const candidates = [];
 
   await new Promise((resolve) => {
     let settled = false;
@@ -118,15 +217,7 @@ async function checkWebRtc(exitIp) {
         finish();
         return;
       }
-      const c = ev.candidate.candidate || '';
-      if (c.includes('.local')) hasMdns = true;
-      const ipv4Matches = c.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) || [];
-      for (const ip of ipv4Matches) {
-        if (ip === '0.0.0.0' || ip.startsWith('127.') || ip.startsWith('10.') || ip.startsWith('192.168.') || /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) {
-          continue;
-        }
-        ips.add(ip);
-      }
+      candidates.push(ev.candidate.candidate || '');
     };
     try {
       pc.createDataChannel('eg');
@@ -137,28 +228,16 @@ async function checkWebRtc(exitIp) {
     }
   });
 
-  if (ips.size === 0) {
-    return { state: 'ok', detail: hasMdns ? '未暴露公网候选（mDNS 混淆已生效）' : 'STUN 无额外公网候选暴露' };
-  }
-  const list = [...ips];
-  const fakeIpOnly = list.every((ip) => ip.startsWith('198.18.'));
-  if (fakeIpOnly) {
-    return { state: 'ok', detail: '仅返回代理 Fake-IP (198.18.*)' };
-  }
-  const leaked = exitIp ? list.filter((ip) => ip !== exitIp) : list;
-  if (leaked.length > 0) {
-    return { state: 'fail', detail: `发现非代理出口候选: ${leaked.map(maskIp).join(', ')}` };
-  }
-  return { state: 'ok', detail: `候选地址与代理出口一致 (${maskIp(exitIp)})` };
+  return extractCandidateIps(candidates);
 }
 
 async function checkIpv6(egressCountry) {
   try {
     const r = await fetchWithTimeout('https://api6.ipify.org?format=json', 3200);
-    if (!r.ok) return { state: 'ok', detail: '未检测到 IPv6 直连通道（无双栈旁路风险）' };
+    if (!r.ok) return { state: 'ok', detail: '未检测到 IPv6 直连通道（无双栈旁路风险）', ip: '' };
     const j = await r.json();
     const v6 = String(j.ip || '');
-    if (!v6.includes(':')) return { state: 'ok', detail: '未启用公网 IPv6' };
+    if (!v6.includes(':')) return { state: 'ok', detail: '未启用公网 IPv6', ip: '' };
 
     try {
       const infoRes = await fetchWithTimeout(`https://ipinfo.io/${encodeURIComponent(v6)}/json`, 3500);
@@ -166,27 +245,35 @@ async function checkIpv6(egressCountry) {
         const info = await infoRes.json();
         const v6cc = String(info.country || '').toUpperCase();
         if (v6cc === 'CN' || (egressCountry && v6cc && v6cc !== egressCountry)) {
-          return { state: 'fail', detail: `IPv6 旁路泄漏! 归属 ${v6cc} (${maskIp(v6)})` };
+          return { state: 'fail', detail: `IPv6 旁路泄漏! 归属 ${v6cc} (${maskIp(v6)})`, ip: v6 };
         }
-        return { state: 'ok', detail: `IPv6 已走同区代理 (${v6cc} · ${maskIp(v6)})` };
+        return { state: 'ok', detail: `IPv6 已走同区代理 (${v6cc} · ${maskIp(v6)})`, ip: v6 };
       }
     } catch {}
-    return { state: 'warn', detail: `检测到公网 IPv6 (${maskIp(v6)})，请确认已走代理` };
+    return { state: 'warn', detail: `检测到公网 IPv6 (${maskIp(v6)})，请确认已走代理`, ip: v6 };
   } catch {
-    return { state: 'ok', detail: 'IPv6 未通或已关闭（无双栈旁路泄漏）' };
+    return { state: 'ok', detail: 'IPv6 未通或已关闭（无双栈旁路泄漏）', ip: '' };
   }
 }
 
-async function checkDoh() {
-  const results = await Promise.allSettled([
-    fetchWithTimeout('https://1.1.1.1/cdn-cgi/trace', 3500),
-    fetchWithTimeout('https://dns.google/resolve?name=claude.ai&type=A', 3500)
-  ]);
-  const cfOk = results[0].status === 'fulfilled' && results[0].value.ok;
-  const ggOk = results[1].status === 'fulfilled' && results[1].value.ok;
-  if (cfOk && ggOk) return { state: 'ok', detail: 'Cloudflare 1.1.1.1 与 Google DoH 均可达' };
-  if (cfOk || ggOk) return { state: 'ok', detail: `${cfOk ? 'Cloudflare' : 'Google'} DoH 加密解析可达` };
-  return { state: 'warn', detail: '公共 DoH 不可达（受当前代理分流影响）' };
+// 访问随机子域名，让当前 DNS 解析器去问 ipleak.net 的权威服务器；它记录下来的解析器就是真实解析路径
+async function checkDnsLeak() {
+  try {
+    const r = await fetchWithTimeout(`https://${randomHex(40)}.ipleak.net/dnsdetection/`, 8000);
+    if (!r.ok) throw new Error(String(r.status));
+    const ips = Object.keys((await r.json()).ip || {}).slice(0, 4);
+    const resolvers = await Promise.all(ips.map(async (ip) => {
+      try {
+        const info = await (await fetchWithTimeout(`https://ipleak.net/json/${encodeURIComponent(ip)}`, 5000)).json();
+        return { ip, country: String(info.country_code || '').toUpperCase(), isp: String(info.isp_name || '') };
+      } catch {
+        return { ip, country: '', isp: '' };
+      }
+    }));
+    return evaluateDnsResolvers(resolvers);
+  } catch {
+    return { state: 'warn', detail: 'DNS 泄漏检测服务不可达（ipleak.net）' };
+  }
 }
 
 async function checkFingerprint() {
@@ -229,14 +316,18 @@ export async function runMobileSelfCheck(onStep) {
   const region = checkBrowserRegion(egress.country);
   onStep('region', region);
 
-  const [webrtc, ipv6, doh, fp] = await Promise.all([
-    checkWebRtc(egress.ip).then((r) => { onStep('webrtc', r); return r; }),
+  const [ipv6, dns, fp, candidates] = await Promise.all([
     checkIpv6(egress.country).then((r) => { onStep('ipv6', r); return r; }),
-    checkDoh().then((r) => { onStep('doh', r); return r; }),
-    checkFingerprint().then((r) => { onStep('fp', r); return r; })
+    checkDnsLeak().then((r) => { onStep('dns', r); return r; }),
+    checkFingerprint().then((r) => { onStep('fp', r); return r; }),
+    gatherWebRtcCandidates()
   ]);
+  const webrtc = candidates
+    ? await evaluateWebRtc(candidates, { exitIp: egress.ip, exitIpv6: ipv6.ip }, lookupCountry)
+    : { state: 'ok', detail: '当前浏览器已禁用 WebRTC API' };
+  onStep('webrtc', webrtc);
 
-  const all = [egress, region, webrtc, ipv6, doh, fp];
+  const all = [egress, region, webrtc, ipv6, dns, fp];
   const fails = all.filter((x) => x.state === 'fail').length;
   const warns = all.filter((x) => x.state === 'warn').length;
   return { fails, warns, total: all.length };

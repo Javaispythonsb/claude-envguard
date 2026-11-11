@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https://ipinfo.io https://www.cloudflare.com https://1.1.1.1 https://dns.google https://api6.ipify.org; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; connect-src 'self' https://ipinfo.io https://www.cloudflare.com https://api6.ipify.org https://ipleak.net https://*.ipleak.net; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {
