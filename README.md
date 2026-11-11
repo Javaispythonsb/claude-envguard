@@ -26,6 +26,14 @@
 
 本项目用于在合规地区管理多个 Claude 账号的本地环境与登录态，面向因出差、旅居等原因身处支持地区的用户。请遵守 Anthropic 服务条款；禁止用于账号转售、共享、代注册或规避地区限制。本地环境检查只影响本机配置，不改变服务端记录，也不构成账号不被限制的保证。
 
+### 官方版本免费与举报
+
+本项目官方版本免费提供，维护者不会以收费方式出售官方安装包或账号服务。任何人不得冒充官方、维护者或授权渠道销售“官方 Claude 切换器”，也不得删除版权和许可证声明、隐瞒修改内容，或用额外条款限制 AGPL-3.0-only 已授予的权利。
+
+AGPL-3.0-only 允许在履行许可证义务的前提下再分发和收费，因此仅仅“收费”本身不等于违规。若发现有人冒充官方销售，或销售版本未提供对应源代码、删除许可证声明、隐瞒修改内容，请通过 [Issue](https://github.com/YOURSJEYO/claude-switcher/issues) 举报，并附上商品链接、页面截图和版本信息。请勿公开买家个人信息、订单信息或账号凭据。
+
+macOS App 会在首次启动时显示此提醒（老用户升级后也会看到一次）。点击「知道了」后不再自动弹出；仅关闭提醒不会标记已读，下次启动仍会提醒。之后可从主窗口信息按钮或菜单栏的「官方版本免费与举报」再次查看，原有「安全防护体系公告」仍在信息菜单中。
+
 ## 为什么做这个
 
 AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：时区、Locale、DNS 出口、WebRTC 候选地址、设备指纹、行为时序。绝大多数封号不是因为你做错了什么，而是某个你没意识到的场景里，真实出口 IP 悄悄溜出去了一次——哪怕只是一个 TCP SYN 握手包。
@@ -100,7 +108,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 ## 安装
 
-**系统要求**：macOS · Clash Verge / FlClash / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
+**系统要求**：macOS · Clash Verge / FlClash / Bettbox / Shadowrocket / sing-box / ClashX / Surge 任一（TUN 可用）· Claude 桌面版 · python3
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
 > **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），支持从应用菜单打开 GTK 监测窗口、点击托盘查看 14 项安检摘要、显示发行版，并通过已安装的 claude-desktop 启动 Claude Code 桌面会话。使用说明见 [linux/README.md](linux/README.md)。
@@ -328,9 +336,10 @@ Windows 加密快照使用 `.csnap`（PBKDF2-HMAC-SHA256 + AES-256-CBC + HMAC-SH
 ~/.local/bin/claude-switch.sh set-client flclash
 ```
 
-支持 `clash-verge|flclash|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
+支持 `clash-verge|flclash|bettbox|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
 
 - 换成 FlClash 后，「代理内核」与保镖识别 `FlClashCore`/`FlClash` 进程；WebRTC 与其他非 Clash Verge 客户端一致，STUN 无响应显示「未确认」，不会把未验证当作已安全拒绝
+- 换成 Bettbox 后，「代理内核」与保镖识别 `BettboxCore`/`Bettbox` 进程；其规则写入尚未自动化，仍需在客户端内自行添加 Claude 域名与 STUN 端口置顶规则
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
 - FlClash 可通过「一键修复」自动补齐当前 Profile 的 Claude 生态域名与 STUN UDP 端口规则；其他非 Clash 客户端仍需自行配置，「规则置顶」使用 fake-ip 行为检测
 - 「保镖」现在会核对运行中 LaunchDaemon 与 root 所有的保镖脚本内 `MODE`，不再只看进程是否存在；客户端模式不一致时显示 `fail:客户端不一致`，此时需手动重跑 `installer/安装.command` 同步保镖（需要管理员权限）。`fix` 只能启动缺失的 LaunchDaemon，**不会更新已有 root 脚本内的旧模式**；在重新检查通过前不要启动 Claude。
