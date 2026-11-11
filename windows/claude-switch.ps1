@@ -442,6 +442,10 @@ function Invoke-ProbeText {
         [int]$TimeoutSec = 8,
         [scriptblock]$Valid = { param($body) return [bool]$body }
     )
+    if ($script:ProbePrefetch) {
+        $prefetched = Receive-ProbePrefetch "text|$Url"
+        if ($null -ne $prefetched) { return [string]$prefetched }
+    }
     $body = ''
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         $body = (& curl.exe -s --max-time $TimeoutSec $Url 2>$null) -join "`n"
@@ -458,6 +462,10 @@ function Invoke-ProbeCode {
         [int]$Attempts = 3,
         [int]$TimeoutSec = 8
     )
+    if ($script:ProbePrefetch) {
+        $prefetched = Receive-ProbePrefetch "code|$Url"
+        if ($null -ne $prefetched) { return [string]$prefetched }
+    }
     $code = '000'
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         $code = ((& curl.exe -s --max-time $TimeoutSec -o NUL -w '%{http_code}' $Url 2>$null) -join '').Trim()
@@ -465,6 +473,79 @@ function Invoke-ProbeCode {
         if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
     }
     return $code
+}
+
+# 出口探测确认路径存活后,把后续彼此独立的只读探测(ASN 的 ipinfo→peeringdb、生态可达性的两个站点)
+# 放到后台 runspace 并行发出。各检查项仍照常调用 Invoke-Probe*:命中预取结果就直接用,
+# 未命中(没有预取,或检查项复核路径失败而根本不发请求)走原有同步探测。判定逻辑与路径复核都不变。
+function Start-ProbePrefetch($Egress) {
+    Stop-ProbePrefetch
+    if (-not $Egress -or $Egress.skipped -or -not (Test-ProxyPathAlive)) { return }
+    $definitions = "function Invoke-ProbeText {`n$(${function:Invoke-ProbeText})`n}`nfunction Invoke-ProbeCode {`n$(${function:Invoke-ProbeCode})`n}"
+    $jobs = @()
+    if ($Egress.ip -and -not (Test-CheckDisabled 'ASN属性')) {
+        $ipInfoUrl = "https://ipinfo.io/$([Uri]::EscapeDataString([string]$Egress.ip))/json"
+        $asnChain = @'
+$results = @{}
+$ipInfoResponse = Invoke-ProbeText -Url $Url -TimeoutSec 6
+$results["text|$Url"] = $ipInfoResponse
+try {
+    $ipInfo = $ipInfoResponse | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$ipInfo.ip -eq $Ip -and [string]$ipInfo.org -match '^AS(\d+)\s') {
+        $networkUrl = "https://www.peeringdb.com/api/net?asn=$($Matches[1])&fields=asn,info_type"
+        $results["text|$networkUrl"] = Invoke-ProbeText -Url $networkUrl -TimeoutSec 6
+    }
+} catch {}
+$results
+'@
+        $jobs += New-ProbePrefetchJob $definitions $asnChain @($ipInfoUrl, [string]$Egress.ip) '^text\|https://(ipinfo\.io|www\.peeringdb\.com)/'
+    }
+    if (-not (Test-CheckDisabled '生态可达性')) {
+        foreach ($url in @('https://claude.ai/', 'https://api.anthropic.com/v1/models')) {
+            $jobs += New-ProbePrefetchJob $definitions '@{ ("code|" + $Url) = (Invoke-ProbeCode -Url $Url) }' @($url, '') ('^code\|' + [regex]::Escape($url) + '$')
+        }
+    }
+    $script:ProbePrefetch = @{ Jobs = $jobs; Results = @{} }
+}
+
+function New-ProbePrefetchJob([string]$Definitions, [string]$Body, [object[]]$Arguments, [string]$KeyPattern) {
+    $shell = [powershell]::Create()
+    [void]$shell.AddScript("param(`$Url, `$Ip)`n$Definitions`n$Body")
+    foreach ($argument in $Arguments) { [void]$shell.AddArgument($argument) }
+    return @{ Shell = $shell; Handle = $shell.BeginInvoke(); Pattern = $KeyPattern; Done = $false }
+}
+
+function Receive-ProbePrefetch([string]$Key) {
+    $cache = $script:ProbePrefetch
+    if (-not $cache) { return $null }
+    if (-not $cache.Results.ContainsKey($Key)) {
+        foreach ($job in @($cache.Jobs | Where-Object { -not $_.Done -and $Key -match $_.Pattern })) {
+            try {
+                foreach ($output in @($job.Shell.EndInvoke($job.Handle))) {
+                    $table = $output.psobject.BaseObject
+                    if ($table -is [hashtable]) { foreach ($k in @($table.Keys)) { $cache.Results[$k] = $table[$k] } }
+                }
+            } catch {} finally {
+                $job.Done = $true
+                $job.Shell.Dispose()
+            }
+        }
+    }
+    if (-not $cache.Results.ContainsKey($Key)) { return $null }
+    $value = $cache.Results[$Key]
+    $cache.Results.Remove($Key)
+    return $value
+}
+
+function Stop-ProbePrefetch {
+    $cache = $script:ProbePrefetch
+    $script:ProbePrefetch = $null
+    if (-not $cache) { return }
+    foreach ($job in @($cache.Jobs | Where-Object { -not $_.Done })) {
+        try { $job.Shell.Stop() } catch {}
+        $job.Shell.Dispose()
+        $job.Done = $true
+    }
 }
 
 function Get-Egress {
@@ -776,44 +857,64 @@ function Invoke-SetRegion {
     if ($tzFromDefault) { "INFO:时区使用国家默认(可手动改)" }
 }
 
-# STUN 探针(纯 .NET UDP,手工构造 RFC5389 报文)
-function Get-StunPublicIP([string]$server, [int]$port, [int]$timeoutMs = 2000) {
-    try { $addr = ([System.Net.Dns]::GetHostAddresses($server) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1) } catch { return $null }
-    if (-not $addr) { return $null }
-    $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.Client.ReceiveTimeout = $timeoutMs
-    try {
-        $txn = New-Object byte[] 12; (New-Object Random).NextBytes($txn)
-        $req = [byte[]](0x00, 0x01, 0x00, 0x00) + [byte[]](0x21, 0x12, 0xA4, 0x42) + $txn
-        $udp.Connect($addr, $port)
-        [void]$udp.Send($req, $req.Length)
-        $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
-        $resp = $udp.Receive([ref]$remote)
-        $pos = 20
-        while ($pos + 4 -le $resp.Length) {
-            $atype = ([int]$resp[$pos] -shl 8) -bor $resp[$pos + 1]
-            $alen  = ([int]$resp[$pos + 2] -shl 8) -bor $resp[$pos + 3]
-            if (($atype -eq 0x20 -or $atype -eq 0x01) -and $alen -ge 8 -and $resp[$pos + 5] -eq 0x01) {
-                $ipBytes = @($resp[$pos + 8], $resp[$pos + 9], $resp[$pos + 10], $resp[$pos + 11])
-                if ($atype -eq 0x20) {
-                    $cookie = [byte[]](0x21, 0x12, 0xA4, 0x42)
-                    for ($i = 0; $i -lt 4; $i++) { $ipBytes[$i] = $ipBytes[$i] -bxor $cookie[$i] }
-                }
-                return ($ipBytes -join '.')
+# 从 STUN Binding 响应中取 (XOR-)MAPPED-ADDRESS 的 IPv4
+function ConvertFrom-StunResponse([byte[]]$Response) {
+    $pos = 20
+    while ($pos + 4 -le $Response.Length) {
+        $atype = ([int]$Response[$pos] -shl 8) -bor $Response[$pos + 1]
+        $alen  = ([int]$Response[$pos + 2] -shl 8) -bor $Response[$pos + 3]
+        if (($atype -eq 0x20 -or $atype -eq 0x01) -and $alen -ge 8 -and $pos + 12 -le $Response.Length -and $Response[$pos + 5] -eq 0x01) {
+            $ipBytes = @($Response[$pos + 8], $Response[$pos + 9], $Response[$pos + 10], $Response[$pos + 11])
+            if ($atype -eq 0x20) {
+                $cookie = [byte[]](0x21, 0x12, 0xA4, 0x42)
+                for ($i = 0; $i -lt 4; $i++) { $ipBytes[$i] = $ipBytes[$i] -bxor $cookie[$i] }
             }
-            $pos += 4 + $alen + ((4 - ($alen % 4)) % 4)
+            return ($ipBytes -join '.')
         }
-    } catch { return $null } finally { $udp.Close() }
+        $pos += 4 + $alen + ((4 - ($alen % 4)) % 4)
+    }
     return $null
+}
+
+# STUN 探针(纯 .NET UDP,手工构造 RFC5389 报文):所有服务器同时发出、共用一个超时窗口,按服务器顺序去重返回
+function Get-StunPublicIPs([object[]]$Servers, [int]$TimeoutMs = 2000) {
+    $probes = @()
+    foreach ($s in $Servers) {
+        $addr = $null
+        try { $addr = [System.Net.Dns]::GetHostAddresses([string]$s[0]) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 } catch {}
+        if (-not $addr) { continue }
+        $udp = New-Object System.Net.Sockets.UdpClient
+        try {
+            $txn = New-Object byte[] 12; (New-Object Random).NextBytes($txn)
+            $req = [byte[]](0x00, 0x01, 0x00, 0x00) + [byte[]](0x21, 0x12, 0xA4, 0x42) + $txn
+            $udp.Connect($addr, [int]$s[1])
+            [void]$udp.Send($req, $req.Length)
+            $probes += @{ Udp = $udp; Receive = $udp.ReceiveAsync() }
+        } catch { $udp.Close() }
+    }
+    try {
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        while ($true) {
+            $pending = @($probes | Where-Object { -not $_.Receive.IsCompleted } | ForEach-Object { $_.Receive })
+            $left = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($pending.Count -eq 0 -or $left -le 0) { break }
+            [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$pending, $left)
+        }
+        $found = @()
+        foreach ($p in $probes) {
+            if ($p.Receive.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { continue }
+            $ip = ConvertFrom-StunResponse $p.Receive.Result.Buffer
+            if ($ip -and ($found -notcontains $ip)) { $found += $ip }
+        }
+        return $found
+    } finally {
+        foreach ($p in $probes) { $p.Udp.Close() }
+    }
 }
 
 function Test-WebRTC($exitIp) {
     $servers = @(@("stun.miwifi.com", 3478), @("stun.chat.bilibili.com", 3478), @("stun.l.google.com", 19302), @("stun.cloudflare.com", 3478))
-    $found = @()
-    foreach ($s in $servers) {
-        $r = Get-StunPublicIP $s[0] $s[1]
-        if ($r -and ($found -notcontains $r)) { $found += $r }
-    }
+    $found = @(Get-StunPublicIPs $servers)
     # STUN 无响应不等于没有泄漏:可能只是节点不支持 UDP,或规则拦了探测目标却漏了别的 UDP 出口
     if ($found.Count -eq 0) { return @{ code = 'warn'; detail = 'STUN 无响应,未确认 UDP 出口(不等于零暴露)' } }
     $leak = $found | Where-Object { $_ -ne $exitIp }
@@ -1500,6 +1601,8 @@ function Invoke-CheckDetail {
     elseif ($e.loc -eq $COUNTRY_TARGET) { "出口IP=ok:$($e.ip)" }
     else { "出口IP=fail:$($e.ip)/$($e.loc)(期望$COUNTRY_TARGET)" }
 
+    Start-ProbePrefetch $e
+
     if (Test-CheckDisabled 'IP一致') {
         Format-OptionalResult 'IP一致' 'ok'
     } else {
@@ -1608,6 +1711,8 @@ function Invoke-CheckDetail {
         $r2 = Invoke-ProbeCode -Url 'https://api.anthropic.com/v1/models'
         if ($r1 -ne '000' -and $r2 -ne '000') { Format-OptionalResult '生态可达性' 'ok' "claude.ai:$r1 api:$r2" } else { Format-OptionalResult '生态可达性' 'fail' "claude.ai:$r1 api:$r2" }
     }
+
+    Stop-ProbePrefetch
 }
 
 function Invoke-Check {
