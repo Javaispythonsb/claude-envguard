@@ -323,6 +323,18 @@ try {
 } catch {
     Write-Host "[WARN] 地区格式未设置,请安装后运行 set-region 或手动在「区域格式」中选择 $LOCALE_TARGET" -ForegroundColor Yellow
 }
+$ipv6StateFile = Join-Path $BASE 'ipv6-state.json'
+if (-not (Test-Path -LiteralPath $ipv6StateFile)) {
+    $v6Bindings = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue)
+    if (@($v6Bindings | Where-Object { $_.Enabled }).Count -gt 0) {
+        $v6Map = [ordered]@{}
+        foreach ($b in $v6Bindings) { if ($b -and $b.Name) { $v6Map[[string]$b.Name] = [bool]$b.Enabled } }
+        if ($v6Map.Count -gt 0) {
+            $v6Payload = ([pscustomobject]@{ version = 1; adapters = [pscustomobject]$v6Map }) | ConvertTo-Json -Depth 4
+            [System.IO.File]::WriteAllText($ipv6StateFile, $v6Payload, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+}
 Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled } | Disable-NetAdapterBinding -Confirm:$false
 Clear-DnsClientCache
 Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green

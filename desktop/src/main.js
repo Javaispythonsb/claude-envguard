@@ -6,12 +6,12 @@ const CHECK_SPECS = [
   { key: 'TUN网卡', label: 'TUN 网卡', hard: true },
   { key: '出口IP', label: '出口国家与 IP', hard: true },
   { key: '时区', label: '时区对齐', hard: true },
+  { key: '地区', label: '区域格式 Locale', hard: true },
   { key: 'IPv6', label: 'IPv6 旁路防护', hard: true },
-  { key: '保镖', label: '保镖 Kill-Switch', hard: true },
-  { key: '规则置顶', label: 'Clash 置顶规则', hard: true },
-  { key: '地区', label: '区域格式 Locale', hard: false },
+  { key: '保镖', label: '保镖进程急停', hard: true },
+  { key: '规则置顶', label: '置顶规则 / 隧道接管', hard: true },
   { key: 'IP一致', label: 'IP 稳定性 (48h)', hard: false },
-  { key: 'DNS', label: 'DNS Fake-IP 隧道', hard: false },
+  { key: 'DNS', label: 'DNS 隧道与解析器归属', hard: false },
   { key: 'WebRTC', label: 'WebRTC STUN 探针', hard: false },
   { key: '客户端语言', label: '客户端语言', hard: false },
   { key: 'ASN属性', label: 'ASN 网络属性', hard: false },
@@ -20,7 +20,7 @@ const CHECK_SPECS = [
 
 const OPTIONAL_ITEMS = [
   { key: 'WebRTC', title: 'WebRTC 国内外 STUN 交叉探针' },
-  { key: 'DNS', title: 'DNS Fake-IP 隧道校验' },
+  { key: 'DNS', title: 'DNS 隧道与实际解析器归属校验' },
   { key: 'IP一致', title: '出口 IP 48 小时跳变提醒' },
   { key: 'ASN属性', title: 'ASN 运营商类型核对' },
   { key: '客户端语言', title: 'Claude 客户端语言比对' },
@@ -155,7 +155,7 @@ function applyUiState(data, elapsedMs = 0) {
   const gDesc = document.getElementById('guardDesc');
   gDot.className = 'dot ' + (bg.state === 'ok' ? '' : bg.state === 'warn' ? 'warn' : 'fail');
   gBadge.textContent = bg.state === 'ok' ? 'ACTIVE' : bg.state === 'warn' ? 'LEGACY' : 'OFFLINE';
-  gDesc.textContent = bg.detail ? `状态：${bg.detail}。掉线即刻终止 Claude 桌面版与 CLI。` : '状态以环境审计为准。';
+  gDesc.textContent = bg.detail ? `状态：${bg.detail}。10s 巡检进程级急停（非防火墙级阻断）。` : '状态以环境审计为准。';
 
   // Settings sync
   const cfg = data.check_config || {};
@@ -173,7 +173,7 @@ function applyUiState(data, elapsedMs = 0) {
   let warnCount = 0;
   let failCount = 0;
   let skipCount = 0;
-  const failedNames = [];
+  const blockedNames = [];
 
   CHECK_SPECS.forEach((spec, idx) => {
     const row = document.querySelector(`.citem[data-ck="${spec.key}"]`);
@@ -191,13 +191,13 @@ function applyUiState(data, elapsedMs = 0) {
       segs[idx].className = `seg ${st === 'ok' ? 'ok' : st === 'warn' ? 'warn' : st === 'fail' ? 'fail' : ''}`;
     }
     if (st === 'ok') okCount++;
-    else if (st === 'warn') warnCount++;
-    else if (st === 'fail') { failCount++; failedNames.push(spec.label); }
-    else skipCount++;
+    else if (st === 'warn') { warnCount++; if (spec.hard) blockedNames.push(spec.label); }
+    else if (st === 'fail') { failCount++; blockedNames.push(spec.label); }
+    else { skipCount++; if (spec.hard) blockedNames.push(spec.label); }
   });
 
   const complete = (data.checks || []).length === CHECK_SPECS.length;
-  const ready = complete && failCount === 0;
+  const ready = typeof data.ready === 'boolean' ? (complete && data.ready) : (complete && blockedNames.length === 0);
   currentState = { ...data, environmentReady: ready };
 
   const heroIcon = document.getElementById('heroIcon');
@@ -218,22 +218,22 @@ function applyUiState(data, elapsedMs = 0) {
   } else if (!ready) {
     heroIcon.className = 'sicon blocked';
     heroIcon.textContent = '✕';
-    heroTitle.textContent = `存在未通过项（${failedNames.slice(0, 3).join('、')}）· 已阻断启动`;
-    heroDesc.textContent = 'Fail-Closed 门禁生效：可点击「一键修复」自动配置规则与网络，复检全绿后解锁。';
+    heroTitle.textContent = `启动门禁已阻断（${blockedNames.slice(0, 3).join('、')}）`;
+    heroDesc.textContent = '8 项硬性红线必须全部为 [ OK ] 且无失败项：可点击「一键修复」处理保镖/时区/IPv6/规则，复检通过后解锁。';
     heroPill.className = 'pill blocked';
-    heroPill.textContent = `BLOCKED · ${failCount} FAIL`;
-  } else if (warnCount > 0) {
+    heroPill.textContent = `BLOCKED · ${blockedNames.length}`;
+  } else if (warnCount > 0 || skipCount > 0) {
     heroIcon.className = 'sicon warn';
     heroIcon.textContent = '!';
-    heroTitle.textContent = '硬性红线已全部通过 · 允许安全启动（含提示项）';
-    heroDesc.textContent = `通过 ${okCount} 项，提示 ${warnCount} 项${skipCount ? `，跳过 ${skipCount} 项` : ''}。`;
+    heroTitle.textContent = '8 项硬性红线已全部通过 · 允许启动（可选项含提示/跳过）';
+    heroDesc.textContent = `通过 ${okCount} 项，提示 ${warnCount} 项${skipCount ? `，跳过 ${skipCount} 项` : ''}；保镖以 10s 周期执行进程级急停。`;
     heroPill.className = 'pill warn';
     heroPill.textContent = `READY · ${okCount}/14 OK`;
   } else {
     heroIcon.className = 'sicon';
     heroIcon.textContent = '✓';
-    heroTitle.textContent = '全部安全检查已通过 · 环境洁净可启动';
-    heroDesc.textContent = `可安全启动 Claude 桌面版或 CLI；CLI 会额外注入 TZ=${data.iana_tz_target}。`;
+    heroTitle.textContent = '14 项检查全部通过 · 允许安全启动';
+    heroDesc.textContent = '启动门禁已放行 Claude 桌面版与 CLI；运行期由保镖按 10s 周期监控内核与 TUN。';
     heroPill.className = 'pill';
     heroPill.textContent = `PASS · ${okCount}/14 OK`;
   }
@@ -394,8 +394,8 @@ function wireMobileEvents() {
   if (!runBtn) return;
   runBtn.onclick = async () => {
     runBtn.disabled = true;
-    runBtn.textContent = '⏳ 正在实时探测 6 项防漏信号…';
-    document.getElementById('mHeroTitle').textContent = '正在执行实时防漏自检…';
+    runBtn.textContent = '⏳ 正在实时探测 5 项防漏信号与硬件摘要…';
+    document.getElementById('mHeroTitle').textContent = '正在执行浏览器侧实时自检…';
 
     document.querySelectorAll('#mobileCheckList .mcard').forEach((card) => {
       card.querySelector('small').textContent = '探测中…';
@@ -414,17 +414,17 @@ function wireMobileEvents() {
     });
 
     if (summary.fails > 0) {
-      document.getElementById('mHeroTitle').textContent = `发现 ${summary.fails} 项泄漏风险 · 请勿打开 Claude`;
-      document.getElementById('mHeroDesc').textContent = '请先检查手机代理工具的全局/TUN 与分流规则，消除红项后再复测。';
+      document.getElementById('mHeroTitle').textContent = `发现 ${summary.fails} 项浏览器侧泄漏风险`;
+      document.getElementById('mHeroDesc').textContent = '请先检查当前设备代理工具的全局/TUN 与分流规则，消除红项后再复测。';
     } else if (summary.warns > 0) {
-      document.getElementById('mHeroTitle').textContent = `核心通过 · 含 ${summary.warns} 项提示`;
-      document.getElementById('mHeroDesc').textContent = '未发现真实国内 IP 泄漏，留意下方黄色提示项即可。';
+      document.getElementById('mHeroTitle').textContent = `5 项防漏无红项 · 含 ${summary.warns} 项提示`;
+      document.getElementById('mHeroDesc').textContent = '未发现浏览器侧国内出口或 DNS 泄漏，请留意下方黄色提示项（不代表电脑端进程级状态）。';
     } else {
-      document.getElementById('mHeroTitle').textContent = '6/6 防漏自检全部通过';
-      document.getElementById('mHeroDesc').textContent = '当前浏览器网络出口、DNS、WebRTC、IPv6 与时区均无异常暴露。';
+      document.getElementById('mHeroTitle').textContent = '5/5 浏览器防漏信号通过（附硬件摘要）';
+      document.getElementById('mHeroDesc').textContent = '当前浏览器出口、DNS、WebRTC、IPv6 与时区均无异常暴露；电脑端启动仍须通过桌面版 14 项审计。';
     }
     runBtn.disabled = false;
-    runBtn.textContent = '↻ 重新执行 6 项防漏自检';
+    runBtn.textContent = '↻ 重新检测浏览器信号';
   };
 }
 

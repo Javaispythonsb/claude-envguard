@@ -181,8 +181,8 @@ try {
     $out = (@(Invoke-SafeLaunch 'cli') -join "`n")
     $cliCall = @($script:started | Where-Object { $_.FilePath -eq 'powershell.exe' }) | Select-Object -First 1
     $cliCommand = if ($cliCall) { [string]$cliCall.Args[-1] } else { '' }
-    Assert 'CLI 在独立终端启动并注入目标 IANA 时区' ($script:exitCode -eq 0 -and $cliCommand.Contains("`$env:TZ = 'America/Los_Angeles'") -and $cliCommand.Contains("& 'C:\Tools\claude.exe'")) "命令=$cliCommand"
-    Assert 'CLI 输出说明注入的时区' ($out -match 'TZ=America/Los_Angeles') "输出=$out"
+    Assert 'CLI 在独立终端启动且不注入冗余 TZ' ($script:exitCode -eq 0 -and (-not $cliCommand.Contains('$env:TZ')) -and $cliCommand.Contains("& 'C:\Tools\claude.exe'")) "命令=$cliCommand"
+    Assert 'CLI 输出不声称注入 TZ' ($out -match '^OK:' -and $out -notmatch 'TZ=') "输出=$out"
 
     $script:exitCode = 0
     $script:started = @()
@@ -247,10 +247,40 @@ try {
     $script:started = @()
     $out = (@(Invoke-ShieldRestore) -join "`n")
     $elevated = @($script:started | Where-Object { $_.Verb -eq 'RunAs' })
-    Assert '本会话 CLI 全部退出后完成撤防' ($script:exitCode -eq 0 -and $out -match '^OK:') "输出=$out"
+    Assert '本会话 CLI 全部退出后完成撤防(无 IPv6 快照时给出 WARN 并整体启用)' ($script:exitCode -eq 0 -and $out -match '(?m)^WARN:未找到护盾开启前的网卡 IPv6 记录' -and $out -match '(?m)^OK:') "输出=$out"
     Assert '只结束本会话的 Claude Code CLI' (($script:stopped -notcontains 4103) -and ($script:stopped -notcontains 4104) -and ((@($script:procs | ForEach-Object { $_.Id }) -join ',') -eq '4103,4104'))
     Assert '提权脚本恢复 IPv6 并还原原时区' ($elevated.Count -eq 1 -and $elevated[0].Script -match 'Enable-NetAdapterBinding' -and $elevated[0].Script.Contains("Set-TimeZone -Id 'China Standard Time'"))
     Assert '撤防时停止保镖任务' ($script:taskStops -ge 1)
+
+    # 4b. 按快照逐块恢复各网卡 IPv6 + 无 home-tz.txt 时明确告警且不乱改时区
+    $script:MockBindings = @(
+        [pscustomobject]@{ Name = '以太网'; Enabled = $true },
+        [pscustomobject]@{ Name = 'Tailscale'; Enabled = $false }
+    )
+    function Get-NetAdapterBinding {
+        [CmdletBinding()]
+        param([string]$ComponentID)
+        $script:MockBindings
+    }
+    $v6StatePath = Join-Path $BASE 'ipv6-state.json'
+    Remove-Item -LiteralPath $v6StatePath -Force -ErrorAction SilentlyContinue
+    Save-HomeIpv6State
+    Assert 'Save-HomeIpv6State 生成网卡状态快照' (Test-Path -LiteralPath $v6StatePath)
+    $script:MockBindings = @(
+        [pscustomobject]@{ Name = '以太网'; Enabled = $false },
+        [pscustomobject]@{ Name = 'Tailscale'; Enabled = $false }
+    )
+    $firstSnapHash = (Get-FileHash -LiteralPath $v6StatePath).Hash
+    Save-HomeIpv6State
+    Assert '全关闭状态下不覆盖已有 IPv6 快照' ((Get-FileHash -LiteralPath $v6StatePath).Hash -eq $firstSnapHash)
+    Remove-Item -LiteralPath (Join-Path $BASE 'home-tz.txt') -Force -ErrorAction SilentlyContinue
+    $script:exitCode = 0
+    $script:started = @()
+    $out = (@(Invoke-ShieldRestore) -join "`n")
+    $elevated = @($script:started | Where-Object { $_.Verb -eq 'RunAs' })
+    Assert '有 IPv6 快照但无原时区记录时给出时区 WARN 且成功撤防' ($script:exitCode -eq 0 -and $out -match '(?m)^WARN:未找到原时区记录' -and $out -match '(?m)^OK:.*恢复 1 块网卡.*其余 1 块保持原关闭') "输出=$out"
+    Assert '按快照仅恢复原启用网卡并保持原关闭网卡,且不调用 Set-TimeZone' ($elevated.Count -eq 1 -and $elevated[0].Script.Contains("Enable-NetAdapterBinding -Name '以太网'") -and $elevated[0].Script.Contains("Disable-NetAdapterBinding -Name 'Tailscale'") -and (-not $elevated[0].Script.Contains('Set-TimeZone'))) "脚本=$($elevated[0].Script)"
+    Assert '成功按快照恢复后清理 ipv6-state.json 以便下次护盾重新采样' (-not (Test-Path -LiteralPath $v6StatePath))
 
     $script:desktopStopOk = $false
     $script:exitCode = 0

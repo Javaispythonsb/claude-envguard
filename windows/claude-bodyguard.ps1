@@ -14,12 +14,49 @@ $PROXY_MODE = if (Test-Path $modeFile) { Get-Content $modeFile -Raw } else { '' 
 if ($PROXY_MODE) { $PROXY_MODE = $PROXY_MODE.Trim() }
 if (-not $PROXY_MODE) { $PROXY_MODE = 'clash-verge' }
 
-# TUN 在线判定:198.18 假IP段优先,否则回退到任意 Up 状态的虚拟网卡(兼容 Astrill/WireGuard/OpenVPN 等)
+# TUN 在线判定:按客户端模式收敛,防止 Tailscale 等常驻虚拟网卡在 Clash TUN 关闭时掩盖掉线
 function Get-TunStatus {
-    if (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like '198.18.*' }) {
+    $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    if ($PROXY_MODE -eq 'wireguard') {
+        $wgNic = $upAdapters | Where-Object {
+            ($_.Name -notmatch '(?i)Tailscale' -and $_.InterfaceDescription -notmatch '(?i)Tailscale') -and
+            ($_.InterfaceDescription -match '(?i)(WireGuard|Wintun)' -or $_.Name -match '(?i)^wg')
+        } | Select-Object -First 1
+        if ($wgNic) { return @{ up = $true; detail = "WireGuard网卡($($wgNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    $fakeIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPAddress -match '^198\.1[89]\.' -and (-not $_.AddressState -or [string]$_.AddressState -eq 'Preferred')
+    }
+    if ($fakeIp) {
         return @{ up = $true; detail = '198.18 假IP段' }
     }
-    $nic = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'TAP|TUN|WireGuard|Wintun|VPN|Tailscale') }
+    $mihomoNic = $upAdapters | Where-Object {
+        $_.Name -match '^(?i)(Mihomo|Meta|Clash|FlClash)' -or
+        $_.InterfaceDescription -match '(?i)(Meta Tunnel|Mihomo|FlClash|Clash)'
+    } | Select-Object -First 1
+    if ($PROXY_MODE -in @('clash-verge', 'flclash')) {
+        if ($mihomoNic) { return @{ up = $true; detail = "Mihomo网卡($($mihomoNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    if ($PROXY_MODE -in @('sing-box', 'clashx', 'surge')) {
+        $clientNic = $upAdapters | Where-Object {
+            ($_.Name -notmatch '(?i)Tailscale' -and $_.InterfaceDescription -notmatch '(?i)Tailscale') -and
+            ($_.Name -match '(?i)(sing|tun|utun|Clash|Surge|Mihomo|Meta)' -or $_.InterfaceDescription -match '(?i)(sing|Wintun|TAP|TUN|Meta Tunnel|Clash|Surge)')
+        } | Select-Object -First 1
+        if ($clientNic) { return @{ up = $true; detail = "客户端TUN($($clientNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    if ($PROXY_MODE -eq 'auto') {
+        $mihomoRunning = [bool](Get-Process -Name 'verge-mihomo','FlClashCore','FlClash' -ErrorAction SilentlyContinue)
+        $otherRunning  = [bool](Get-Process -Name 'sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) -or
+                         [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running')
+        if ($mihomoRunning -and -not $otherRunning) {
+            if ($mihomoNic) { return @{ up = $true; detail = "Mihomo网卡($($mihomoNic.Name))" } }
+            return @{ up = $false; detail = '不在线' }
+        }
+    }
+    $nic = $upAdapters | Where-Object { $_.InterfaceDescription -match 'TAP|TUN|WireGuard|Wintun|VPN|Tailscale' } | Select-Object -First 1
     if ($nic) { return @{ up = $true; detail = '通用虚拟网卡' } }
     return @{ up = $false; detail = '不在线' }
 }

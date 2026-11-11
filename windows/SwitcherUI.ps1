@@ -379,6 +379,7 @@ $win = [Windows.Markup.XamlReader]::Load($reader)
 $rows = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $win.FindName('CheckList').ItemsSource = $rows
 $checkNames = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
+$hardChecks = @('代理内核','TUN网卡','出口IP','时区','地区','IPv6','保镖','规则置顶')
 $clientModes = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')
 $script:isBusy = $false
 $script:environmentReady = $false
@@ -570,8 +571,16 @@ function Apply-CheckOutput([string]$Text, [int]$ExitCode) {
             $detail = if ($state.Count -gt 1) { $state[1] } else { '' }
             switch ($state[0]) {
                 'ok' { $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '通过'; Color = '#FF22C55E' } }
-                'warn' { $hasWarn = $true; $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '警告'; Color = '#FFFACC15' } }
-                'skip' { $hasSkip = $true; $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '跳过'; Color = '#FF6B7280' } }
+                'warn' {
+                    $hasWarn = $true
+                    if ($hardChecks -contains $rows[$i].Name) { $valid = $false }
+                    $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '警告'; Color = '#FFFACC15' }
+                }
+                'skip' {
+                    $hasSkip = $true
+                    if ($hardChecks -contains $rows[$i].Name) { $valid = $false }
+                    $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '跳过'; Color = '#FF6B7280' }
+                }
                 default { $valid = $false; $rows[$i] = [pscustomobject]@{ Name = $rows[$i].Name; Detail = $detail; StateText = '失败'; Color = '#FFF87171' } }
             }
             break

@@ -118,9 +118,18 @@ $CLASH_DIR = @(
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
-# check-update / rules-status / diagnose-proxy / 只读 uistate 不在检查路径上创建任何目录
-if ($args.Count -eq 0 -or ($args[0] -notin @('check-update','rules-status','diagnose-proxy','upstream-status') -and -not ($args[0] -eq 'uistate' -and ($args.Count -lt 2 -or $args[1] -ne '--fresh')))) {
+# check-update / rules-status / diagnose-proxy / upstream-status / 只读 uistate 不在检查路径上创建任何目录;
+# accounts 子目录仅在旧版切换/快照命令中按需创建,EnvGuard 命令只建 $BASE
+$readOnlyCommands = @('check-update','rules-status','diagnose-proxy','upstream-status')
+$accountCommands = @('status','switch','snapshot-export','snapshot-import')
+if ($args.Count -eq 0) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
+} elseif ($args[0] -notin $readOnlyCommands -and -not ($args[0] -eq 'uistate' -and ($args.Count -lt 2 -or $args[1] -ne '--fresh'))) {
+    if ($args[0] -in $accountCommands) {
+        New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
+    } else {
+        New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+    }
 }
 
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Out-File -Append -Encoding utf8 $LOG }
@@ -406,12 +415,49 @@ function Set-ClientMode([string]$Mode) {
     }
 }
 
-# TUN 在线判定:198.18 假IP段优先,否则回退到任意 Up 状态的虚拟网卡(兼容 Astrill/WireGuard/OpenVPN 等)
+# TUN 在线判定:按客户端模式收敛,防止 Tailscale 等常驻虚拟网卡在 Clash TUN 关闭时掩盖掉线
 function Get-TunStatus {
-    if (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -like '198.18.*' }) {
+    $upAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    if ($PROXY_MODE -eq 'wireguard') {
+        $wgNic = $upAdapters | Where-Object {
+            ($_.Name -notmatch '(?i)Tailscale' -and $_.InterfaceDescription -notmatch '(?i)Tailscale') -and
+            ($_.InterfaceDescription -match '(?i)(WireGuard|Wintun)' -or $_.Name -match '(?i)^wg')
+        } | Select-Object -First 1
+        if ($wgNic) { return @{ up = $true; detail = "WireGuard网卡($($wgNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    $fakeIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPAddress -match '^198\.1[89]\.' -and (-not $_.AddressState -or [string]$_.AddressState -eq 'Preferred')
+    }
+    if ($fakeIp) {
         return @{ up = $true; detail = '198.18 假IP段' }
     }
-    $nic = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.InterfaceDescription -match 'TAP|TUN|WireGuard|Wintun|VPN|Tailscale') }
+    $mihomoNic = $upAdapters | Where-Object {
+        $_.Name -match '^(?i)(Mihomo|Meta|Clash|FlClash)' -or
+        $_.InterfaceDescription -match '(?i)(Meta Tunnel|Mihomo|FlClash|Clash)'
+    } | Select-Object -First 1
+    if ($PROXY_MODE -in @('clash-verge', 'flclash')) {
+        if ($mihomoNic) { return @{ up = $true; detail = "Mihomo网卡($($mihomoNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    if ($PROXY_MODE -in @('sing-box', 'clashx', 'surge')) {
+        $clientNic = $upAdapters | Where-Object {
+            ($_.Name -notmatch '(?i)Tailscale' -and $_.InterfaceDescription -notmatch '(?i)Tailscale') -and
+            ($_.Name -match '(?i)(sing|tun|utun|Clash|Surge|Mihomo|Meta)' -or $_.InterfaceDescription -match '(?i)(sing|Wintun|TAP|TUN|Meta Tunnel|Clash|Surge)')
+        } | Select-Object -First 1
+        if ($clientNic) { return @{ up = $true; detail = "客户端TUN($($clientNic.Name))" } }
+        return @{ up = $false; detail = '不在线' }
+    }
+    if ($PROXY_MODE -eq 'auto') {
+        $mihomoRunning = [bool](Get-Process -Name 'verge-mihomo','FlClashCore','FlClash' -ErrorAction SilentlyContinue)
+        $otherRunning  = [bool](Get-Process -Name 'sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) -or
+                         [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running')
+        if ($mihomoRunning -and -not $otherRunning) {
+            if ($mihomoNic) { return @{ up = $true; detail = "Mihomo网卡($($mihomoNic.Name))" } }
+            return @{ up = $false; detail = '不在线' }
+        }
+    }
+    $nic = $upAdapters | Where-Object { $_.InterfaceDescription -match 'TAP|TUN|WireGuard|Wintun|VPN|Tailscale' } | Select-Object -First 1
     if ($nic) { return @{ up = $true; detail = '通用虚拟网卡' } }
     return @{ up = $false; detail = '不在线' }
 }
@@ -485,6 +531,27 @@ function Start-ProbePrefetch($Egress) {
     if (-not $Egress -or $Egress.skipped -or -not (Test-ProxyPathAlive)) { return }
     $definitions = "function Invoke-ProbeText {`n$(${function:Invoke-ProbeText})`n}`nfunction Invoke-ProbeCode {`n$(${function:Invoke-ProbeCode})`n}"
     $jobs = @()
+    $dnsToken = ''
+    if (-not (Test-CheckDisabled 'DNS')) {
+        $dnsToken = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')).Substring(0, 40)
+        $dnsDetectUrl = "https://$dnsToken.ipleak.net/dnsdetection/"
+        $dnsChain = @'
+$results = @{}
+$detectBody = Invoke-ProbeText -Url $Url -Attempts 2 -TimeoutSec 6
+$results["text|$Url"] = $detectBody
+try {
+    $detectObj = $detectBody | ConvertFrom-Json -ErrorAction Stop
+    if ($detectObj -and $detectObj.ip -is [pscustomobject]) {
+        foreach ($rip in @($detectObj.ip.PSObject.Properties.Name | Where-Object { $_ } | Select-Object -First 4)) {
+            $rUrl = "https://ipleak.net/json/$([Uri]::EscapeDataString([string]$rip))"
+            $results["text|$rUrl"] = Invoke-ProbeText -Url $rUrl -Attempts 2 -TimeoutSec 5
+        }
+    }
+} catch {}
+$results
+'@
+        $jobs += New-ProbePrefetchJob $definitions $dnsChain @($dnsDetectUrl, '') '^text\|https://([0-9a-f]+\.)?ipleak\.net/'
+    }
     if ($Egress.ip -and -not (Test-CheckDisabled 'ASN属性')) {
         $ipInfoUrl = "https://ipinfo.io/$([Uri]::EscapeDataString([string]$Egress.ip))/json"
         $asnChain = @'
@@ -507,7 +574,7 @@ $results
             $jobs += New-ProbePrefetchJob $definitions '@{ ("code|" + $Url) = (Invoke-ProbeCode -Url $Url) }' @($url, '') ('^code\|' + [regex]::Escape($url) + '$')
         }
     }
-    $script:ProbePrefetch = @{ Jobs = $jobs; Results = @{} }
+    $script:ProbePrefetch = @{ Jobs = $jobs; Results = @{}; DnsToken = $dnsToken }
 }
 
 function New-ProbePrefetchJob([string]$Definitions, [string]$Body, [object[]]$Arguments, [string]$KeyPattern) {
@@ -650,6 +717,24 @@ function Save-HomeTimeZone([string]$TargetTz) {
     $current = (Get-TimeZone).Id
     if ((Test-Path -LiteralPath $homeTzFile) -or -not $current -or $current -eq $TargetTz) { return }
     try { [System.IO.File]::WriteAllText($homeTzFile, $current, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+
+# 记录关闭 IPv6 前各网卡的 ms_tcpip6 原状态(仅在尚无快照且至少有一块网卡启用 IPv6 时记录,避免把护盾态当成日常态)
+function Save-HomeIpv6State {
+    $stateFile = Join-Path $BASE 'ipv6-state.json'
+    if (Test-Path -LiteralPath $stateFile) { return }
+    $bindings = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue)
+    if (-not @($bindings | Where-Object { $_.Enabled }).Count) { return }
+    $map = [ordered]@{}
+    foreach ($b in $bindings) {
+        if ($b -and $b.Name) { $map[[string]$b.Name] = [bool]$b.Enabled }
+    }
+    if ($map.Count -eq 0) { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $BASE -ErrorAction Stop | Out-Null
+        $payload = ([pscustomobject]@{ version = 1; adapters = [pscustomobject]$map }) | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($stateFile, $payload, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
 }
 
 # 保镖健康度检查:不仅看计划任务是否存在,还实查运行态/心跳与 72h·电池策略隐患
@@ -1549,10 +1634,44 @@ function Test-ClashScriptManaged {
     try { return ([System.IO.File]::ReadAllText($p)) -match '// >>> claude-switcher managed rules >>>' } catch { return $false }
 }
 
+function Test-MihomoClientSelected {
+    if ($PROXY_MODE -in @('clash-verge', 'flclash')) { return $true }
+    if ($PROXY_MODE -ne 'auto') { return $false }
+    if (Get-Process -Name 'verge-mihomo','FlClashCore','FlClash' -ErrorAction SilentlyContinue) { return $true }
+    if ((Get-Process -Name 'sing-box','ClashX','Surge' -ErrorAction SilentlyContinue) -or
+        (Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running')) {
+        return $false
+    }
+    return (Test-Path -LiteralPath $CLASH_DIR) -or [bool](Get-FlClashConfigPath)
+}
+
 function Get-RulesStatus {
+    if (-not (Test-MihomoClientSelected)) {
+        $wgMode = ($PROXY_MODE -eq 'wireguard') -or ($PROXY_MODE -eq 'auto' -and [bool](Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running'))
+        if ($wgMode) {
+            $wgUp = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+                $_.Status -eq 'Up' -and
+                ($_.Name -notmatch '(?i)Tailscale' -and $_.InterfaceDescription -notmatch '(?i)Tailscale') -and
+                ($_.InterfaceDescription -match '(?i)(WireGuard|Wintun)' -or $_.Name -match '(?i)^wg')
+            })
+            $wgIdx = @($wgUp | ForEach-Object { if ($null -ne $_.ifIndex) { [int]$_.ifIndex } elseif ($null -ne $_.InterfaceIndex) { [int]$_.InterfaceIndex } })
+            $defRoute = @()
+            if ($wgIdx.Count -gt 0) {
+                $defRoute = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $wgIdx -contains [int]$_.InterfaceIndex })
+            }
+            if ($defRoute.Count -gt 0) { return '规则置顶=ok:WireGuard 全局路由已接管' }
+            return '规则置顶=warn:WireGuard 未检测到全局默认路由(0.0.0.0/0),无法核验分流'
+        }
+        $d1 = (Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+        $d2 = (Resolve-DnsName api.anthropic.com -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+        if ($d1 -match '^198\.1[89]\.' -and $d2 -match '^198\.1[89]\.') {
+            return '规则置顶=ok:Fake-IP 已接管 Claude 域名(非 Mihomo 客户端,STUN 规则请自行确认)'
+        }
+        return "规则置顶=warn:非 Mihomo 客户端($PROXY_MODE)未检测到 Fake-IP 接管,无法核验置顶规则"
+    }
     $mode = Get-ClashMode
-    if ($mode -eq 'global') { return '规则置顶=ok:全局模式(规则不适用)' }
-    if ($mode -eq 'direct') { return '规则置顶=ok:直连模式(规则不适用)' }
+    if ($mode -eq 'global') { return '规则置顶=ok:全局模式(全部流量走代理)' }
+    if ($mode -eq 'direct') { return '规则置顶=fail:直连模式(流量不走代理)' }
     if ($mode -eq 'unknown') { return '规则置顶=warn:无法确认 Clash 模式,未检查规则' }
     $rulesInfo = Get-ClashRules
     if ($rulesInfo.available) {
@@ -1561,6 +1680,74 @@ function Get-RulesStatus {
     }
     if (Test-ClashScriptManaged) { return "规则置顶=warn:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))" }
     return '规则置顶=fail:未配置'
+}
+
+function Format-MaskedIp([string]$Ip) {
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return '未知' }
+    $v = $Ip.Trim()
+    if ($v -match '^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$') { return "$($Matches[1]).$($Matches[2]).*.*" }
+    if ($v.Contains(':')) {
+        $parts = @($v.Split(':') | Where-Object { $_ -ne '' })
+        if ($parts.Count -ge 2) { return "$($parts[0]):$($parts[1]):*" }
+        return '*:*'
+    }
+    return $v
+}
+
+function Test-DnsResolverVerdict([string]$LocalIp, [bool]$IsFakeIp, [object[]]$Resolvers, [bool]$DetectReachable) {
+    $displayLocal = if ($IsFakeIp) { $LocalIp } else { Format-MaskedIp $LocalIp }
+    if ($DetectReachable -and $Resolvers.Count -gt 0) {
+        $cn = @($Resolvers | Where-Object { $_.country -eq 'CN' })
+        if ($cn.Count -gt 0) {
+            $masked = ($cn | ForEach-Object { Format-MaskedIp $_.ip }) -join ','
+            $prefix = if ($IsFakeIp) { "Fake-IP($displayLocal)但上游经国内解析器" } else { '经国内解析器' }
+            return @{ state = 'fail'; detail = "${prefix}($masked)" }
+        }
+        if (@($Resolvers | Where-Object { -not $_.country }).Count -gt 0) {
+            if ($IsFakeIp) { return @{ state = 'warn'; detail = "Fake-IP($displayLocal) · 部分解析器归属未知" } }
+            return @{ state = 'fail'; detail = "实IP($displayLocal) · 部分解析器归属未知" }
+        }
+        $countries = @($Resolvers | ForEach-Object { $_.country } | Select-Object -Unique) -join '/'
+        if ($IsFakeIp) { return @{ state = 'ok'; detail = "Fake-IP走隧道 · 解析器位于 $countries" } }
+        return @{ state = 'ok'; detail = "实IP解析 · 解析器位于 $countries" }
+    }
+    if ($IsFakeIp) { return @{ state = 'warn'; detail = "Fake-IP($displayLocal)已接管,未确认上游解析器归属" } }
+    return @{ state = 'fail'; detail = "未命中Fake-IP($displayLocal)且无法核验解析器归属" }
+}
+
+function Test-DnsCheck {
+    $rec = Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1
+    $dns = if ($rec -and $rec.IPAddress) { ([string]$rec.IPAddress).Trim() } else { '' }
+    if (-not $dns) { return @{ state = 'fail'; detail = '域名解析失败(claude.ai)' } }
+    if ($dns -match '^(0\.|127\.)') { return @{ state = 'fail'; detail = "异常解析地址($dns)" } }
+    $isFakeIp = ($dns -match '^198\.1[89]\.')
+    if (-not (Test-ProxyPathAlive)) {
+        return @{ state = 'fail'; detail = '代理路径失效,已跳过解析器探测(避免真实 IP 出网)' }
+    }
+    $token = if ($script:ProbePrefetch -and $script:ProbePrefetch.DnsToken) {
+        [string]$script:ProbePrefetch.DnsToken
+    } else {
+        ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')).Substring(0, 40)
+    }
+    $detectReachable = $false
+    $resolvers = @()
+    try {
+        $detectRaw = Invoke-ProbeText -Url "https://$token.ipleak.net/dnsdetection/" -Attempts 2 -TimeoutSec 6
+        $detectObj = $detectRaw | ConvertFrom-Json -ErrorAction Stop
+        if ($null -ne $detectObj -and $null -ne $detectObj.ip -and $detectObj.ip -is [pscustomobject]) {
+            $detectReachable = $true
+            foreach ($rip in @($detectObj.ip.PSObject.Properties.Name | Where-Object { $_ } | Select-Object -First 4)) {
+                $cc = ''
+                try {
+                    $infoRaw = Invoke-ProbeText -Url "https://ipleak.net/json/$([Uri]::EscapeDataString([string]$rip))" -Attempts 2 -TimeoutSec 5
+                    $infoObj = $infoRaw | ConvertFrom-Json -ErrorAction Stop
+                    $cc = ([string]$infoObj.country_code).Trim().ToUpperInvariant()
+                } catch {}
+                $resolvers += [pscustomobject]@{ ip = [string]$rip; country = $cc }
+            }
+        }
+    } catch {}
+    return (Test-DnsResolverVerdict $dns $isFakeIp $resolvers $detectReachable)
 }
 
 function Add-IpHistory([string]$Ip) {
@@ -1629,14 +1816,8 @@ function Invoke-CheckDetail {
     $v6off = [bool](Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true })
     if (-not $v6off) { "IPv6=ok:已关闭" } else { "IPv6=fail:未关闭" }
 
-    if (Test-CheckDisabled 'DNS') {
-        Format-OptionalResult 'DNS' 'ok'
-    } else {
-        $dns = (Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
-        if ($dns -like '198.18.*') { Format-OptionalResult 'DNS' 'ok' '走隧道' } else { Format-OptionalResult 'DNS' 'fail' "未走隧道($dns)" }
-    }
-
-    if (Test-CheckDisabled 'WebRTC') {
+    # 先执行本地 WebRTC STUN 与控制接口检查,让后台预取的 DNS(ipleak) 与 ASN/生态请求并行跑完后再收集,输出顺序不变
+    $webrtcLine = if (Test-CheckDisabled 'WebRTC') {
         Format-OptionalResult 'WebRTC' 'ok'
     } else {
         $w = Test-WebRTC $e.ip
@@ -1644,10 +1825,20 @@ function Invoke-CheckDetail {
     }
 
     $bgHealth = Get-BodyguardHealth
-    if ($bgHealth.state -eq 'ok') { "保镖=ok:$($bgHealth.detail)" }
-    else { "保镖=$($bgHealth.state):$($bgHealth.detail)" }
+    $bgLine = if ($bgHealth.state -eq 'ok') { "保镖=ok:$($bgHealth.detail)" } else { "保镖=$($bgHealth.state):$($bgHealth.detail)" }
 
-    Get-RulesStatus
+    $rulesLine = Get-RulesStatus
+
+    if (Test-CheckDisabled 'DNS') {
+        Format-OptionalResult 'DNS' 'ok'
+    } else {
+        $dnsRes = Test-DnsCheck
+        Format-OptionalResult 'DNS' ([string]$dnsRes.state) ([string]$dnsRes.detail)
+    }
+
+    $webrtcLine
+    $bgLine
+    $rulesLine
 
     # Claude 的语言设置独立于 Windows 显示语言，使用当前数据目录中的配置。
     if (Test-CheckDisabled '客户端语言') {
@@ -1717,20 +1908,25 @@ function Invoke-CheckDetail {
     Stop-ProbePrefetch
 }
 
+$HARD_CHECKS = @('代理内核','TUN网卡','出口IP','时区','地区','IPv6','保镖','规则置顶')
+
 function Invoke-Check {
     $results = @(Invoke-CheckDetail)
-    $states = @{}
+    $states = [ordered]@{}
     $invalid = $false
     foreach ($line in $results) {
         if ($line -notmatch '^([^=]+)=(ok|warn|fail|skip)(?::.*)?$') { continue }
         $name = $Matches[1]; $state = $Matches[2]
-        if ($states.ContainsKey($name)) { $invalid = $true; continue }
+        if ($states.Contains($name)) { $invalid = $true; continue }
         $states[$name] = $state
     }
-    $failed = @($states.Keys | Where-Object { $states[$_] -eq 'fail' })
-    if ($invalid -or $states.Count -ne 14 -or $failed.Count -gt 0) {
+    # 8 项硬性检查必须全部为 ok(warn/skip 同样阻断);6 项可选检查仅 fail 阻断
+    $blocked = @($states.Keys | Where-Object {
+        $states[$_] -eq 'fail' -or (($HARD_CHECKS -contains $_) -and $states[$_] -ne 'ok')
+    })
+    if ($invalid -or $states.Count -ne 14 -or $blocked.Count -gt 0) {
         $script:exitCode = 1
-        $detail = if ($failed.Count) { $failed -join '、' } else { '检查输出不完整或重复' }
+        $detail = if ($blocked.Count) { $blocked -join '、' } else { '检查输出不完整或重复' }
         "FAIL:$detail"
         return
     }
@@ -1764,7 +1960,10 @@ function Invoke-Fix {
         $tzEscFix = $TZ_TARGET.Replace("'", "''")
         $adminScript += "Set-TimeZone -Id '$tzEscFix'"
     }
-    if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) { $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false" }
+    if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) {
+        Save-HomeIpv6State
+        $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false"
+    }
     $adminScript += "Clear-DnsClientCache"
     $bgFix = Get-BodyguardHealth
     $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
@@ -1788,7 +1987,7 @@ function Invoke-Fix {
     if ($adminScript.Count -gt 0) {
         "FIX:修复时区/IPv6/DNS/保镖(需要管理员授权)..."
         $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
-        ($adminScript -join "`n") | Out-File -Encoding utf8 $tmp
+        [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
         try { Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" } catch { "FIX:管理员授权被取消" }
         Remove-Item $tmp -ErrorAction SilentlyContinue
         "FIX:时区/IPv6/DNS/保镖 ✓"
@@ -3062,6 +3261,11 @@ function Invoke-UpdateNow {
 
 # 只读诊断:控制接口是否可达、Script.js 是否写入、内核前 18 条规则是什么
 function Invoke-RulesStatus {
+    if (-not (Test-MihomoClientSelected)) {
+        "client=$PROXY_MODE(非 Mihomo 客户端,无 Mihomo 控制接口)"
+        Get-RulesStatus
+        return
+    }
     $api = Get-ClashApi
     "mode=$(Get-ClashMode)"
     if ($api) {
@@ -3135,8 +3339,6 @@ function Invoke-SafeLaunch([string]$Target = 'desktop', [string[]]$ExtraArgs = @
         'OK:环境检查通过,已安全启动 Claude 桌面版'
         return
     }
-    # 只对 CLI 注入 TZ:Node/Bun 读取它,而桌面版的 Chromium 渲染进程在 Windows 上忽略 TZ,只能靠系统时区
-    $ianaTz = ConvertFrom-WindowsTimeZone $TZ_TARGET $COUNTRY_TARGET
     $cliCmd = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $cliCmd) {
         $bundledRoot = Join-Path $DATA 'claude-code'
@@ -3152,13 +3354,12 @@ function Invoke-SafeLaunch([string]$Target = 'desktop', [string[]]$ExtraArgs = @
         'FAIL:未找到 Claude Code CLI(claude)'
         return
     }
-    $argLine = if ($ExtraArgs.Count -gt 0) { ConvertTo-WindowsCommandLine $ExtraArgs } else { '' }
+    $argLine = if ($ExtraArgs.Count -gt 0) { ' ' + (ConvertTo-WindowsCommandLine $ExtraArgs) } else { '' }
     $escapedCli = $cliPath.Replace("'", "''")
-    $escapedTz  = $ianaTz.Replace("'", "''")
-    $launchCmd  = "`$env:TZ = '$escapedTz'; & '$escapedCli' $argLine"
+    $launchCmd  = "& '$escapedCli'$argLine"
     Start-Process powershell.exe -ArgumentList @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-Command',$launchCmd) -ErrorAction Stop | Out-Null
-    Log "安全启动 Claude Code CLI(TZ=$ianaTz)"
-    "OK:环境检查通过,已在独立终端启动 Claude Code CLI(注入 TZ=$ianaTz)"
+    Log '安全启动 Claude Code CLI'
+    'OK:环境检查通过,已在独立终端启动 Claude Code CLI'
 }
 
 # npm/bun 方式运行的 Claude Code CLI;原生 claude.exe 与桌面版同名,由 Stop-ClaudeApp 一并处理
@@ -3181,7 +3382,7 @@ function Stop-ClaudeCliHosts {
 }
 
 function Invoke-ShieldRestore {
-    # Fail-Closed:恢复 IPv6/停保镖前必须先确保受保护进程已完全退出,绝不在运行中撤防
+    # 撤防前必须先确保受保护进程已完全退出,绝不在运行中撤防
     if (-not (Stop-ClaudeApp)) {
         $script:exitCode = 1
         'FAIL:Claude 桌面版未能退出,拒绝在运行中撤除防护'
@@ -3197,6 +3398,16 @@ function Invoke-ShieldRestore {
     if (Test-Path -LiteralPath $homeTzFile -PathType Leaf) {
         try { $restoreTz = ([System.IO.File]::ReadAllText($homeTzFile, [System.Text.Encoding]::UTF8)).Trim() } catch {}
     }
+    $ipv6StateFile = Join-Path $BASE 'ipv6-state.json'
+    $savedAdapters = $null
+    if (Test-Path -LiteralPath $ipv6StateFile -PathType Leaf) {
+        try {
+            $parsedState = ([System.IO.File]::ReadAllText($ipv6StateFile, [System.Text.Encoding]::UTF8)) | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $parsedState -and [int]$parsedState.version -eq 1 -and $parsedState.adapters -is [pscustomobject]) {
+                $savedAdapters = $parsedState.adapters
+            }
+        } catch {}
+    }
     try { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
     $hbFile = Join-Path $BASE 'bodyguard-heartbeat.txt'
     if (Test-Path -LiteralPath $hbFile) {
@@ -3207,17 +3418,54 @@ function Invoke-ShieldRestore {
         Remove-Item -LiteralPath $hbFile -Force -ErrorAction SilentlyContinue
     }
     $adminLines = @(
-        "Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue",
-        "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { -not `$_.Enabled } | Enable-NetAdapterBinding -Confirm:`$false"
+        "Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue"
     )
-    if ($restoreTz -and (Get-TimeZone).Id -ne $restoreTz) {
-        $tzEsc = $restoreTz.Replace("'", "''")
-        $adminLines += "Set-TimeZone -Id '$tzEsc'"
+    $ipv6Summary = ''
+    if ($null -ne $savedAdapters) {
+        $enableNames = @()
+        $disableNames = @()
+        foreach ($prop in @($savedAdapters.PSObject.Properties)) {
+            if (-not $prop.Name) { continue }
+            if ([bool]$prop.Value) { $enableNames += [string]$prop.Name }
+            else { $disableNames += [string]$prop.Name }
+        }
+        foreach ($name in $enableNames) {
+            $esc = $name.Replace("'", "''")
+            $adminLines += "Enable-NetAdapterBinding -Name '$esc' -ComponentID ms_tcpip6 -Confirm:`$false -ErrorAction SilentlyContinue"
+        }
+        foreach ($name in $disableNames) {
+            $esc = $name.Replace("'", "''")
+            $adminLines += "Disable-NetAdapterBinding -Name '$esc' -ComponentID ms_tcpip6 -Confirm:`$false -ErrorAction SilentlyContinue"
+        }
+        $ipv6Summary = if ($disableNames.Count -gt 0) {
+            "已按原记录恢复 $($enableNames.Count) 块网卡的 IPv6(其余 $($disableNames.Count) 块保持原关闭)"
+        } else {
+            "已按原记录恢复 $($enableNames.Count) 块网卡的 IPv6"
+        }
+    } else {
+        'WARN:未找到护盾开启前的网卡 IPv6 记录(ipv6-state.json),将对当前所有网卡启用 IPv6'
+        $adminLines += "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { -not `$_.Enabled } | Enable-NetAdapterBinding -Confirm:`$false"
+        $ipv6Summary = '已对全部网卡启用 IPv6(无原状态记录)'
+    }
+    $currentTz = (Get-TimeZone).Id
+    $tzSummary = ''
+    if ($restoreTz) {
+        if ($currentTz -ne $restoreTz) {
+            $tzEsc = $restoreTz.Replace("'", "''")
+            $adminLines += "Set-TimeZone -Id '$tzEsc'"
+            $adminLines += "if ((Get-TimeZone).Id -ne '$tzEsc') { exit 1 }"
+            $tzSummary = "已还原时区为 $restoreTz"
+        } else {
+            $tzSummary = "时区已是原记录($restoreTz)"
+        }
+    } else {
+        "WARN:未找到原时区记录(home-tz.txt,可能由旧版安装器修改),未改动当前时区($currentTz),如需恢复请在系统设置手动调整"
+        $tzSummary = "无原时区记录(保持 $currentTz)"
     }
     $adminLines += "Clear-DnsClientCache"
     $tmp = "$env:TEMP\claude-restore-$([guid]::NewGuid().Guid).ps1"
     try {
-        ($adminLines -join "`r`n") | Out-File -Encoding utf8 $tmp
+        [System.IO.File]::WriteAllText($tmp, ($adminLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
         $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
         if (-not $proc -or $proc.ExitCode -ne 0) {
             $script:exitCode = 1
@@ -3231,8 +3479,11 @@ function Invoke-ShieldRestore {
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
-    Log "已退出护盾并恢复日常网络设置$(if ($restoreTz) { "(时区->$restoreTz)" })"
-    "OK:已暂停保镖、恢复网卡 IPv6$(if ($restoreTz) { " 并还原时区为 $restoreTz" })"
+    if ($null -ne $savedAdapters) {
+        Remove-Item -LiteralPath $ipv6StateFile -Force -ErrorAction SilentlyContinue
+    }
+    Log "已退出护盾($ipv6Summary;$tzSummary)"
+    "OK:已暂停保镖，$ipv6Summary，$tzSummary"
 }
 
 function Invoke-UiState([bool]$Fresh = $false) {
@@ -3262,9 +3513,16 @@ function Invoke-UiState([bool]$Fresh = $false) {
     }
     $bg = Get-BodyguardHealth
     $ianaTz = ConvertFrom-WindowsTimeZone $TZ_TARGET $COUNTRY_TARGET
+    $stateMap = @{}
+    foreach ($c in $checks) { $stateMap[$c.name] = $c.state }
+    $ready = ($checks.Count -eq 14) -and
+        (-not @($checks | Where-Object { $_.state -eq 'fail' }).Count) -and
+        (-not @($HARD_CHECKS | Where-Object { $stateMap[$_] -ne 'ok' }).Count)
     $stateObj = [ordered]@{
         schema_version = 1
         version        = (Get-AppVersion)
+        ready          = [bool]$ready
+        hard_checks    = $HARD_CHECKS
         proxy_mode     = $PROXY_MODE
         clients        = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')
         flclash_port   = $portSetting

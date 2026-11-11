@@ -309,6 +309,13 @@ async function checkFingerprint() {
   };
 }
 
+export function summarizeMobileChecks(checks) {
+  const leakItems = [checks.egress, checks.region, checks.webrtc, checks.ipv6, checks.dns].filter(Boolean);
+  const fails = leakItems.filter((x) => x.state === 'fail').length;
+  const warns = leakItems.filter((x) => x.state === 'warn').length;
+  return { fails, warns, leakTotal: leakItems.length, fpState: checks.fp ? checks.fp.state : 'skip' };
+}
+
 export async function runMobileSelfCheck(onStep) {
   const egress = await checkEgress();
   onStep('egress', egress);
@@ -327,8 +334,5 @@ export async function runMobileSelfCheck(onStep) {
     : { state: 'ok', detail: '当前浏览器已禁用 WebRTC API' };
   onStep('webrtc', webrtc);
 
-  const all = [egress, region, webrtc, ipv6, dns, fp];
-  const fails = all.filter((x) => x.state === 'fail').length;
-  const warns = all.filter((x) => x.state === 'warn').length;
-  return { fails, warns, total: all.length };
+  return summarizeMobileChecks({ egress, region, webrtc, ipv6, dns, fp });
 }

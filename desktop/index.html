@@ -16,10 +16,10 @@
     <header class="topbar">
       <div class="topbar-l">
         <span class="pulse-dot" id="topDot"></span>
-        <span class="tbar"><b>envguard</b> — fail-closed leak protection</span>
+        <span class="tbar"><b>envguard</b> — launch gate &amp; runtime kill-switch</span>
       </div>
       <div class="topbar-r">
-        <button class="chip-btn" id="btnSwitchMobileView" title="打开浏览器侧 6 项防漏自检">📱 浏览器信号自检</button>
+        <button class="chip-btn" id="btnSwitchMobileView" title="打开浏览器侧 5 项防漏自检 + 硬件摘要">📱 浏览器侧自检</button>
         <div class="theme-seg">
           <button class="tbtn on" data-theme-pick="terminal">终端绿</button>
           <button class="tbtn" data-theme-pick="cyber">赛博</button>
@@ -34,7 +34,7 @@
           <div class="logo">EG</div>
           <div>
             <h1>Claude 环境卫士</h1>
-            <span>ENVGUARD // 防泄漏控制台</span>
+            <span>ENVGUARD // 启动门禁 · 掉线急停</span>
           </div>
         </div>
 
@@ -46,10 +46,10 @@
 
         <div class="guard">
           <div class="row">
-            <span class="row-l"><span class="dot" id="guardDot"></span> 保镖 / KILL-SWITCH</span>
+            <span class="row-l"><span class="dot" id="guardDot"></span> 保镖 / 进程级急停</span>
             <span class="badge" id="guardBadge">检测中</span>
           </div>
-          <p id="guardDesc">10s 双因子巡检（内核 × TUN），掉线即刻终止 Claude 桌面版与 CLI。</p>
+          <p id="guardDesc">10s 双因子巡检（内核 × TUN），掉线终止 Claude 桌面版与 CLI（进程级急停，存在巡检周期窗口，非防火墙级阻断）。</p>
         </div>
       </aside>
 
@@ -59,7 +59,7 @@
         <section class="view active" data-view="overview">
           <div class="head">
             <div>
-              <div class="kicker">FAIL-CLOSED LAUNCH GATE</div>
+              <div class="kicker">PRE-LAUNCH AUDIT GATE</div>
               <h2>环境安全总览<span class="blink"></span></h2>
             </div>
             <div class="actions">
@@ -80,7 +80,7 @@
                 <div class="sicon warn" id="heroIcon">…</div>
                 <div>
                   <h3 id="heroTitle">正在执行 14 项环境安全审计…</h3>
-                  <p id="heroDesc">硬性红线全部通过后自动解锁启动入口。</p>
+                  <p id="heroDesc">8 项硬性红线（含无警告要求）全部通过且无失败项后，自动解锁启动入口。</p>
                 </div>
                 <div class="pill warn" id="heroPill">AUDITING</div>
               </div>
@@ -119,7 +119,7 @@
                 </div>
               </div>
               <div class="shield-bar">
-                <span>收工不用时恢复网卡 IPv6 与原时区</span>
+                <span>收工还原已记录的网卡 IPv6 与原时区</span>
                 <button class="btn ghost sm" id="btnShieldRestore">退出护盾</button>
               </div>
             </div>
@@ -229,21 +229,21 @@
             </div>
 
             <div class="card">
-              <div class="ct"><span>// 6 项可选检查开关 &amp; 硬性安全红线</span></div>
+              <div class="ct"><span>// 6 项可选检查开关 &amp; 8 项硬性红线</span></div>
               <div id="optionalChecksContainer"></div>
               <div class="optrow">
-                <div><div class="ol">代理内核 · TUN 网卡 · 出口国家 · IPv6 关闭</div></div>
+                <div><div class="ol">代理内核 · TUN 网卡 · 出口国家与 IP · IPv6 关闭</div></div>
                 <span class="locked">硬性锁定</span>
               </div>
               <div class="optrow">
-                <div><div class="ol">保镖存活（无72h限制）· 置顶规则</div></div>
+                <div><div class="ol">系统时区 · 区域格式 Locale · 保镖存活 · 置顶规则</div></div>
                 <span class="locked">硬性锁定</span>
               </div>
             </div>
           </div>
 
           <div class="note" id="settingsMsg">
-            <b>日常收工还原：</b>不用 Claude 时点击首页「退出护盾」并在 5 秒内再次点击确认：会先关闭 Claude 桌面版与所有 Claude Code CLI 会话，全部退出后才暂停保镖、恢复网卡 IPv6 与原本的系统时区；任一进程未退出则不撤防。
+            <b>日常收工还原：</b>不用 Claude 时点击首页「退出护盾」并在 5 秒内再次点击确认：会先关闭 Claude 桌面版与所有 Claude Code CLI 会话，全部退出后才暂停保镖、按护盾开启前的快照恢复各网卡 IPv6，并还原已记录的原系统时区（若时区由旧版安装器修改而无快照，会明确提示手动调整）；任一进程未退出则不撤防。
           </div>
         </section>
 
@@ -258,7 +258,7 @@
         <div class="logo sm">EG</div>
         <div>
           <h2>Claude 环境卫士</h2>
-          <span>WEB / PWA // 6 项防漏自检</span>
+          <span>WEB / PWA // 5 项防漏信号 + 1 项硬件摘要</span>
         </div>
       </div>
       <div class="mhead-r">
@@ -271,10 +271,10 @@
     </div>
 
     <div class="mhero">
-      <div class="tag">// MOBILE &amp; BROWSER PRE-FLIGHT</div>
+      <div class="tag">// BROWSER SIGNAL PRE-FLIGHT</div>
       <h3 id="mHeroTitle">准备就绪 · 点击开始自检</h3>
-      <p id="mHeroDesc">手机连好代理（Shadowrocket / Stash / Clash）后点一次实时自检，确认无真实 IP、WebRTC、IPv6 或东八区时区暴露后再打开 Claude。</p>
-      <button class="btn launch full" id="btnRunMobileCheck">▶ 立即执行 6 项防漏自检</button>
+      <p id="mHeroDesc">评估当前浏览器侧 5 项网络信号（出口、时区、WebRTC、IPv6、DNS）与 1 项硬件渲染摘要；仅代表当前设备浏览器，不替代电脑桌面端的 14 项启动审计。</p>
+      <button class="btn launch full" id="btnRunMobileCheck">▶ 立即检测浏览器信号</button>
     </div>
 
     <div class="mlist" id="mobileCheckList">
@@ -299,12 +299,12 @@
         <span class="st skip">[WAIT]</span>
       </div>
       <div class="mcard" data-mkey="fp">
-        <div><b>06 · WebGL / Canvas 硬件摘要</b><small>等待检测（GPU 渲染器与 Canvas 哈希）</small></div>
+        <div><b>06 · WebGL / Canvas 硬件摘要（仅参考）</b><small>等待检测（GPU 渲染器与 Canvas 哈希，非泄漏指标）</small></div>
         <span class="st skip">[WAIT]</span>
       </div>
     </div>
 
-    <div class="mfoot">纯浏览器实时自检 · 结果仅留本机 · 零追踪零上传</div>
+    <div class="mfoot">纯浏览器实时探测 · 会向 ipinfo / Cloudflare / ipify / ipleak 发起检测请求 · 本工具不设服务端、不存储或上传结果</div>
   </div>
 
   <script type="module" src="/src/main.js"></script>

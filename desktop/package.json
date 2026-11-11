@@ -2,7 +2,8 @@
   "name": "claude-envguard",
   "private": true,
   "version": "2.0.0",
-  "description": "Claude 环境卫士 (EnvGuard) — Tauri 桌面护盾 + 移动端 Web/PWA 防漏自检",
+  "license": "AGPL-3.0-only",
+  "description": "Claude 环境卫士 (EnvGuard) — 启动门禁与进程急停桌面端 + 浏览器侧防漏自检",
   "type": "module",
   "scripts": {
     "dev": "vite",

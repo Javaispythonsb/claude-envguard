@@ -156,10 +156,10 @@ try {
     Start-ProbePrefetch @{ ip = ''; loc = ''; skipped = $true }
     Assert '出口探测被跳过时不发起预取' ($null -eq $script:ProbePrefetch -and $script:created.Count -eq 0)
     Start-ProbePrefetch $e
-    Assert '路径存活时预取 ASN 与两个生态站点' ($script:created.Count -eq 3 -and $script:created[0] -match 'ipinfo' -and ($script:created -join ' ') -match 'claude\\\.ai' -and ($script:created -join ' ') -match 'api\\\.anthropic')
+    Assert '路径存活时预取 DNS、ASN 与两个生态站点' ($script:created.Count -eq 4 -and $script:created[0] -match 'ipleak' -and $script:created[1] -match 'ipinfo' -and ($script:created -join ' ') -match 'claude\\\.ai' -and ($script:created -join ' ') -match 'api\\\.anthropic')
     Stop-ProbePrefetch
     $script:created = @()
-    $script:CheckConfig = @{ disabled = @('ASN属性', '生态可达性'); allowOptionalFailures = $false; logging = $true }
+    $script:CheckConfig = @{ disabled = @('DNS', 'ASN属性', '生态可达性'); allowOptionalFailures = $false; logging = $true }
     Start-ProbePrefetch $e
     Assert '检查被禁用时不预取对应探测' ($script:created.Count -eq 0)
     Stop-ProbePrefetch

@@ -5,7 +5,8 @@ import {
   isPublicIpv6,
   extractCandidateIps,
   evaluateWebRtc,
-  evaluateDnsResolvers
+  evaluateDnsResolvers,
+  summarizeMobileChecks
 } from '../src/mobile-check.js';
 
 const noLookup = async () => {
@@ -80,4 +81,17 @@ test('DNS 解析器：国内判失败、归属未知提示、全在海外通过'
   const ok = evaluateDnsResolvers([{ ip: '8.8.8.8', country: 'US', isp: 'Google' }, { ip: '8.8.4.4', country: 'US', isp: 'Google' }]);
   assert.equal(ok.state, 'ok');
   assert.match(ok.detail, /US/);
+});
+
+test('summarizeMobileChecks 仅统计 5 项防漏信号，硬件摘要不混入泄漏告警计数', () => {
+  const ok = { state: 'ok' };
+  const s1 = summarizeMobileChecks({ egress: ok, region: ok, webrtc: ok, ipv6: ok, dns: ok, fp: { state: 'warn' } });
+  assert.equal(s1.leakTotal, 5);
+  assert.equal(s1.fails, 0);
+  assert.equal(s1.warns, 0);
+  assert.equal(s1.fpState, 'warn');
+
+  const s2 = summarizeMobileChecks({ egress: ok, region: { state: 'warn' }, webrtc: ok, ipv6: ok, dns: { state: 'fail' }, fp: { state: 'warn' } });
+  assert.equal(s2.fails, 1);
+  assert.equal(s2.warns, 1);
 });

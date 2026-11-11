@@ -1,7 +1,8 @@
 [package]
 name = "claude-envguard"
 version = "2.0.0"
-description = "Claude 环境卫士 (EnvGuard) — Fail-Closed 防泄漏桌面控制台"
+description = "Claude 环境卫士 (EnvGuard) — 启动门禁与运行期进程急停控制台"
+license = "AGPL-3.0-only"
 authors = ["EnvGuard"]
 edition = "2021"
 
