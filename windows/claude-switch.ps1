@@ -995,9 +995,86 @@ function Set-FlClashControllerSetting([string]$Value) {
     "OK:FlClash 控制端口已设为 $stored"
 }
 
-# 解析 Clash 控制接口;Windows 版不使用 unix socket
+function Get-NamedPipeNames {
+    try {
+        return @([System.IO.Directory]::GetFiles('\\.\pipe\') | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    } catch {
+        return @(Get-ChildItem -Path '\\.\pipe\' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    }
+}
+
+# Clash Verge Rev 关闭 HTTP 外部控制时,内核仍在命名管道上提供同一套 REST 接口。
+# 服务模式下实际管道名与配置里的 external-controller-pipe 只差中间段(如 sidecar-release / production),
+# 所以先找配置的原名,找不到再只接受 verge-mihomo- 开头、哈希后缀相同的唯一候选。
+function Get-ClashPipeApi {
+    foreach ($name in @('clash-verge.yaml', 'config.yaml')) {
+        $yaml = Join-Path $CLASH_DIR $name
+        $configured = Get-YamlScalar $yaml 'external-controller-pipe'
+        if ([string]::IsNullOrWhiteSpace($configured)) { continue }
+        $configuredName = ($configured -replace '^\\\\\.\\pipe\\', '').Trim()
+        if ($configuredName -notmatch '^[A-Za-z0-9._-]{1,200}$') { continue }
+        $existing = @(Get-NamedPipeNames)
+        $pipe = $null
+        if ($existing -contains $configuredName) {
+            $pipe = $configuredName
+        } elseif ($configuredName -match '-([0-9a-fA-F]{16,})$') {
+            $suffix = $Matches[1]
+            $similar = @($existing | Where-Object { $_ -match ('^verge-mihomo-[A-Za-z0-9-]+-' + $suffix + '$') })
+            if ($similar.Count -eq 1) { $pipe = $similar[0] }
+        }
+        if (-not $pipe) { continue }
+        $secret = Get-YamlScalar $yaml 'secret'
+        $headers = @{}
+        if (-not [string]::IsNullOrWhiteSpace($secret)) { $headers['Authorization'] = 'Bearer ' + $secret }
+        return @{ base = "pipe:$pipe"; pipe = $pipe; headers = $headers; source = "$name(pipe)" }
+    }
+    return $null
+}
+
+# 经命名管道发 HTTP/1.0 GET:服务端不会用分块编码,回完即关闭连接,读到 EOF 就是完整响应
+function Invoke-ClashPipeRequest([string]$Pipe, [string]$Path, [hashtable]$Headers, [int]$TimeoutSec = 8) {
+    $client = New-Object System.IO.Pipes.NamedPipeClientStream('.', $Pipe, [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::Asynchronous)
+    try {
+        try {
+            $client.Connect([Math]::Min(2000, [Math]::Max(1, $TimeoutSec) * 1000))
+        } catch {
+            return @{ ok = $false; reason = 'pipe-unavailable'; data = $null }
+        }
+        $lines = @("GET $Path HTTP/1.0", 'Host: localhost')
+        foreach ($key in @($Headers.Keys)) { $lines += "${key}: $($Headers[$key])" }
+        $request = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`r`n") + "`r`n`r`n")
+        $client.Write($request, 0, $request.Length)
+        $client.Flush()
+        $buffer = New-Object System.IO.MemoryStream
+        $chunk = New-Object byte[] 65536
+        $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSec))
+        while ($true) {
+            $read = $client.ReadAsync($chunk, 0, $chunk.Length)
+            $left = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $read.Wait($left)) { return @{ ok = $false; reason = 'timeout'; data = $null } }
+            if ($read.Result -le 0) { break }
+            $buffer.Write($chunk, 0, $read.Result)
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($buffer.ToArray())
+        $split = $text.IndexOf("`r`n`r`n")
+        if ($split -lt 0 -or $text -notmatch '^HTTP/1\.[01] (\d{3})') { return @{ ok = $false; reason = 'error'; data = $null } }
+        $status = [int]$Matches[1]
+        if ($status -eq 401 -or $status -eq 403) { return @{ ok = $false; reason = 'auth-failed'; data = $null } }
+        if ($status -lt 200 -or $status -ge 300) { return @{ ok = $false; reason = "http-$status"; data = $null } }
+        if ($text.Substring(0, $split) -match '(?im)^Transfer-Encoding:') { return @{ ok = $false; reason = 'error'; data = $null } }
+        return @{ ok = $true; reason = ''; data = ($text.Substring($split + 4) | ConvertFrom-Json -ErrorAction Stop) }
+    } catch {
+        return @{ ok = $false; reason = 'error'; data = $null }
+    } finally {
+        $client.Dispose()
+    }
+}
+
+# 解析 Clash 控制接口:Clash Verge 优先命名管道,其次 HTTP;Windows 版不使用 unix socket
 function Get-ClashApi {
     if (Test-FlClashClientSelected) { return Get-FlClashApi }
+    $pipeApi = Get-ClashPipeApi
+    if ($pipeApi) { return $pipeApi }
     foreach ($name in @('clash-verge.yaml', 'config.yaml', 'verge.yaml')) {
         $yaml = Join-Path $CLASH_DIR $name
         if (-not (Test-Path -LiteralPath $yaml)) { continue }
@@ -1039,6 +1116,10 @@ function Get-ClashApiError($err) {
 function Invoke-ClashApi([string]$Path, [int]$TimeoutSec = 8) {
     $api = Get-ClashApi
     if (-not $api) { return @{ ok = $false; reason = 'no-endpoint'; data = $null; endpoint = ''; source = '' } }
+    if ($api.pipe) {
+        $response = Invoke-ClashPipeRequest $api.pipe $Path $api.headers $TimeoutSec
+        return @{ ok = $response.ok; reason = $response.reason; data = $response.data; endpoint = $api.base; source = $api.source }
+    }
     try {
         $params = @{ Uri = ($api.base + $Path); TimeoutSec = $TimeoutSec; ErrorAction = 'Stop' }
         if ($api.headers.Count -gt 0) { $params['Headers'] = $api.headers }
@@ -1059,6 +1140,7 @@ function Get-ClashApiHint([string]$reason) {
     switch ($reason) {
         'no-endpoint'    { return $noEndpoint }
         'connect-failed' { return $connectFailed }
+        'pipe-unavailable' { return '控制管道不可用:Clash Verge 未运行或内核未就绪' }
         'auth-failed'    { return '控制接口鉴权失败:secret 不匹配' }
         'timeout'        { return '控制接口超时:内核无响应或 /rules 过大' }
         ''               { return '控制接口不可用' }

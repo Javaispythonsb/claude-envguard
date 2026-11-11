@@ -117,7 +117,7 @@ Windows 用户请使用 `windows/` 下的 PowerShell 版本。关键差异与注
 - **检查设置与日志**：与 macOS 使用相同的 6 项非关键检查白名单和 `allowOptionalFailures` 边界；配置在 `%USERPROFILE%\.claude-switcher\checks.json`，脱敏日志在 `%USERPROFILE%\.claude-switcher\logs\client.log`，512 KiB 轮转。WPF 设置窗口和 `export-diagnostics` 可导出脱敏诊断 zip，不得包含账号、IP、凭据、Clash 配置或原始检查详情。独立代理诊断不得创建账号状态或写客户端日志。
 - **已知限制**：新 WPF、FlClash、隔离浏览器、代理诊断、加密快照、安装与更新流程尚未做 Windows 真机验收，静态/XAML 测试不能冒充真机测试；Clash Verge 的 TUN 开关被更新重置后在 Windows 端需手动重开。
 - **自动更新**：启动时静默检查 GitHub 最新 Release，有新版显示提示条；一键更新会下载 zip、校验 SHA256、备份并替换用户目录脚本、重启保镖任务和界面，失败自动回滚，不需要管理员。发布 zip 根必须带 `VERSION`（`release.yml` 已写入），安装后落到 `%USERPROFILE%\.claude-switcher\version.txt`。
-- **Clash 规则**：一键修复先识别 Clash 模式（Mihomo API `/configs`，失败回退 `clash-verge.yaml`/`config.yaml`/`verge.yaml` 的 `mode:`）。全局/直连模式不写规则，仅清理旧 Merge；规则模式只写 `profiles\Script.js` 托管块，重启后用内核 `/rules` 验证前 16 条，失败回滚。安装器不再写 `Merge.yaml`，旧 `prepend-rules`/`---` 会被清理并备份。控制接口地址从 `clash-verge.yaml` → `config.yaml` → `verge.yaml` 依次查找（不支持 unix socket）；「规则置顶」告警括号里会带原因（未配置/拒绝连接/鉴权失败/超时），只读排查用 `rules-status`。
+- **Clash 规则**：一键修复先识别 Clash 模式（Mihomo API `/configs`，失败回退 `clash-verge.yaml`/`config.yaml`/`verge.yaml` 的 `mode:`）。全局/直连模式不写规则，仅清理旧 Merge；规则模式只写 `profiles\Script.js` 托管块，重启后用内核 `/rules` 验证前 16 条，失败回滚。安装器不再写 `Merge.yaml`，旧 `prepend-rules`/`---` 会被清理并备份。控制接口优先走 `external-controller-pipe` 命名管道（服务模式下实际管道名只与配置差中间段，按相同哈希后缀匹配唯一的 `verge-mihomo-*` 管道），没有管道再从 `clash-verge.yaml` → `config.yaml` → `verge.yaml` 依次查找 HTTP 地址（不支持 unix socket）；「规则置顶」告警括号里会带原因（未配置/拒绝连接/管道不可用/鉴权失败/超时），只读排查用 `rules-status`。
 - SmartScreen 首次运行拦截属正常现象（未签名脚本），引导用户「更多信息 → 仍要运行」。
 
 ## Linux 版（linux/ 目录, Beta）
