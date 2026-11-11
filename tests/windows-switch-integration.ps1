@@ -5,7 +5,7 @@
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\windows-switch-integration.ps1
 #
-# 覆盖：首次收编 / 新建空槽位 / 往返切换的数据归属 / 暂存目录残留时拒绝覆盖。
+# 覆盖：MSIX 数据目录优先级 / 首次收编 / 新建空槽位 / 往返切换的数据归属 / 暂存残留按归属标记清理或拒绝覆盖。
 
 $ErrorActionPreference = 'Stop'
 
@@ -62,7 +62,7 @@ function Read-Text([string]$path) {
 
 $scriptErrorPreference = $ErrorActionPreference
 try {
-    # MSIX 数据目录发现的分支与旧版优先级；完成后恢复旧版路径执行通用切换回归
+    # MSIX 数据目录发现的分支与优先级；完成后恢复旧版路径执行通用切换回归
     $legacyData = Join-Path $env:APPDATA 'Claude'
     $msixData = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_test_pfn'
     New-Item -ItemType Directory -Path $msixData -Force | Out-Null
@@ -72,9 +72,10 @@ try {
     $script:appxPackage = [pscustomobject]@{ PackageFamilyName = 'Claude_test_pfn' }
     Assert 'Appx PackageFamilyName 主路径发现' ((Find-ClaudeDataPath) -eq $msixData)
     New-Item -ItemType Directory -Path $legacyData -Force | Out-Null
-    Assert '旧版数据目录保持优先' ((Find-ClaudeDataPath) -eq $legacyData)
-    Remove-Item -LiteralPath $legacyData -Recurse -Force
+    Assert '已安装包的数据目录优先于后出现的旧版目录' ((Find-ClaudeDataPath) -eq $msixData)
     $script:appxPackage = $null
+    Assert '未安装包时遗留的 MSIX 目录不抢占旧版目录' ((Find-ClaudeDataPath) -eq $legacyData)
+    Remove-Item -LiteralPath $legacyData -Recurse -Force
     $secondMsixData = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_other_pfn'
     New-Item -ItemType Directory -Path $secondMsixData -Force | Out-Null
     Assert '多个无包归属的 MSIX 目录不猜测' ((Find-ClaudeDataPath) -eq $legacyData)
@@ -176,6 +177,28 @@ try {
     Assert '同步调用保存 DNS 跳过设置' ($script:lastCoreExit -eq 0 -and $saveOutput -match '(?m)^OK:') "输出=$saveOutput"
     $savedConfig = Get-Content -LiteralPath "$base\checks.json" -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert '保存结果包含 DNS 禁用项' (@($savedConfig.disabled) -contains 'DNS')
+
+    # 11. 切换暂存 Claude.new 残留：有本工具写下的同槽位归属标记才自动清理，否则拒绝且不删除
+    Remove-Item -LiteralPath "$base\keep-in-workspace.txt" -Force
+    if (Test-Path -LiteralPath "$base\keep-stage") { Remove-Item -LiteralPath "$base\keep-stage" -Recurse -Force }
+    $stage = "$base\staging\Claude.new"
+    $marker = "$base\staging\stage-owner.json"
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    Set-Content -LiteralPath "$stage\partial.txt" -Value 'partial' -Encoding UTF8
+    Set-Content -LiteralPath $marker -Value (@{ version = 1; path = $stage; target = 'B' } | ConvertTo-Json -Compress) -Encoding UTF8
+    $r = Invoke-Switch 'B'
+    Assert '有归属标记的暂存残留自动清理后切换成功' ((Read-Text "$base\current.txt") -eq 'B') "输出=$r"
+    Assert '清理后不留暂存与归属标记' (-not (Test-Path -LiteralPath $stage) -and -not (Test-Path -LiteralPath $marker))
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    Set-Content -LiteralPath "$stage\unknown.txt" -Value 'keep' -Encoding UTF8
+    $r = Invoke-Switch 'A'
+    Assert '无归属标记的暂存残留仍拒绝切换' ((@($r) -join "`n") -match '存在待恢复数据') "输出=$r"
+    Assert '无归属标记时残留内容不删除' ((Read-Text "$stage\unknown.txt") -eq 'keep')
+    Assert '拒绝切换时 current 不变' ((Read-Text "$base\current.txt") -eq 'B')
+    Set-Content -LiteralPath $marker -Value (@{ version = 1; path = $stage; target = 'C' } | ConvertTo-Json -Compress) -Encoding UTF8
+    $r = Invoke-Switch 'A'
+    Assert '归属标记指向其他槽位时仍拒绝' ((@($r) -join "`n") -match '存在待恢复数据') "输出=$r"
+    Assert '标记不符时残留内容不删除' ((Read-Text "$stage\unknown.txt") -eq 'keep')
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

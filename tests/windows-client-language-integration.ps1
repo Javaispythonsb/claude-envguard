@@ -47,15 +47,15 @@ try {
     Write-Config $msixConfig '{"locale":"en-US"}'
     Write-Config (Join-Path $legacyData 'claude_desktop_config.json') '{}'
     $DATA = Find-ClaudeDataPath
-    if ($DATA -ne $legacyData) { throw 'Account data-directory priority changed' }
+    if ($DATA -ne $msixData) { throw 'Installed MSIX data directory must take priority' }
     Assert-Result 'MSIX config with legacy MCP-only directory and Chinese Windows UI' '^客户端语言=ok:Claude=en-US$'
     Write-Config $legacyConfig '{"locale":"zh-CN"}'
-    Assert-Result 'Existing legacy locale is authoritative' '^客户端语言=warn:Claude=zh-CN,期望 en 前缀$'
-    Write-Config $legacyConfig '{"locale":"en-GB"}'
+    Assert-Result 'Legacy locale does not override installed MSIX data' '^客户端语言=ok:Claude=en-US$'
+    Write-Config $msixConfig '{"locale":"en-GB"}'
     Assert-Result 'Matching language prefix' '^客户端语言=ok:Claude=en-GB$'
     foreach ($json in @('{', '{}', '{"locale":""}', '{"locale":false}', '{"locale":["en-US"]}', '{"locale":{"name":"en-US"}}', '{"locale":"en-US\n"}')) {
-        Write-Config $legacyConfig $json
-        Assert-Result 'Malformed or missing locale stays unknown without MSIX fallback' '^客户端语言=warn:未能读取 Claude 的语言设置$'
+        Write-Config $msixConfig $json
+        Assert-Result 'Malformed or missing locale stays unknown without legacy fallback' '^客户端语言=warn:未能读取 Claude 的语言设置$'
     }
     Remove-Item -LiteralPath $legacyConfig -Force
     Remove-Item -LiteralPath $msixConfig -Force
@@ -63,6 +63,8 @@ try {
     $script:appxPackage = $null
     $otherMsix = Join-Path $env:LOCALAPPDATA 'Claude-Data\claude_other_pfn'
     Write-Config (Join-Path $otherMsix 'config.json') '{"locale":"en-US"}'
+    $DATA = Find-ClaudeDataPath
+    if ($DATA -ne $legacyData) { throw 'Legacy data directory must be used without an installed package' }
     Assert-Result 'Multiple unowned MSIX directories are not guessed' '^客户端语言=warn:未能读取 Claude 的语言设置$'
     $script:CheckConfig = [pscustomobject]@{ disabled = @('客户端语言'); allowOptionalFailures = $false }
     $script:readCount = 0

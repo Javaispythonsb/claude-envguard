@@ -1,0 +1,2 @@
+# 按原样存储：.ps1 必须保持 UTF-8 BOM + LF，与上游字节一致，不让 core.autocrlf 改写
+* -text

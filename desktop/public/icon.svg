@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="56" fill="#06110b"/>
+  <rect x="14" y="14" width="228" height="228" rx="44" fill="none" stroke="#39ff14" stroke-width="6" stroke-opacity="0.75"/>
+  <path d="M128 44 L196 72 V128 C196 174 166 204 128 218 C90 204 60 174 60 128 V72 Z" fill="#0b2416" stroke="#00ff9c" stroke-width="6"/>
+  <text x="128" y="146" text-anchor="middle" font-family="Consolas, monospace" font-weight="700" font-size="64" fill="#39ff14">EG</text>
+</svg>

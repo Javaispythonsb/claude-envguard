@@ -11,8 +11,79 @@ $LOCALE_TARGET = "en-US"               # 地区格式目标(安装/set-region �
 $PROXY_GROUP = "GLOBAL"                # Clash 代理组名
 # =======================================================
 
-$BASE = Join-Path $env:USERPROFILE ".claude-switcher"
-function Find-ClaudeMsixDataPath {
+$BASE = if ($env:ENVGUARD_STATE_DIR) { [string]$env:ENVGUARD_STATE_DIR } else { Join-Path $env:USERPROFILE ".claude-switcher" }
+$ENVGUARD_CONFIG = Join-Path $BASE "envguard-config.json"
+$IANA_TZ_OVERRIDE = ""
+
+# 外部运行时配置桥:当从 Tauri 资源目录或开发目录调用本脚本(非 $BASE\claude-switch.ps1)时:
+# 1) 若用户目录已有旧版 $BASE\claude-switch.ps1,只读继承其 5 项锁定配置(绝不覆盖原文件);
+# 2) 若存在 $BASE\envguard-config.json,再叠加其中的最新客户端/地区锁定值。
+function Initialize-RuntimeConfig {
+    $selfFull = if ($PSCommandPath) { try { [IO.Path]::GetFullPath($PSCommandPath) } catch { '' } } else { '' }
+    $installedCore = Join-Path $BASE 'claude-switch.ps1'
+    $installedFull = try { [IO.Path]::GetFullPath($installedCore) } catch { '' }
+    if ($selfFull -and $installedFull -and ($selfFull -ine $installedFull) -and (Test-Path -LiteralPath $installedCore -PathType Leaf)) {
+        try {
+            $legacyText = [IO.File]::ReadAllText($installedCore, [Text.Encoding]::UTF8)
+            foreach ($pair in @(
+                @('PROXY_MODE','PROXY_MODE'),
+                @('COUNTRY_TARGET','COUNTRY_TARGET'),
+                @('TZ_TARGET','TZ_TARGET'),
+                @('LOCALE_TARGET','LOCALE_TARGET'),
+                @('PROXY_GROUP','PROXY_GROUP')
+            )) {
+                $m = [regex]::Match($legacyText, '(?m)^[ \t]*\$' + $pair[0] + '[ \t]*=[ \t]*"([^"]*)"')
+                if ($m.Success -and $m.Groups[1].Value) {
+                    Set-Variable -Name $pair[1] -Scope Script -Value $m.Groups[1].Value
+                }
+            }
+        } catch {}
+    }
+    if (Test-Path -LiteralPath $ENVGUARD_CONFIG -PathType Leaf) {
+        try {
+            $raw = [IO.File]::ReadAllText($ENVGUARD_CONFIG, [Text.Encoding]::UTF8)
+            if ($raw.Length -le 16384) {
+                $cfg = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($cfg.proxy_mode -is [string] -and $cfg.proxy_mode) { $script:PROXY_MODE = $cfg.proxy_mode }
+                if ($cfg.country_target -is [string] -and $cfg.country_target -match '^[A-Z]{2}$') { $script:COUNTRY_TARGET = $cfg.country_target }
+                if ($cfg.tz_target -is [string] -and $cfg.tz_target) { $script:TZ_TARGET = $cfg.tz_target }
+                if ($cfg.iana_tz_target -is [string] -and $cfg.iana_tz_target -match '^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$') { $script:IANA_TZ_OVERRIDE = $cfg.iana_tz_target }
+                if ($cfg.locale_target -is [string] -and $cfg.locale_target) { $script:LOCALE_TARGET = $cfg.locale_target }
+                if ($cfg.proxy_group -is [string] -and $cfg.proxy_group -and $cfg.proxy_group -notmatch '["`$,\x00-\x1f]') { $script:PROXY_GROUP = $cfg.proxy_group }
+            }
+        } catch {}
+    }
+}
+
+function Save-RuntimeConfig([hashtable]$Patch) {
+    $current = [ordered]@{
+        proxy_mode     = $PROXY_MODE
+        country_target = $COUNTRY_TARGET
+        tz_target      = $TZ_TARGET
+        iana_tz_target = $(if ($IANA_TZ_OVERRIDE) { $IANA_TZ_OVERRIDE } else { '' })
+        locale_target  = $LOCALE_TARGET
+        proxy_group    = $PROXY_GROUP
+    }
+    foreach ($k in $Patch.Keys) { $current[$k] = $Patch[$k] }
+    New-Item -ItemType Directory -Force -Path $BASE -ErrorAction Stop | Out-Null
+    $tmp = Join-Path $BASE ('.envguard-cfg-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($tmp, (([pscustomobject]$current) | ConvertTo-Json -Depth 3), (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $ENVGUARD_CONFIG -Force -ErrorAction Stop
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-SelfInBase([string]$SelfPath) {
+    if (-not $SelfPath) { return $false }
+    try {
+        return ([IO.Path]::GetFullPath($SelfPath) -ieq [IO.Path]::GetFullPath((Join-Path $BASE 'claude-switch.ps1')))
+    } catch { return $false }
+}
+
+Initialize-RuntimeConfig
+function Find-ClaudeMsixDataPath([switch]$PackagedOnly) {
     $msixRoot = Join-Path $env:LOCALAPPDATA "Claude-Data"
     try {
         $pkg = Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -20,13 +91,19 @@ function Find-ClaudeMsixDataPath {
             return (Join-Path $msixRoot ([string]$pkg.PackageFamilyName))
         }
     } catch {}
+    if ($PackagedOnly) { return $null }
     $candidates = @(Get-ChildItem -LiteralPath $msixRoot -Directory -Filter 'claude_*' -ErrorAction SilentlyContinue)
     if ($candidates.Count -eq 1) { return $candidates[0].FullName }
     return $null
 }
 function Find-ClaudeDataPath {
+    # 已安装 Appx 包且其数据目录存在时优先:%APPDATA%\Claude 可能只是 MCP 工具或旧版残留建的目录,
+    # 按它切换会把空目录当当前账号归档。未安装包时仍旧版优先,卸载后遗留的 Claude-Data 目录不能抢占。
+    $packaged = Find-ClaudeMsixDataPath -PackagedOnly
+    if ($packaged -and (Test-Path -LiteralPath $packaged)) { return $packaged }
     $legacy = Join-Path $env:APPDATA "Claude"
     if (Test-Path -LiteralPath $legacy) { return $legacy }
+    if ($packaged) { return $packaged }
     $msix = Find-ClaudeMsixDataPath
     if ($msix) { return $msix }
     return $legacy
@@ -41,8 +118,8 @@ $CLASH_DIR = @(
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
-# check-update / rules-status / diagnose-proxy 必须只读:不在检查路径上创建任何目录
-if ($args.Count -eq 0 -or ($args[0] -ne 'check-update' -and $args[0] -ne 'rules-status' -and $args[0] -ne 'diagnose-proxy')) {
+# check-update / rules-status / diagnose-proxy / 只读 uistate 不在检查路径上创建任何目录
+if ($args.Count -eq 0 -or ($args[0] -notin @('check-update','rules-status','diagnose-proxy') -and -not ($args[0] -eq 'uistate' -and ($args.Count -lt 2 -or $args[1] -ne '--fresh')))) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
 }
 
@@ -299,20 +376,26 @@ function Set-ClientMode([string]$Mode) {
         return
     }
     $modePath = Join-Path $BASE 'proxy-mode.txt'
-    $oldText = [System.IO.File]::ReadAllText($selfPath)
+    $inBase = Test-SelfInBase $selfPath
+    $oldText = if ($inBase) { [System.IO.File]::ReadAllText($selfPath) } else { '' }
     $oldModeExists = Test-Path -LiteralPath $modePath
     $oldMode = if ($oldModeExists) { [System.IO.File]::ReadAllText($modePath) } else { '' }
     try {
-        $newText = Set-ScriptConfigValue $oldText 'PROXY_MODE' $Mode
-        if ($newText -eq $oldText -and $PROXY_MODE -ne $Mode) { throw '核心配置行未更新' }
-        [System.IO.File]::WriteAllText($selfPath, $newText, (New-Object System.Text.UTF8Encoding($true)))
+        New-Item -ItemType Directory -Force -Path $BASE -ErrorAction Stop | Out-Null
+        if ($inBase) {
+            $newText = Set-ScriptConfigValue $oldText 'PROXY_MODE' $Mode
+            if ($newText -eq $oldText -and $PROXY_MODE -ne $Mode) { throw '核心配置行未更新' }
+            [System.IO.File]::WriteAllText($selfPath, $newText, (New-Object System.Text.UTF8Encoding($true)))
+        } else {
+            Save-RuntimeConfig @{ proxy_mode = $Mode }
+        }
         [System.IO.File]::WriteAllText($modePath, $Mode, [System.Text.Encoding]::ASCII)
         $script:PROXY_MODE = $Mode
         "OK:代理客户端已设为 $Mode"
         'INFO:保镖会在下一轮巡检读取新模式；非 Clash Verge 客户端请自行配置 Claude 域名规则'
     } catch {
         try {
-            [System.IO.File]::WriteAllText($selfPath, $oldText, (New-Object System.Text.UTF8Encoding($true)))
+            if ($inBase -and $oldText) { [System.IO.File]::WriteAllText($selfPath, $oldText, (New-Object System.Text.UTF8Encoding($true))) }
             if ($oldModeExists) { [System.IO.File]::WriteAllText($modePath, $oldMode, [System.Text.Encoding]::ASCII) }
             else { Remove-Item -LiteralPath $modePath -Force -ErrorAction SilentlyContinue }
         } catch {}
@@ -391,6 +474,80 @@ function ConvertTo-WindowsTimeZone([string]$iana) {
     }
     if ($map.ContainsKey($iana)) { return $map[$iana] }
     return $null
+}
+
+# Windows 时区 ID -> IANA 时区(供进程级 TZ 环境变量注入使用)
+function ConvertFrom-WindowsTimeZone([string]$winTz, [string]$countryFallback = 'US') {
+    if ($IANA_TZ_OVERRIDE) { return $IANA_TZ_OVERRIDE }
+    $c = ([string]$countryFallback).Trim().ToUpperInvariant()
+    if ($winTz -eq 'Eastern Standard Time' -and $c -eq 'CA') { return 'America/Toronto' }
+    if ($winTz -eq 'Pacific Standard Time' -and $c -eq 'CA') { return 'America/Vancouver' }
+    if ($winTz -eq 'Singapore Standard Time' -and $c -eq 'MY') { return 'Asia/Kuala_Lumpur' }
+    $rev = @{
+        'Eastern Standard Time'     = 'America/New_York'
+        'Central Standard Time'     = 'America/Chicago'
+        'Mountain Standard Time'    = 'America/Denver'
+        'Pacific Standard Time'     = 'America/Los_Angeles'
+        'Singapore Standard Time'   = 'Asia/Singapore'
+        'Tokyo Standard Time'       = 'Asia/Tokyo'
+        'Korea Standard Time'       = 'Asia/Seoul'
+        'Taipei Standard Time'      = 'Asia/Taipei'
+        'China Standard Time'       = 'Asia/Hong_Kong'
+        'GMT Standard Time'         = 'Europe/London'
+        'W. Europe Standard Time'   = 'Europe/Berlin'
+        'Romance Standard Time'     = 'Europe/Paris'
+        'AUS Eastern Standard Time' = 'Australia/Sydney'
+    }
+    if ($winTz -and $rev.ContainsKey($winTz)) { return $rev[$winTz] }
+    return (Get-CountryDefaultTimeZone $c)
+}
+
+# 只记录第一次改成目标前的原时区,之后不覆盖,供 shield-restore 还原
+function Save-HomeTimeZone([string]$TargetTz) {
+    $homeTzFile = Join-Path $BASE 'home-tz.txt'
+    $current = (Get-TimeZone).Id
+    if ((Test-Path -LiteralPath $homeTzFile) -or -not $current -or $current -eq $TargetTz) { return }
+    try { [System.IO.File]::WriteAllText($homeTzFile, $current, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+
+# 保镖健康度检查:不仅看计划任务是否存在,还实查运行态/心跳与 72h·电池策略隐患
+function Get-BodyguardHealth {
+    $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+    if (-not $bg) {
+        return @{ state = 'fail'; detail = '未安装'; installed = $false; running = $false; legacyPolicy = $false }
+    }
+    $legacyPolicy = $false
+    if ($bg.Settings) {
+        $limit = [string]$bg.Settings.ExecutionTimeLimit
+        if ($bg.Settings.StopIfGoingOnBatteries -or $bg.Settings.DisallowStartIfOnBatteries -or ($limit -and $limit -notin @('PT0S','P0D'))) {
+            $legacyPolicy = $true
+        }
+    }
+    $hbAlive = $false
+    $hbFile = Join-Path $BASE 'bodyguard-heartbeat.txt'
+    if (Test-Path -LiteralPath $hbFile -PathType Leaf) {
+        try {
+            $raw = ([System.IO.File]::ReadAllText($hbFile, [System.Text.Encoding]::ASCII)).Trim()
+            if ($raw -match '^(\d+)\s+(\d+)$') {
+                $hbPid = [int]$Matches[1]
+                $hbTs  = [long]$Matches[2]
+                $age   = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $hbTs
+                if ($age -ge -5 -and $age -le 35) {
+                    $proc = Get-Process -Id $hbPid -ErrorAction SilentlyContinue
+                    if ($proc -and $proc.ProcessName -match '^(powershell|pwsh)$') { $hbAlive = $true }
+                }
+            }
+        } catch {}
+    }
+    $taskRunning = ([string]$bg.State -eq 'Running')
+    $running = ($hbAlive -or $taskRunning)
+    if (-not $running) {
+        return @{ state = 'fail'; detail = '已注册但未运行(可能超时或被系统停止,点一键修复重启)'; installed = $true; running = $false; legacyPolicy = $legacyPolicy }
+    }
+    if ($legacyPolicy) {
+        return @{ state = 'warn'; detail = '在线(含72h/电池停止旧限制,建议点一键修复升级)'; installed = $true; running = $true; legacyPolicy = $true }
+    }
+    return @{ state = 'ok'; detail = '在线(10s巡检)'; installed = $true; running = $true; legacyPolicy = $false }
 }
 
 # 多源出口探测(与安装器同源):ipinfo -> ipapi -> ifconfig -> Cloudflare trace
@@ -508,19 +665,30 @@ function Invoke-SetRegion {
         return
     }
     try {
-        $text = [System.IO.File]::ReadAllText($selfPath)
-        $text = Set-ScriptConfigValue $text 'COUNTRY_TARGET' $country
-        $text = Set-ScriptConfigValue $text 'TZ_TARGET' $tzId
-        $text = Set-ScriptConfigValue $text 'LOCALE_TARGET' $locale
-        [System.IO.File]::WriteAllText($selfPath, $text, (New-Object System.Text.UTF8Encoding($true)))
+        if (Test-SelfInBase $selfPath) {
+            $text = [System.IO.File]::ReadAllText($selfPath)
+            $text = Set-ScriptConfigValue $text 'COUNTRY_TARGET' $country
+            $text = Set-ScriptConfigValue $text 'TZ_TARGET' $tzId
+            $text = Set-ScriptConfigValue $text 'LOCALE_TARGET' $locale
+            [System.IO.File]::WriteAllText($selfPath, $text, (New-Object System.Text.UTF8Encoding($true)))
+        } else {
+            Save-RuntimeConfig @{
+                country_target = $country
+                tz_target      = $tzId
+                iana_tz_target = $ianaTz
+                locale_target  = $locale
+            }
+        }
     } catch {
         "FAIL:写入配置失败:$($_.Exception.Message)"
         return
     }
     $script:COUNTRY_TARGET = $country
     $script:TZ_TARGET = $tzId
+    $script:IANA_TZ_OVERRIDE = $ianaTz
     $script:LOCALE_TARGET = $locale
 
+    Save-HomeTimeZone $tzId
     $tmp = "$env:TEMP\claude-set-region-$([guid]::NewGuid().Guid).ps1"
     try {
         $tzEsc = $tzId.Replace("'", "''")
@@ -1227,8 +1395,9 @@ function Invoke-CheckDetail {
         Format-OptionalResult 'WebRTC' ([string]$w.code) ([string]$w.detail)
     }
 
-    $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
-    if ($bg) { "保镖=ok" } else { "保镖=fail:未安装" }
+    $bgHealth = Get-BodyguardHealth
+    if ($bgHealth.state -eq 'ok') { "保镖=ok:$($bgHealth.detail)" }
+    else { "保镖=$($bgHealth.state):$($bgHealth.detail)" }
 
     Get-RulesStatus
 
@@ -1335,11 +1504,31 @@ function Invoke-Fix {
 
     # B. 时区/IPv6/DNS/保镖(需管理员:通过 UAC 弹一次)
     $adminScript = @()
-    if ((Get-TimeZone).Id -ne $TZ_TARGET) { $adminScript += "Set-TimeZone -Id '$TZ_TARGET'" }
+    if ((Get-TimeZone).Id -ne $TZ_TARGET) {
+        Save-HomeTimeZone $TZ_TARGET
+        $tzEscFix = $TZ_TARGET.Replace("'", "''")
+        $adminScript += "Set-TimeZone -Id '$tzEscFix'"
+    }
     if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) { $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false" }
     $adminScript += "Clear-DnsClientCache"
-    if (-not (Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue)) {
-        $adminScript += "`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`"'; `$t = New-ScheduledTaskTrigger -AtLogOn; Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Force | Out-Null; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+    $bgFix = Get-BodyguardHealth
+    $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
+    $targetBg  = Join-Path $BASE 'claude-bodyguard.ps1'
+    if ($siblingBg -and (Test-Path -LiteralPath $siblingBg -PathType Leaf) -and (-not (Test-Path -LiteralPath $targetBg) -or $bgFix.legacyPolicy)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+            if (([IO.Path]::GetFullPath($siblingBg)) -ine ([IO.Path]::GetFullPath($targetBg))) {
+                Copy-Item -LiteralPath $siblingBg -Destination $targetBg -Force -ErrorAction Stop
+            }
+        } catch {}
+    }
+    if (-not $bgFix.installed -or $bgFix.legacyPolicy) {
+        $bgPathEsc = ("$BASE\claude-bodyguard.ps1").Replace("'", "''")
+        $adminScript += "`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"' + '$bgPathEsc' + '`"'); `$t = New-ScheduledTaskTrigger -AtLogOn; `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Settings `$s -Force | Out-Null; Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+    } elseif (-not $bgFix.running) {
+        try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop; "FIX:保镖任务已在用户态重新拉起 ✓" } catch {
+            $adminScript += "Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+        }
     }
     if ($adminScript.Count -gt 0) {
         "FIX:修复时区/IPv6/DNS/保镖(需要管理员授权)..."
@@ -1522,6 +1711,56 @@ function Get-SwitchPreviousPath {
     return "$DATA.old"
 }
 
+# 切换暂存(Claude.new)的归属标记。暂存内容只会是 accounts\<槽位> 的副本(载入)或空目录(新建),
+# 从不是唯一用户数据(唯一数据在 $DATA / accounts\ / 由 cleanup.json 保护的 .old)。因此当标记
+# 能证明某个残留暂存是本工具为同一槽位建立时,自动清理重试是安全的;无法证明则维持"拒绝覆盖"。
+# 这样可消除"切换被文件占用打断后 Claude.new 残留 → 之后每次切换都被拒绝"的卡死。
+function Get-SwitchStageMarkerPath { return "$BASE\staging\stage-owner.json" }
+
+function Register-SwitchStageOwner([string]$Stage, [string]$Target) {
+    $marker = Get-SwitchStageMarkerPath
+    try {
+        $dir = Split-Path -Parent $marker
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $value = [ordered]@{ version = 1; path = $Stage; target = $Target }
+        [IO.File]::WriteAllText($marker, ($value | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        Log "WARN:切换暂存归属标记写入失败:$($_.Exception.Message)"
+    }
+}
+
+function Clear-SwitchStageOwner {
+    $marker = Get-SwitchStageMarkerPath
+    if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+}
+
+function Resolve-SwitchStageLeftover([string]$Stage, [string]$Target) {
+    $marker = Get-SwitchStageMarkerPath
+    if (-not (Test-Path -LiteralPath $Stage)) {
+        # 暂存已不在(上次可能提交成功只剩悬空标记),清掉标记即可
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+        return $true
+    }
+    $valid = $false
+    if (Test-Path -LiteralPath $marker -PathType Leaf) {
+        try {
+            $record = (Get-Content -LiteralPath $marker -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+            $valid = ([int]$record.version -eq 1 -and [string]$record.path -eq $Stage -and [string]$record.target -eq $Target)
+        } catch { $valid = $false }
+    }
+    if ($valid) {
+        try {
+            Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+            Log "切换暂存残留已按归属标记自动清理:$Stage"
+            return $true
+        } catch {
+            return (Set-SwitchError "切换暂存残留无法清理:$Stage；请关闭占用程序后重试")
+        }
+    }
+    return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$Stage(确认数据归属后手动恢复或清理)")
+}
+
 function Write-AtomicCurrent([string]$Target) {
     $tmp = Join-Path $BASE ('.current-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
@@ -1612,6 +1851,8 @@ function Switch-DataDir([string]$Stage, [string]$Target) {
             "WARN:目标账号已切换，旧目录暂未清理；已记录归属，下次切换会先重试清理"
         }
     }
+    # 数据与指针均已成功提交,暂存已移入正式数据目录,归属标记到此作废
+    Clear-SwitchStageOwner
     return $true
 }
 
@@ -1657,9 +1898,8 @@ function Load-Account([string]$name) {
     $source = "$BASE\accounts\$name"
     $stage = Get-SwitchStagePath
     if (-not (Test-Path -LiteralPath $source)) { return (Set-SwitchError "账号$name 没有可用快照") }
-    if (Test-Path -LiteralPath $stage) {
-        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
-    }
+    if (-not (Resolve-SwitchStageLeftover $stage $name)) { return $false }
+    Register-SwitchStageOwner $stage $name
     $rc = Invoke-Robocopy $source $stage '/E'
     if (-not $rc.ok) {
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
@@ -1674,9 +1914,8 @@ function Load-Account([string]$name) {
 # 空槽位:用空目录换位，不先删当前数据
 function New-AccountData([string]$name) {
     $stage = Get-SwitchStagePath
-    if (Test-Path -LiteralPath $stage) {
-        return (Set-SwitchError "存在待恢复数据，拒绝覆盖:$stage(确认数据归属后手动恢复或清理)")
-    }
+    if (-not (Resolve-SwitchStageLeftover $stage $name)) { return $false }
+    Register-SwitchStageOwner $stage $name
     if (-not (New-Item -ItemType Directory -Force -Path $stage -ErrorAction SilentlyContinue)) {
         return (Set-SwitchError "无法创建账号$name 数据目录")
     }
@@ -1868,21 +2107,24 @@ function Invoke-Switch($target) {
 
 function Get-Fingerprint {
     "# 设备指纹体检 $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $hits = New-Object 'System.Collections.Generic.HashSet[string]'
+    $officeHits = New-Object 'System.Collections.Generic.HashSet[string]'
+    $sysHits = New-Object 'System.Collections.Generic.HashSet[string]'
     $fontDirs = @("$env:WINDIR\Fonts", "$env:LOCALAPPDATA\Microsoft\Windows\Fonts")
     foreach ($dir in $fontDirs) {
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
         foreach ($file in @(Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue)) {
             if ($file.Extension -notin @('.ttf','.ttc','.otf')) { continue }
             $name = $file.Name.ToLowerInvariant()
-            if ($name -match 'simsun|simhei|simkai|simfang|msyh|msjh|dengxian|wqy|fzshu|fzkai|fzhei|fangsong') { [void]$hits.Add($name) }
+            if ($name -match 'wqy|fzshu|fzkai|fzhei|fangsong') { [void]$officeHits.Add($name) }
+            elseif ($name -match 'simsun|simhei|simkai|simfang|msyh|msjh|dengxian') { [void]$sysHits.Add($name) }
         }
     }
-    if ($hits.Count) {
-        "字体=warn:检测到地区特征字体:$($hits -join ',')"
-        '建议=不需要的字体可在 Windows 字体设置中停用；系统自带字体不等于异常'
+    if ($officeHits.Count) {
+        "字体=info:检测到第三方中文办公字体:$($officeHits -join ',')"
+    } elseif ($sysHits.Count) {
+        "字体=info:仅含 Windows 系统自带中文字体($($sysHits.Count) 项,属正常系统特征)"
     } else {
-        '字体=ok:未发现中文办公字体'
+        '字体=ok:未发现中文特征字体'
     }
     $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
     $gpuName = if ($gpu -and $gpu.Name) { [string]$gpu.Name } else { '未知' }
@@ -2598,6 +2840,200 @@ function Invoke-RulesStatus {
     Get-RulesStatus
 }
 
+# ============ EnvGuard 新增:受检安全启动 / 护盾还原 / 单次聚合 JSON ============
+function Invoke-SafeLaunch([string]$Target = 'desktop', [string[]]$ExtraArgs = @()) {
+    $mode = if ([string]::IsNullOrWhiteSpace($Target)) { 'desktop' } else { $Target.Trim().ToLowerInvariant() }
+    if ($mode -notin @('desktop','cli')) {
+        $script:exitCode = 1
+        'FAIL:用法: claude-switch.ps1 launch [desktop|cli] [args...]'
+        return
+    }
+    if ($mode -eq 'cli') {
+        $authOverrides = @('ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY','ANTHROPIC_PROFILE')
+        $hitEnv = @($authOverrides | Where-Object { -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_)) })
+        if ($hitEnv.Count -gt 0) {
+            $script:exitCode = 1
+            "FAIL:检测到认证环境变量覆盖($($hitEnv -join ',')),已拒绝启动"
+            return
+        }
+    }
+    $checkOut = @(Invoke-Check)
+    if ($script:exitCode -ne 0 -or ($checkOut -join "`n") -match '(?m)^FAIL:') {
+        $script:exitCode = 1
+        $checkOut
+        return
+    }
+    if (-not ((Test-ProxyAlive) -and (Test-TunUp))) {
+        $script:exitCode = 1
+        'FAIL:代理路径未就绪(内核或TUN离线),已阻断启动'
+        return
+    }
+    if ($mode -eq 'desktop') {
+        if (-not (Start-ClaudeApp)) {
+            $script:exitCode = 1
+            'FAIL:未找到 Claude 桌面版可执行文件或商店应用'
+            return
+        }
+        Log '安全启动 Claude 桌面版'
+        'OK:环境检查通过,已安全启动 Claude 桌面版'
+        return
+    }
+    # 只对 CLI 注入 TZ:Node/Bun 读取它,而桌面版的 Chromium 渲染进程在 Windows 上忽略 TZ,只能靠系统时区
+    $ianaTz = ConvertFrom-WindowsTimeZone $TZ_TARGET $COUNTRY_TARGET
+    $cliCmd = Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cliCmd) {
+        $bundledRoot = Join-Path $DATA 'claude-code'
+        $bundledExe = if (Test-Path -LiteralPath $bundledRoot) {
+            Get-ChildItem -LiteralPath $bundledRoot -Recurse -Filter 'claude.exe' -File -ErrorAction SilentlyContinue | Sort-Object FullName | Select-Object -Last 1
+        } else { $null }
+        if ($bundledExe) { $cliPath = $bundledExe.FullName } else { $cliPath = '' }
+    } else {
+        $cliPath = [string]$cliCmd.Source
+    }
+    if (-not $cliPath) {
+        $script:exitCode = 1
+        'FAIL:未找到 Claude Code CLI(claude)'
+        return
+    }
+    $argLine = if ($ExtraArgs.Count -gt 0) { ConvertTo-WindowsCommandLine $ExtraArgs } else { '' }
+    $escapedCli = $cliPath.Replace("'", "''")
+    $escapedTz  = $ianaTz.Replace("'", "''")
+    $launchCmd  = "`$env:TZ = '$escapedTz'; & '$escapedCli' $argLine"
+    Start-Process powershell.exe -ArgumentList @('-NoExit','-NoProfile','-ExecutionPolicy','Bypass','-Command',$launchCmd) -ErrorAction Stop | Out-Null
+    Log "安全启动 Claude Code CLI(TZ=$ianaTz)"
+    "OK:环境检查通过,已在独立终端启动 Claude Code CLI(注入 TZ=$ianaTz)"
+}
+
+# npm/bun 方式运行的 Claude Code CLI;原生 claude.exe 与桌面版同名,由 Stop-ClaudeApp 一并处理
+function Get-ClaudeCliHostIds {
+    $session = try { (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch { -1 }
+    $hostIds = @(Get-Process -Name 'node','bun' -ErrorAction SilentlyContinue | Where-Object { $session -lt 0 -or $_.SessionId -eq $session } | ForEach-Object { [int]$_.Id })
+    if (-not $hostIds.Count) { return @() }
+    return @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='bun.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        ($hostIds -contains [int]$_.ProcessId) -and ([string]$_.CommandLine -match '@anthropic-ai[\\/]+claude-code')
+    } | ForEach-Object { [int]$_.ProcessId })
+}
+
+function Stop-ClaudeCliHosts {
+    foreach ($id in @(Get-ClaudeCliHostIds)) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+    for ($i = 0; $i -lt 5; $i++) {
+        if (-not @(Get-ClaudeCliHostIds).Count) { return $true }
+        Start-Sleep 1
+    }
+    return $false
+}
+
+function Invoke-ShieldRestore {
+    # Fail-Closed:恢复 IPv6/停保镖前必须先确保受保护进程已完全退出,绝不在运行中撤防
+    if (-not (Stop-ClaudeApp)) {
+        $script:exitCode = 1
+        'FAIL:Claude 桌面版未能退出,拒绝在运行中撤除防护'
+        return
+    }
+    if (-not (Stop-ClaudeCliHosts)) {
+        $script:exitCode = 1
+        'FAIL:Claude Code CLI 未能退出,拒绝在运行中撤除防护'
+        return
+    }
+    $homeTzFile = Join-Path $BASE 'home-tz.txt'
+    $restoreTz = ''
+    if (Test-Path -LiteralPath $homeTzFile -PathType Leaf) {
+        try { $restoreTz = ([System.IO.File]::ReadAllText($homeTzFile, [System.Text.Encoding]::UTF8)).Trim() } catch {}
+    }
+    try { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
+    $hbFile = Join-Path $BASE 'bodyguard-heartbeat.txt'
+    if (Test-Path -LiteralPath $hbFile) {
+        try {
+            $raw = ([System.IO.File]::ReadAllText($hbFile, [System.Text.Encoding]::ASCII)).Trim()
+            if ($raw -match '^(\d+)\s+') { Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue }
+        } catch {}
+        Remove-Item -LiteralPath $hbFile -Force -ErrorAction SilentlyContinue
+    }
+    $adminLines = @(
+        "Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue",
+        "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { -not `$_.Enabled } | Enable-NetAdapterBinding -Confirm:`$false"
+    )
+    if ($restoreTz -and (Get-TimeZone).Id -ne $restoreTz) {
+        $tzEsc = $restoreTz.Replace("'", "''")
+        $adminLines += "Set-TimeZone -Id '$tzEsc'"
+    }
+    $adminLines += "Clear-DnsClientCache"
+    $tmp = "$env:TEMP\claude-restore-$([guid]::NewGuid().Guid).ps1"
+    try {
+        ($adminLines -join "`r`n") | Out-File -Encoding utf8 $tmp
+        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
+        if (-not $proc -or $proc.ExitCode -ne 0) {
+            $script:exitCode = 1
+            'FAIL:管理员授权未完成,日常网络设置未完全恢复'
+            return
+        }
+    } catch {
+        $script:exitCode = 1
+        'FAIL:管理员授权被取消,日常网络设置未恢复'
+        return
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    Log "已退出护盾并恢复日常网络设置$(if ($restoreTz) { "(时区->$restoreTz)" })"
+    "OK:已暂停保镖、恢复网卡 IPv6$(if ($restoreTz) { " 并还原时区为 $restoreTz" })"
+}
+
+function Invoke-UiState([bool]$Fresh = $false) {
+    $checkLines = @()
+    if ($Fresh) {
+        $checkLines = @(Invoke-CheckDetail)
+        try { $checkLines | Out-File -Encoding utf8 "$BASE\last-check.txt" } catch {}
+    } elseif (Test-Path -LiteralPath "$BASE\last-check.txt") {
+        try { $checkLines = @([System.IO.File]::ReadAllLines("$BASE\last-check.txt", [System.Text.Encoding]::UTF8)) } catch {}
+    }
+    $checks = @()
+    foreach ($line in $checkLines) {
+        if ($line -match '^([^=]+)=(ok|warn|fail|skip)(?::(.*))?$') {
+            $checks += [pscustomobject]@{
+                name   = $Matches[1]
+                state  = $Matches[2]
+                detail = $(if ($Matches[3]) { $Matches[3] } else { '' })
+            }
+        }
+    }
+    $cfg = try { Get-CheckConfig } catch { @{ disabled = @(); allowOptionalFailures = $false; logging = $true } }
+    $override = Get-FlClashControllerOverride
+    $portSetting = 'auto'
+    if (-not [string]::IsNullOrWhiteSpace($override)) {
+        $chosen = ConvertTo-LoopbackClashEndpoint $override '' 'flclash-override'
+        if ($chosen) { $portSetting = ($chosen.base -replace '^http://', '') }
+    }
+    $bg = Get-BodyguardHealth
+    $ianaTz = ConvertFrom-WindowsTimeZone $TZ_TARGET $COUNTRY_TARGET
+    $stateObj = [ordered]@{
+        schema_version = 1
+        version        = (Get-AppVersion)
+        proxy_mode     = $PROXY_MODE
+        clients        = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')
+        flclash_port   = $portSetting
+        country_target = $COUNTRY_TARGET
+        tz_target      = $TZ_TARGET
+        iana_tz_target = $ianaTz
+        locale_target  = $LOCALE_TARGET
+        system_tz      = (Get-TimeZone).Id
+        system_locale  = [System.Globalization.CultureInfo]::CurrentCulture.Name
+        bodyguard      = [ordered]@{
+            installed     = [bool]$bg.installed
+            running       = [bool]$bg.running
+            legacy_policy = [bool]$bg.legacyPolicy
+            state         = [string]$bg.state
+            detail        = [string]$bg.detail
+        }
+        check_config   = [ordered]@{
+            disabled              = @($cfg.disabled)
+            allowOptionalFailures = [bool]$cfg.allowOptionalFailures
+            logging               = [bool]$cfg.logging
+        }
+        checks         = $checks
+    }
+    ([pscustomobject]$stateObj) | ConvertTo-Json -Depth 6 -Compress
+}
+
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 $command = if ($args.Count -gt 0) { [string]$args[0] } else { '' }
@@ -2639,18 +3075,32 @@ try {
         'check-update' { Invoke-CheckUpdate }
         'update-now'   { Invoke-UpdateNow }
         'rules-status' { Invoke-RulesStatus }
+        'launch' {
+            $launchTarget = if ($args.Count -gt 1) { [string]$args[1] } else { 'desktop' }
+            $launchExtra  = if ($args.Count -gt 2) { @($args[2..($args.Count - 1)]) } else { @() }
+            Invoke-SafeLaunch $launchTarget $launchExtra
+        }
+        'shield-restore' { Invoke-ShieldRestore }
+        'uistate' {
+            $fresh = ($args.Count -gt 1 -and [string]$args[1] -eq '--fresh')
+            Invoke-UiState $fresh
+        }
         'get-check-config' {
             $config = Get-CheckConfig
             [pscustomobject]@{ disabled = @($config.disabled); allowOptionalFailures = [bool]$config.allowOptionalFailures; logging = [bool]$config.logging } | ConvertTo-Json -Depth 3 -Compress
         }
         'set-check-config' {
-            Set-CheckConfigFromJson $args[1]
+            # 标准输入按 UTF-8 读:无窗口子进程的控制台代码页(如 936)会把中文检查项名解成乱码
+            $jsonArg = if ($args.Count -gt 1 -and [string]$args[1] -eq '--stdin') {
+                (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))).ReadToEnd()
+            } else { [string]$args[1] }
+            Set-CheckConfigFromJson $jsonArg
             'OK:检查设置已保存'
         }
         'export-diagnostics' { Export-Diagnostics $args[1] }
         default        {
             $exitCode = 1
-            "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now|rules-status|get-check-config|set-check-config|export-diagnostics|fingerprint|cli-info|open-safe|diagnose-proxy|get-flclash-controller|set-flclash-controller"
+            "用法: claude-switch.ps1 checkdetail|check|fix|launch [desktop|cli]|shield-restore|uistate [--fresh]|set-region|set-client|get-client|rules-status|get-check-config|set-check-config|fingerprint|open-safe|check-update|update-now|get-flclash-controller|set-flclash-controller"
         }
     }
 } catch {

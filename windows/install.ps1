@@ -215,10 +215,14 @@ if ($PROXY_MODE -eq 'clash-verge' -and $CLASH_DIR) {
     }
     if (-not $grp) { $grp = Read-Host "未能自动识别代理组名,请打开 Clash Verge 查看后输入" }
     if (-not $grp) { $grp = 'GLOBAL' }
-    Write-Host "[OK] 代理组: $grp" -ForegroundColor Green
-    if ($grp -match '[,\r\n]') {
-        Write-Host "[WARN] 代理组名包含逗号或换行,规则模式可能无法写入;请改名后重跑安装器" -ForegroundColor Yellow
+    # 代理组名会被写进核心脚本的 $PROXY_GROUP = "..." 字面量,并用于 DOMAIN-SUFFIX,<域名>,<组名> 规则。
+    # 含 " ` $ 会闭合/注入该字面量(可借订阅里的恶意组名执行任意 PowerShell),逗号/换行会拆断规则 —— 一律拒绝。
+    while ($grp -ne 'GLOBAL' -and $grp -match '["`$,\x00-\x1f]') {
+        Write-Host "[WARN] 代理组名含不安全字符(引号/反引号/美元符/逗号/控制字符),拒绝写入: $grp" -ForegroundColor Yellow
+        $retry = Read-Host "请在 Clash Verge 里把该代理组改成简单名称后输入(直接回车用 GLOBAL)"
+        $grp = if ($retry) { $retry } else { 'GLOBAL' }
     }
+    Write-Host "[OK] 代理组: $grp" -ForegroundColor Green
 }
 
 # ---- 3. IANA 时区 -> Windows 时区ID ----
@@ -265,7 +269,8 @@ $modeEsc = $PROXY_MODE.Replace('$', '$$')
 $countryEsc = $COUNTRY_TARGET.Replace('$', '$$')
 $tzEsc = $TZ_TARGET.Replace('$', '$$')
 $localeEsc = $LOCALE_TARGET.Replace('$', '$$')
-$grpEsc = $grp.Replace('$', '$$')
+# 纵深防御:即使上游识别逻辑被改动,也绝不把不安全字符写进 $PROXY_GROUP 字面量
+$grpEsc = ($grp -replace '["`$,\x00-\x1f]', '').Replace('$', '$$')
 $core = $core -replace '\$PROXY_MODE = "[^"]*"', ('$$PROXY_MODE = "' + $modeEsc + '"')
 $core = $core -replace '\$COUNTRY_TARGET = "[^"]*"', ('$$COUNTRY_TARGET = "' + $countryEsc + '"')
 $core = $core -replace '\$TZ_TARGET = "[^"]*"', ('$$TZ_TARGET = "' + $tzEsc + '"')
@@ -306,6 +311,11 @@ if ($PROXY_MODE -eq 'clash-verge') {
 }
 
 # ---- 7. 系统级配置 ----
+$origTz = (Get-TimeZone).Id
+$homeTzFile = Join-Path $BASE 'home-tz.txt'
+if (-not (Test-Path -LiteralPath $homeTzFile) -and $origTz -and $origTz -ne $TZ_TARGET) {
+    [System.IO.File]::WriteAllText($homeTzFile, $origTz, (New-Object System.Text.UTF8Encoding($false)))
+}
 Set-TimeZone -Id $TZ_TARGET
 try {
     Set-Culture -CultureInfo $LOCALE_TARGET -ErrorAction Stop
@@ -317,13 +327,14 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Whe
 Clear-DnsClientCache
 Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green
 
-# ---- 8. 注册保镖计划任务 ----
-$action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action $action -Trigger $trigger -Force | Out-Null
+# ---- 8. 注册保镖计划任务(取消默认 72h 超时强杀与电池断电停止限制) ----
+$action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName 'ClaudeBodyguard'
-Write-Host "[OK] 保镖已注册并启动(计划任务,登录自动运行)" -ForegroundColor Green
+Write-Host "[OK] 保镖已注册并启动(计划任务,登录自动运行,无72h/电池限制)" -ForegroundColor Green
 
 # ---- 9. 重启 Clash 使规则生效(仅 Clash Verge) ----
 if ($PROXY_MODE -eq 'clash-verge') {
