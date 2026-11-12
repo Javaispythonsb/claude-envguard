@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-runtime="web">
+<html lang="zh-CN" data-runtime="web" data-dock="top" data-tucked="false" data-idle="false" data-preview="none">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -11,27 +11,36 @@
 </head>
 <body>
 
-  <!-- ================= PC SPOTLIGHT DYNAMIC POD ================= -->
+  <!-- ================= PC FLOATING SPOTLIGHT POD ================= -->
   <div class="pod-stage" id="pcApp">
-    <div class="pod obsidian" id="podCard" data-tauri-drag-region>
 
-      <!-- 主舱行（支持按住空白处拖拽窗口） -->
-      <div class="pod-main" data-tauri-drag-region>
-        <div class="ring-gauge" id="ringGauge" data-tauri-drag-region>
-          <div class="ring-inner" id="ringIcon" data-tauri-drag-region>
+    <!-- 拖拽贴边磁吸光带预览 -->
+    <div class="snap-guide" aria-hidden="true"></div>
+
+    <!-- 贴边隐藏态：灵动微光边缘感应条 -->
+    <div class="edge-handle" id="edgeHandle" aria-hidden="true">
+      <i class="edge-bar" id="edgeStatusBar"></i>
+    </div>
+
+    <div class="pod obsidian" id="podCard" data-tauri-drag-region="deep">
+
+      <!-- 主舱行（按住任意空白处自由拖拽悬浮窗） -->
+      <div class="pod-main">
+        <div class="ring-gauge" id="ringGauge">
+          <div class="ring-inner" id="ringIcon">
             <svg class="ico lg" viewBox="0 0 24 24" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
           </div>
         </div>
 
-        <div class="pod-text" data-tauri-drag-region>
-          <h1 id="heroTitle" data-tauri-drag-region>正在审计…</h1>
-          <p id="heroSub" data-tauri-drag-region>检测网络与保镖状态</p>
+        <div class="pod-text">
+          <h1 id="heroTitle">正在审计…</h1>
+          <p id="heroSub">检测网络与保镖状态</p>
         </div>
 
         <div class="pod-actions">
           <button type="button" class="pill-btn cli-btn" id="btnLaunchCli" disabled>CLI</button>
           <button type="button" class="cta-white" id="btnLaunchDesktop" disabled>审计中…</button>
-          <button type="button" class="close-dot" id="btnHideWin" title="隐藏到托盘 (Esc)" aria-label="隐藏到系统托盘">
+          <button type="button" class="close-dot" id="btnHideWin" title="收起至边缘 (Esc)" aria-label="收起悬浮窗">
             <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
         </div>
@@ -58,7 +67,7 @@
           <button type="button" class="tool-pill" id="btnInlineBrowserCheck">浏览器自检</button>
         </div>
 
-        <div class="console-box" id="toolOutputBox" hidden>
+        <div class="console-box" id="toolOutputBox" data-tauri-drag-region="false" hidden>
           <pre id="consoleOut"></pre>
         </div>
 
@@ -115,7 +124,7 @@
       </section>
 
       <!-- 底栏微胶囊条 -->
-      <footer class="pod-bar" data-tauri-drag-region>
+      <footer class="pod-bar">
         <div class="pod-pills">
           <button type="button" class="pod-mini" id="btnRecheck">
             <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
@@ -130,10 +139,15 @@
           <button type="button" class="pod-mini" id="btnShieldRestore">退出护盾</button>
         </div>
 
-        <button type="button" class="pod-mini detail-toggle" id="btnTabDetails" data-drawer-btn="details">
-          <span>明细</span>
-          <svg class="ico xs chev" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-        </button>
+        <div class="pod-right-pills">
+          <button type="button" class="pod-mini icon-only" id="btnPinPod" title="自动贴边隐藏中（点击固定展开）" aria-label="固定展开">
+            <svg class="ico xs" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
+          </button>
+          <button type="button" class="pod-mini detail-toggle" id="btnTabDetails" data-drawer-btn="details">
+            <span>明细</span>
+            <svg class="ico xs chev" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </button>
+        </div>
       </footer>
 
     </div>

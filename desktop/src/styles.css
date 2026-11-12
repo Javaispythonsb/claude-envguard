@@ -4,8 +4,8 @@
   --island-bg: #07070a;
   --tile: rgba(255, 255, 255, 0.055);
   --tile-hover: rgba(255, 255, 255, 0.105);
-  --tile-active: rgba(255, 255, 255, 0.15);
-  --hairline: rgba(255, 255, 255, 0.11);
+  --tile-active: rgba(255, 255, 255, 0.16);
+  --hairline: rgba(255, 255, 255, 0.12);
   --softline: rgba(255, 255, 255, 0.065);
   --text-1: #f5f5f7;
   --text-2: #98989f;
@@ -31,7 +31,6 @@ html, body {
   user-select: none;
 }
 
-/* Standalone web preview gets ambient dark background */
 :root[data-runtime="web"] body {
   min-height: 100vh;
   background:
@@ -44,10 +43,7 @@ html, body {
   padding: 20px;
 }
 
-:root[data-runtime="tauri"] body {
-  overflow: hidden;
-}
-
+:root[data-runtime="tauri"] body { overflow: hidden; }
 :root[data-runtime="tauri"] .web-stage { display: none; }
 :root[data-runtime="web"] .pod-stage { display: none; }
 
@@ -72,13 +68,134 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
-/* ================= SPOTLIGHT POD CONTAINER ================= */
+/* ================= STAGE & EDGE AUTO-HIDE MECHANICS ================= */
 .pod-stage {
-  /* Soft outer padding so ambient drop shadow renders inside transparent WebView2 without clipping */
-  padding: 16px 20px 22px;
+  position: relative;
+  padding: 12px 20px 22px;
   width: 588px;
 }
 
+/* Magnetic Snap Guide Line when dragging near a screen edge */
+.snap-guide {
+  position: fixed;
+  pointer-events: none;
+  opacity: 0;
+  background: var(--green);
+  box-shadow: 0 0 16px rgba(48, 209, 88, 0.85);
+  border-radius: 999px;
+  transition: opacity 150ms var(--ease-out);
+  z-index: 30;
+}
+:root[data-preview="top"] .snap-guide {
+  top: 0;
+  left: 50%;
+  width: 220px;
+  height: 4px;
+  transform: translate3d(-50%, 0, 0);
+  opacity: 1;
+}
+:root[data-preview="left"] .snap-guide {
+  left: 0;
+  top: 26px;
+  width: 4px;
+  height: 112px;
+  opacity: 1;
+}
+:root[data-preview="right"] .snap-guide {
+  right: 0;
+  top: 26px;
+  width: 4px;
+  height: 112px;
+  opacity: 1;
+}
+
+/* Apple Dynamic Island Edge Handle (Visible when tucked into Top / Left / Right boundary) */
+.edge-handle {
+  position: fixed;
+  background: var(--island-bg);
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 25;
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.65),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+  transition: transform 240ms var(--ease-island), opacity 200ms var(--ease-out);
+}
+
+.edge-bar {
+  display: block;
+  border-radius: 999px;
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(48, 209, 88, 0.85);
+  transition: background-color 200ms var(--ease-out), box-shadow 200ms var(--ease-out);
+}
+.edge-bar.auditing,
+.edge-bar.warn {
+  background: var(--amber);
+  box-shadow: 0 0 8px rgba(255, 214, 10, 0.8);
+}
+.edge-bar.blocked {
+  background: var(--red);
+  box-shadow: 0 0 10px rgba(255, 69, 58, 0.9);
+}
+
+/* Top Edge Handle */
+:root[data-dock="top"] .edge-handle {
+  top: 0;
+  left: 50%;
+  width: 164px;
+  height: 9px;
+  border-radius: 0 0 10px 10px;
+  transform: translate3d(-50%, -100%, 0);
+}
+:root[data-dock="top"] .edge-bar {
+  width: 44px;
+  height: 3px;
+}
+:root[data-dock="top"][data-tucked="true"] .edge-handle {
+  opacity: 1;
+  transform: translate3d(-50%, 0, 0);
+}
+
+/* Left Edge Handle */
+:root[data-dock="left"] .edge-handle {
+  left: 0;
+  top: 28px;
+  width: 9px;
+  height: 108px;
+  border-radius: 0 10px 10px 0;
+  transform: translate3d(-100%, 0, 0);
+}
+:root[data-dock="left"] .edge-bar {
+  width: 3px;
+  height: 36px;
+}
+:root[data-dock="left"][data-tucked="true"] .edge-handle {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+/* Right Edge Handle */
+:root[data-dock="right"] .edge-handle {
+  right: 0;
+  top: 28px;
+  width: 9px;
+  height: 108px;
+  border-radius: 10px 0 0 10px;
+  transform: translate3d(100%, 0, 0);
+}
+:root[data-dock="right"] .edge-bar {
+  width: 3px;
+  height: 36px;
+}
+:root[data-dock="right"][data-tucked="true"] .edge-handle {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+}
+
+/* ================= MAIN POD CAPSULE & GPU TRANSITIONS ================= */
 .obsidian {
   background: var(--island-bg);
   box-shadow:
@@ -95,6 +212,39 @@ input:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 13px;
+  cursor: grab;
+  transform: translate3d(0, 0, 0) scale(1);
+  opacity: 1;
+  transition: transform 260ms var(--ease-island), opacity 210ms var(--ease-out);
+}
+.pod:active { cursor: grabbing; }
+
+/* Docked Edge Retract States */
+:root[data-dock="top"] .pod { transform-origin: top center; }
+:root[data-dock="top"][data-tucked="true"] .pod {
+  transform: translate3d(0, calc(-100% - 22px), 0) scale(0.95);
+  opacity: 0;
+  pointer-events: none;
+}
+
+:root[data-dock="left"] .pod { transform-origin: left center; }
+:root[data-dock="left"][data-tucked="true"] .pod {
+  transform: translate3d(calc(-100% - 24px), 0, 0) scale(0.95);
+  opacity: 0;
+  pointer-events: none;
+}
+
+:root[data-dock="right"] .pod { transform-origin: right center; }
+:root[data-dock="right"][data-tucked="true"] .pod {
+  transform: translate3d(calc(100% + 24px), 0, 0) scale(0.95);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Free-Floating Idle Translucent Standby (emerges to crisp 1.0 on mouse hover) */
+:root[data-dock="none"][data-idle="true"] .pod {
+  opacity: 0.56;
+  transform: translate3d(0, 0, 0) scale(0.985);
 }
 
 /* ================= MAIN CAPSULE ROW ================= */
@@ -115,7 +265,6 @@ input:focus-visible {
   transition: background 240ms var(--ease-out);
 }
 .ring-gauge.sm { width: 40px; height: 40px; }
-
 .ring-gauge.auditing {
   background: conic-gradient(var(--amber) 0% 65%, rgba(255, 255, 255, 0.1) 65% 100%);
 }
@@ -237,11 +386,11 @@ input:focus-visible {
   border-top: 1px solid var(--softline);
 }
 
-.pod-pills {
+.pod-pills,
+.pod-right-pills {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
 }
 
 .pod-mini {
@@ -260,12 +409,17 @@ input:focus-visible {
   white-space: nowrap;
   transition: color 140ms var(--ease-out), background-color 140ms var(--ease-out), transform 140ms var(--ease-out), opacity 140ms var(--ease-out);
 }
+.pod-mini.icon-only { padding: 6px 8px; }
 .pod-mini:hover:not(:disabled) { color: var(--text-1); background: var(--tile-hover); }
 .pod-mini:active:not(:disabled) { transform: scale(0.96); }
 .pod-mini:disabled { opacity: 0.38; cursor: not-allowed; }
 .pod-mini.active {
   color: var(--text-1);
   background: var(--tile-active);
+}
+.pod-mini.pinned {
+  color: #041308;
+  background: var(--green);
 }
 .pod-mini.armed {
   color: #ffffff;
@@ -289,7 +443,6 @@ input:focus-visible {
 }
 .drawer[hidden] { display: none; }
 
-/* Drawer 1: 14-item micro grid */
 .chip-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -351,7 +504,7 @@ input:focus-visible {
   padding: 6px 13px;
   outline: none;
 }
-.pod-input { flex: 1; min-width: 0; }
+.pod-input { flex: 1; min-width: 0; cursor: text; }
 .pod-input::placeholder { color: var(--text-3); }
 .pod-select { cursor: pointer; }
 .pod-select option { background: #14151c; color: var(--text-1); }
@@ -388,6 +541,7 @@ input:focus-visible {
   max-height: 142px;
   overflow: auto;
   user-select: text;
+  cursor: auto;
 }
 .console-box[hidden],
 .inline-bcheck[hidden] { display: none; }

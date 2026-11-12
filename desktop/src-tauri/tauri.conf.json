@@ -22,7 +22,10 @@
         "transparent": true,
         "shadow": false,
         "resizable": false,
-        "center": true
+        "maximizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "center": false
       }
     ],
     "security": {

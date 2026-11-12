@@ -1,15 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -30,7 +30,101 @@ const ALLOWED_CLIENTS: &[&str] = &[
 
 struct OpGuard {
     busy: Arc<AtomicBool>,
-    quitting: AtomicBool,
+    quitting: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DockEdge {
+    None,
+    Top,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl WorkRect {
+    fn right(self) -> i32 {
+        self.x + self.w
+    }
+    fn bottom(self) -> i32 {
+        self.y + self.h
+    }
+    fn contains_point(self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.right() && py >= self.y && py < self.bottom()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedDock {
+    x: i32,
+    y: i32,
+    edge: DockEdge,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DockStatePayload {
+    edge: DockEdge,
+    tucked: bool,
+    idle: bool,
+    pinned: bool,
+    preview: DockEdge,
+}
+
+struct DockInner {
+    edge: DockEdge,
+    tucked: bool,
+    idle: bool,
+    pinned: bool,
+    ui_hold: bool,
+    preview: DockEdge,
+    user_dragging: bool,
+    hover_ticks: u8,
+    last_move_at: Instant,
+    last_hover_at: Instant,
+    grace_until: Instant,
+    programmatic_move_until: Instant,
+}
+
+impl DockInner {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            edge: DockEdge::Top,
+            tucked: false,
+            idle: false,
+            pinned: false,
+            ui_hold: false,
+            preview: DockEdge::None,
+            user_dragging: false,
+            hover_ticks: 0,
+            last_move_at: now,
+            last_hover_at: now,
+            grace_until: now + Duration::from_millis(2600),
+            programmatic_move_until: now,
+        }
+    }
+
+    fn payload(&self) -> DockStatePayload {
+        DockStatePayload {
+            edge: self.edge,
+            tucked: self.tucked,
+            idle: self.idle,
+            pinned: self.pinned,
+            preview: self.preview,
+        }
+    }
+}
+
+struct DockController {
+    inner: Arc<Mutex<DockInner>>,
 }
 
 struct BusyLease {
@@ -437,11 +531,483 @@ async fn export_diagnostics(
     Ok(outcome)
 }
 
+#[cfg(target_os = "windows")]
+fn is_primary_mouse_down() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+        fn GetSystemMetrics(index: i32) -> i32;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    const VK_RBUTTON: i32 = 0x02;
+    const SM_SWAPBUTTON: i32 = 23;
+    // SAFETY: Stateless Win32 queries safe to call from any thread.
+    unsafe {
+        let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+            VK_RBUTTON
+        } else {
+            VK_LBUTTON
+        };
+        (GetAsyncKeyState(vk) as u16 & 0x8000) != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_primary_mouse_down() -> bool {
+    false
+}
+
+fn detect_snap_edge(wx: i32, wy: i32, ww: i32, _wh: i32, area: WorkRect, threshold: i32) -> DockEdge {
+    let d_top = wy - area.y;
+    let d_left = wx - area.x;
+    let d_right = area.right() - (wx + ww);
+
+    let candidates = [
+        (d_top, DockEdge::Top),
+        (d_left, DockEdge::Left),
+        (d_right, DockEdge::Right),
+    ];
+    if let Some(&(min_d, edge)) = candidates.iter().min_by_key(|c| c.0) {
+        if min_d <= threshold {
+            return edge;
+        }
+    }
+    DockEdge::None
+}
+
+fn snap_window_rect(
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    wh: i32,
+    area: WorkRect,
+    threshold: i32,
+    margin: i32,
+) -> (i32, i32, DockEdge) {
+    let edge = detect_snap_edge(wx, wy, ww, wh, area, threshold);
+    let min_x = area.x + margin;
+    let max_x = (area.right() - ww - margin).max(min_x);
+    let min_y = area.y + margin;
+    let max_y = (area.bottom() - wh - margin).max(min_y);
+
+    match edge {
+        DockEdge::Top => (wx.clamp(min_x, max_x), area.y, DockEdge::Top),
+        DockEdge::Left => (area.x, wy.clamp(min_y, max_y), DockEdge::Left),
+        DockEdge::Right => (area.right() - ww, wy.clamp(min_y, max_y), DockEdge::Right),
+        DockEdge::None => (wx.clamp(min_x, max_x), wy.clamp(min_y, max_y), DockEdge::None),
+    }
+}
+
+fn is_cursor_in_edge_handle(
+    cx: i32,
+    cy: i32,
+    wx: i32,
+    wy: i32,
+    ww: i32,
+    _wh: i32,
+    scale: f64,
+    edge: DockEdge,
+) -> bool {
+    let depth = (18.0 * scale).round() as i32;
+    match edge {
+        DockEdge::Top => {
+            let center_x = wx + ww / 2;
+            let half_w = (104.0 * scale).round() as i32;
+            cx >= center_x - half_w
+                && cx <= center_x + half_w
+                && cy >= wy - 4
+                && cy <= wy + depth
+        }
+        DockEdge::Left => {
+            let top_y = wy + (16.0 * scale).round() as i32;
+            let bot_y = wy + (148.0 * scale).round() as i32;
+            cx >= wx - 4 && cx <= wx + depth && cy >= top_y && cy <= bot_y
+        }
+        DockEdge::Right => {
+            let top_y = wy + (16.0 * scale).round() as i32;
+            let bot_y = wy + (148.0 * scale).round() as i32;
+            let right_x = wx + ww;
+            cx >= right_x - depth && cx <= right_x + 4 && cy >= top_y && cy <= bot_y
+        }
+        DockEdge::None => false,
+    }
+}
+
+fn is_cursor_in_pod(cx: i32, cy: i32, wx: i32, wy: i32, ww: i32, wh: i32, pad: i32) -> bool {
+    cx >= wx - pad && cx <= wx + ww + pad && cy >= wy - pad && cy <= wy + wh + pad
+}
+
+fn dock_state_file_path() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("ENVGUARD_STATE_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("window-dock.json"));
+        }
+    }
+    let profile = std::env::var("USERPROFILE").ok()?;
+    Some(
+        PathBuf::from(profile)
+            .join(".claude-switcher")
+            .join("window-dock.json"),
+    )
+}
+
+fn load_saved_dock() -> Option<SavedDock> {
+    let path = dock_state_file_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn persist_saved_dock(saved: &SavedDock) {
+    if let Some(path) = dock_state_file_path() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string(saved) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+fn monitor_work_rect(window: &WebviewWindow, ref_x: i32, ref_y: i32) -> Option<WorkRect> {
+    let mon = window
+        .monitor_from_point(ref_x as f64, ref_y as f64)
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| window.primary_monitor().ok().flatten())?;
+    let wa = mon.work_area();
+    Some(WorkRect {
+        x: wa.position.x,
+        y: wa.position.y,
+        w: wa.size.width as i32,
+        h: wa.size.height as i32,
+    })
+}
+
+fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persist: bool) {
+    let ww = window.outer_size().map(|s| s.width as i32).unwrap_or(588);
+    let mon = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten());
+    if let Some(m) = mon {
+        let wa = m.work_area();
+        let x = wa.position.x + ((wa.size.width as i32 - ww) / 2).max(0);
+        let y = wa.position.y;
+        let now = Instant::now();
+        let payload = {
+            let mut st = dock.lock().unwrap();
+            st.edge = DockEdge::Top;
+            st.tucked = false;
+            st.idle = false;
+            st.preview = DockEdge::None;
+            st.hover_ticks = 0;
+            st.last_hover_at = now;
+            st.grace_until = now + Duration::from_millis(2800);
+            st.programmatic_move_until = now + Duration::from_millis(300);
+            st.payload()
+        };
+        let _ = window.set_ignore_cursor_events(false);
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+        if persist {
+            persist_saved_dock(&SavedDock {
+                x,
+                y,
+                edge: DockEdge::Top,
+            });
+        }
+        let _ = window.emit("dock-state", payload);
+    }
+}
+
+fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
+    let _ = window.set_always_on_top(true);
+    let size = window.outer_size().unwrap_or(tauri::PhysicalSize::new(588, 176));
+    let ww = size.width as i32;
+    let wh = size.height as i32;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let margin = (8.0 * scale).round() as i32;
+
+    if let Some(saved) = load_saved_dock() {
+        if let Some(area) = monitor_work_rect(window, saved.x + ww / 2, saved.y + wh / 2) {
+            if area.contains_point(saved.x + ww / 2, saved.y + 24) {
+                let min_x = area.x + margin;
+                let max_x = (area.right() - ww - margin).max(min_x);
+                let min_y = area.y + margin;
+                let max_y = (area.bottom() - wh - margin).max(min_y);
+                let (x, y) = match saved.edge {
+                    DockEdge::Top => (saved.x.clamp(min_x, max_x), area.y),
+                    DockEdge::Left => (area.x, saved.y.clamp(min_y, max_y)),
+                    DockEdge::Right => (area.right() - ww, saved.y.clamp(min_y, max_y)),
+                    DockEdge::None => (saved.x.clamp(min_x, max_x), saved.y.clamp(min_y, max_y)),
+                };
+                let now = Instant::now();
+                {
+                    let mut st = dock.lock().unwrap();
+                    st.edge = saved.edge;
+                    st.tucked = false;
+                    st.idle = false;
+                    st.last_hover_at = now;
+                    st.grace_until = now + Duration::from_millis(2600);
+                    st.programmatic_move_until = now + Duration::from_millis(300);
+                }
+                let _ = window.set_ignore_cursor_events(false);
+                let _ = window.set_position(PhysicalPosition::new(x, y));
+                return;
+            }
+        }
+    }
+
+    place_top_center(window, dock, false);
+}
+
+fn start_dock_watcher(
+    window: WebviewWindow,
+    dock: Arc<Mutex<DockInner>>,
+    quitting: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        while !quitting.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(40));
+            if quitting.load(Ordering::SeqCst) {
+                break;
+            }
+            if !window.is_visible().unwrap_or(false) {
+                continue;
+            }
+            let (Ok(cur), Ok(wpos), Ok(wsize)) = (
+                window.cursor_position(),
+                window.outer_position(),
+                window.outer_size(),
+            ) else {
+                continue;
+            };
+            let cx = cur.x.round() as i32;
+            let cy = cur.y.round() as i32;
+            let wx = wpos.x;
+            let wy = wpos.y;
+            let ww = wsize.width as i32;
+            let wh = wsize.height as i32;
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let mouse_down = is_primary_mouse_down();
+
+            let Some(area) = monitor_work_rect(&window, wx + ww / 2, wy + (wh.min(180)) / 2) else {
+                continue;
+            };
+            let threshold = (38.0 * scale).round() as i32;
+            let margin = (8.0 * scale).round() as i32;
+            let now = Instant::now();
+
+            let mut emit_payload: Option<DockStatePayload> = None;
+            let mut move_to: Option<(i32, i32)> = None;
+            let mut ignore_cursor: Option<bool> = None;
+            let mut save_dock: Option<SavedDock> = None;
+
+            {
+                let mut st = dock.lock().unwrap();
+                if st.user_dragging {
+                    if mouse_down {
+                        let prev = detect_snap_edge(wx, wy, ww, wh, area, threshold);
+                        if prev != st.preview {
+                            st.preview = prev;
+                            emit_payload = Some(st.payload());
+                        }
+                    } else if now.duration_since(st.last_move_at) >= Duration::from_millis(70) {
+                        st.user_dragging = false;
+                        st.preview = DockEdge::None;
+                        let (sx, sy, new_edge) =
+                            snap_window_rect(wx, wy, ww, wh, area, threshold, margin);
+                        st.edge = new_edge;
+                        st.tucked = false;
+                        st.idle = false;
+                        st.hover_ticks = 0;
+                        st.last_hover_at = now;
+                        st.grace_until = now + Duration::from_millis(1500);
+                        if (sx, sy) != (wx, wy) {
+                            st.programmatic_move_until = now + Duration::from_millis(260);
+                            move_to = Some((sx, sy));
+                        }
+                        ignore_cursor = Some(false);
+                        save_dock = Some(SavedDock {
+                            x: sx,
+                            y: sy,
+                            edge: new_edge,
+                        });
+                        emit_payload = Some(st.payload());
+                    }
+                } else {
+                    // Keep Right edge pixel-flush and prevent tall drawers from clipping below taskbar
+                    if !st.tucked && now >= st.programmatic_move_until {
+                        let mut target_x = wx;
+                        let mut target_y = wy;
+                        if st.edge == DockEdge::Right && (wx + ww - area.right()).abs() > 2 {
+                            target_x = area.right() - ww;
+                        }
+                        if st.edge != DockEdge::Top && wy + wh > area.bottom() - margin {
+                            target_y = (area.bottom() - wh - margin).max(area.y);
+                        }
+                        if (target_x, target_y) != (wx, wy) {
+                            st.programmatic_move_until = now + Duration::from_millis(220);
+                            move_to = Some((target_x, target_y));
+                        }
+                    }
+
+                    match st.edge {
+                        DockEdge::Top | DockEdge::Left | DockEdge::Right => {
+                            if st.tucked {
+                                if !mouse_down
+                                    && is_cursor_in_edge_handle(
+                                        cx, cy, wx, wy, ww, wh, scale, st.edge,
+                                    )
+                                {
+                                    st.tucked = false;
+                                    st.idle = false;
+                                    st.hover_ticks = 0;
+                                    st.last_hover_at = now;
+                                    st.grace_until = now + Duration::from_millis(900);
+                                    ignore_cursor = Some(false);
+                                    emit_payload = Some(st.payload());
+                                }
+                            } else {
+                                let pad = (8.0 * scale).round() as i32;
+                                let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+                                if inside || st.pinned || st.ui_hold {
+                                    st.last_hover_at = now;
+                                } else if now >= st.grace_until
+                                    && now.duration_since(st.last_hover_at)
+                                        >= Duration::from_millis(1350)
+                                {
+                                    st.tucked = true;
+                                    st.idle = true;
+                                    st.hover_ticks = 0;
+                                    ignore_cursor = Some(true);
+                                    emit_payload = Some(st.payload());
+                                }
+                            }
+                        }
+                        DockEdge::None => {
+                            if st.tucked {
+                                st.tucked = false;
+                                ignore_cursor = Some(false);
+                                emit_payload = Some(st.payload());
+                            }
+                            let pad = (6.0 * scale).round() as i32;
+                            let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+                            if inside || st.pinned || st.ui_hold {
+                                st.last_hover_at = now;
+                                if st.idle {
+                                    st.idle = false;
+                                    emit_payload = Some(st.payload());
+                                }
+                            } else if !st.idle
+                                && now >= st.grace_until
+                                && now.duration_since(st.last_hover_at)
+                                    >= Duration::from_millis(2200)
+                            {
+                                st.idle = true;
+                                emit_payload = Some(st.payload());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some((tx, ty)) = move_to {
+                let _ = window.set_position(PhysicalPosition::new(tx, ty));
+            }
+            if let Some(ig) = ignore_cursor {
+                let _ = window.set_ignore_cursor_events(ig);
+            }
+            if let Some(saved) = save_dock {
+                persist_saved_dock(&saved);
+            }
+            if let Some(payload) = emit_payload {
+                let _ = window.emit("dock-state", payload);
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn get_dock_state(dock: State<'_, DockController>) -> DockStatePayload {
+    dock.inner.lock().unwrap().payload()
+}
+
+#[tauri::command]
+fn set_dock_hold(dock: State<'_, DockController>, hold: bool) {
+    let mut st = dock.inner.lock().unwrap();
+    st.ui_hold = hold;
+    if hold {
+        st.last_hover_at = Instant::now();
+    }
+}
+
+#[tauri::command]
+fn set_dock_pinned(app: AppHandle, dock: State<'_, DockController>, pinned: bool) -> DockStatePayload {
+    let payload = {
+        let mut st = dock.inner.lock().unwrap();
+        st.pinned = pinned;
+        st.last_hover_at = Instant::now();
+        if pinned {
+            st.tucked = false;
+            st.idle = false;
+        }
+        st.payload()
+    };
+    if let Some(window) = app.get_webview_window("main") {
+        if pinned {
+            let _ = window.set_ignore_cursor_events(false);
+        }
+        let _ = window.emit("dock-state", payload.clone());
+    }
+    payload
+}
+
+#[tauri::command]
+fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let mut tuck_payload: Option<DockStatePayload> = None;
+    {
+        let mut st = dock.inner.lock().unwrap();
+        if st.edge != DockEdge::None {
+            st.pinned = false;
+            st.ui_hold = false;
+            st.tucked = true;
+            st.idle = true;
+            st.hover_ticks = 0;
+            tuck_payload = Some(st.payload());
+        }
+    }
+    if let Some(payload) = tuck_payload {
+        let _ = window.set_ignore_cursor_events(true);
+        let _ = window.emit("dock-state", payload);
+    } else {
+        let _ = window.hide();
+    }
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let payload = {
+            let dock = app.state::<DockController>();
+            let mut st = dock.inner.lock().unwrap();
+            let now = Instant::now();
+            st.tucked = false;
+            st.idle = false;
+            st.hover_ticks = 0;
+            st.last_hover_at = now;
+            st.grace_until = now + Duration::from_millis(3200);
+            st.payload()
+        };
+        let _ = window.set_ignore_cursor_events(false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = window.emit("dock-state", payload);
     }
 }
 
@@ -456,7 +1022,9 @@ fn map_tray_menu_event(id: &str) -> Option<&'static str> {
 }
 
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let open_console = MenuItemBuilder::with_id("open_console", "打开主控制台").build(app)?;
+    let open_console = MenuItemBuilder::with_id("open_console", "浮现悬浮窗").build(app)?;
+    let reset_top =
+        MenuItemBuilder::with_id("reset_top", "贴靠回屏幕顶部居中").build(app)?;
     let launch_desktop =
         MenuItemBuilder::with_id("launch_desktop", "▶ 安全启动 Claude").build(app)?;
     let launch_cli = MenuItemBuilder::with_id("launch_cli", "❯_ 安全启动 CLI").build(app)?;
@@ -464,10 +1032,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let shield_restore =
         MenuItemBuilder::with_id("shield_restore", "退出护盾（还原网络并停保镖）").build(app)?;
     let quit_app =
-        MenuItemBuilder::with_id("quit_app", "退出控制台（保留后台保镖）").build(app)?;
+        MenuItemBuilder::with_id("quit_app", "退出悬浮窗（保留后台保镖）").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&open_console)
+        .item(&reset_top)
         .separator()
         .item(&launch_desktop)
         .item(&launch_cli)
@@ -495,6 +1064,12 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             let id = event.id().as_ref();
             if id == "open_console" {
                 show_main_window(app);
+            } else if id == "reset_top" {
+                show_main_window(app);
+                if let Some(window) = app.get_webview_window("main") {
+                    let dock = app.state::<DockController>();
+                    place_top_center(&window, &dock.inner, true);
+                }
             } else if id == "quit_app" {
                 app.state::<OpGuard>()
                     .quitting
@@ -515,30 +1090,69 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn main() {
+    let quitting = Arc::new(AtomicBool::new(false));
+    let dock_inner = Arc::new(Mutex::new(DockInner::new()));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
         .manage(OpGuard {
             busy: Arc::new(AtomicBool::new(false)),
-            quitting: AtomicBool::new(false),
+            quitting: Arc::clone(&quitting),
         })
-        .setup(|app| {
-            setup_tray(app.handle())?;
-            Ok(())
+        .manage(DockController {
+            inner: Arc::clone(&dock_inner),
+        })
+        .setup({
+            let quitting = Arc::clone(&quitting);
+            let dock_inner = Arc::clone(&dock_inner);
+            move |app| {
+                setup_tray(app.handle())?;
+                if let Some(win) = app.get_webview_window("main") {
+                    init_window_dock(&win, &dock_inner);
+                    start_dock_watcher(win, dock_inner, quitting);
+                }
+                Ok(())
+            }
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    let quitting = window
-                        .app_handle()
-                        .state::<OpGuard>()
-                        .quitting
-                        .load(Ordering::SeqCst);
-                    if !quitting {
-                        api.prevent_close();
-                        let _ = window.hide();
+                match event {
+                    WindowEvent::Moved(_) => {
+                        if is_primary_mouse_down() {
+                            let dock = window.app_handle().state::<DockController>();
+                            let now = Instant::now();
+                            let mut untuck = false;
+                            {
+                                let mut st = dock.inner.lock().unwrap();
+                                if now >= st.programmatic_move_until {
+                                    st.user_dragging = true;
+                                    st.last_move_at = now;
+                                    st.last_hover_at = now;
+                                    if st.tucked {
+                                        st.tucked = false;
+                                        untuck = true;
+                                    }
+                                }
+                            }
+                            if untuck {
+                                let _ = window.set_ignore_cursor_events(false);
+                            }
+                        }
                     }
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let quitting = window
+                            .app_handle()
+                            .state::<OpGuard>()
+                            .quitting
+                            .load(Ordering::SeqCst);
+                        if !quitting {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -551,7 +1165,11 @@ fn main() {
             set_flclash_port,
             save_check_config,
             run_tool,
-            export_diagnostics
+            export_diagnostics,
+            get_dock_state,
+            set_dock_hold,
+            set_dock_pinned,
+            tuck_or_hide
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude EnvGuard");
@@ -647,5 +1265,47 @@ mod tests {
         assert_eq!(map_tray_menu_event("open_console"), None);
         assert_eq!(map_tray_menu_event("quit_app"), None);
         assert_eq!(map_tray_menu_event("unknown"), None);
+    }
+
+    #[test]
+    fn edge_snap_and_clamp_geometry() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        // Dragged near top-center -> snaps flush to Top (y = 0)
+        assert_eq!(
+            snap_window_rect(650, 22, 588, 176, area, 38, 8),
+            (650, 0, DockEdge::Top)
+        );
+        // Dragged near right edge -> snaps flush to Right (x = 1920 - 588 = 1332)
+        assert_eq!(
+            snap_window_rect(1355, 320, 588, 176, area, 38, 8),
+            (1332, 320, DockEdge::Right)
+        );
+        // Dragged near left edge -> snaps flush to Left (x = 0)
+        assert_eq!(
+            snap_window_rect(-12, 400, 588, 176, area, 38, 8),
+            (0, 400, DockEdge::Left)
+        );
+        // Dragged to center -> stays free-floating (DockEdge::None)
+        assert_eq!(
+            snap_window_rect(600, 300, 588, 176, area, 38, 8),
+            (600, 300, DockEdge::None)
+        );
+    }
+
+    #[test]
+    fn edge_handle_trigger_zones() {
+        // Top docked at (666, 0), width 588 -> center_x = 960, handle trigger x in [856..1064], y in [-4..18]
+        assert!(is_cursor_in_edge_handle(960, 2, 666, 0, 588, 176, 1.0, DockEdge::Top));
+        assert!(!is_cursor_in_edge_handle(1910, 2, 666, 0, 588, 176, 1.0, DockEdge::Top));
+        assert!(!is_cursor_in_edge_handle(960, 40, 666, 0, 588, 176, 1.0, DockEdge::Top));
+
+        // Right docked at (1332, 200), width 588 -> right_x = 1920, y in [216..348]
+        assert!(is_cursor_in_edge_handle(1918, 260, 1332, 200, 588, 176, 1.0, DockEdge::Right));
+        assert!(!is_cursor_in_edge_handle(1918, 500, 1332, 200, 588, 176, 1.0, DockEdge::Right));
     }
 }

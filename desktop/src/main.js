@@ -54,6 +54,10 @@ let currentState = null;
 let defaultSubLine = '检测网络与保镖状态';
 let activeDrawer = null;
 let lastPodHeight = 0;
+let isPinned = false;
+let focusHoldCount = 0;
+let shieldArmed = false;
+let tuckFoldTimer = null;
 
 function maskDisplayIp(text) {
   return String(text || '').replace(/\b(?!198\.1[89]\.)(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b/g, '$1.$2.*.*');
@@ -66,18 +70,68 @@ function setSubStatus(text, isErr = false) {
   el.classList.toggle('err', isErr);
 }
 
+function setEdgeBarTone(tone) {
+  const bar = document.getElementById('edgeStatusBar');
+  if (!bar) return;
+  bar.className = tone ? `edge-bar ${tone}` : 'edge-bar';
+}
+
+function syncDockHold() {
+  if (!isTauri) return;
+  const shouldHold = focusHoldCount > 0 || shieldArmed;
+  invoke('set_dock_hold', { hold: shouldHold }).catch(() => {});
+}
+
+function applyDockPayload(payload) {
+  if (!payload) return;
+  const root = document.documentElement;
+  const edge = payload.edge || 'none';
+  const tucked = Boolean(payload.tucked);
+  const idle = Boolean(payload.idle);
+  const preview = payload.preview || 'none';
+  isPinned = Boolean(payload.pinned);
+
+  root.setAttribute('data-dock', edge);
+  root.setAttribute('data-tucked', String(tucked));
+  root.setAttribute('data-idle', String(idle));
+  root.setAttribute('data-preview', preview);
+
+  const pinBtn = document.getElementById('btnPinPod');
+  if (pinBtn) {
+    pinBtn.classList.toggle('pinned', isPinned);
+    pinBtn.title = isPinned
+      ? '已固定展开（点击恢复贴边自动隐藏）'
+      : '自动贴边隐藏中（点击固定展开）';
+  }
+
+  const closeBtn = document.getElementById('btnHideWin');
+  if (closeBtn) {
+    closeBtn.title = edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)';
+  }
+
+  clearTimeout(tuckFoldTimer);
+  if (tucked && activeDrawer) {
+    // Collapse any open drawer invisibly after the retract transition finishes
+    tuckFoldTimer = setTimeout(() => {
+      if (document.documentElement.getAttribute('data-tucked') === 'true' && activeDrawer) {
+        toggleDrawer(null);
+      }
+    }, 260);
+  }
+}
+
 function syncPodHeight() {
   if (!isTauri) return;
   const stage = document.getElementById('pcApp');
   if (!stage) return;
-  const h = Math.max(152, Math.ceil(stage.getBoundingClientRect().height));
+  const h = Math.max(148, Math.ceil(stage.offsetHeight));
   if (Math.abs(h - lastPodHeight) < 2) return;
   lastPodHeight = h;
   getCurrentWindow().setSize(new LogicalSize(POD_WIDTH, h)).catch(() => {});
 }
 
 function toggleDrawer(name) {
-  const next = activeDrawer === name ? null : name;
+  const next = name === null ? null : (activeDrawer === name ? null : name);
   activeDrawer = next;
   const map = {
     details: 'drawerDetails',
@@ -235,16 +289,19 @@ function applyUiState(data) {
   if (!complete) {
     gauge.className = 'ring-gauge auditing';
     rIcon.innerHTML = SVG_WAIT;
+    setEdgeBarTone('auditing');
     heroTitle.textContent = '等待审计';
     defaultSubLine = `${cc} · ${clientName} · 点「重检」开始`;
   } else if (!ready) {
     gauge.className = 'ring-gauge blocked';
     rIcon.innerHTML = SVG_BLOCK;
+    setEdgeBarTone('blocked');
     heroTitle.textContent = `未通过：${blockedNames.slice(0, 2).join('、')}`;
     defaultSubLine = '点下方「修复」自动处理，或开「设置」调整';
   } else {
     gauge.className = 'ring-gauge';
     rIcon.innerHTML = SVG_CHECK;
+    setEdgeBarTone('');
     heroTitle.textContent = '环境安全';
     defaultSubLine = `${cc} · ${clientName} · ${guardState}`;
   }
@@ -260,6 +317,7 @@ async function refreshDesktopState(fresh = true) {
     const rIcon = document.getElementById('ringIcon');
     if (gauge) gauge.className = 'ring-gauge auditing';
     if (rIcon) rIcon.innerHTML = SVG_WAIT;
+    setEdgeBarTone('auditing');
     setSubStatus('正在检测网络与隧道…', false);
   }
   try {
@@ -322,16 +380,35 @@ async function runInlineBrowserSelfCheck() {
 }
 
 function wireDesktopEvents() {
-  const hideToTray = () => {
-    if (isTauri) getCurrentWindow().hide().catch(() => {});
+  const requestTuckOrHide = () => {
+    if (isTauri) invoke('tuck_or_hide').catch(() => {});
   };
-  document.getElementById('btnHideWin').onclick = hideToTray;
+  document.getElementById('btnHideWin').onclick = requestTuckOrHide;
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      if (activeDrawer) toggleDrawer(activeDrawer);
-      else hideToTray();
+      if (activeDrawer) toggleDrawer(null);
+      else requestTuckOrHide();
     }
   });
+
+  document.getElementById('btnPinPod').onclick = () => {
+    invoke('set_dock_pinned', { pinned: !isPinned })
+      .then((st) => applyDockPayload(st))
+      .catch(() => {});
+  };
+
+  for (const id of ['safeUrlInput', 'proxyClientSelect', 'flclashPortInput']) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('focus', () => {
+      focusHoldCount++;
+      syncDockHold();
+    });
+    el.addEventListener('blur', () => {
+      focusHoldCount = Math.max(0, focusHoldCount - 1);
+      syncDockHold();
+    });
+  }
 
   document.querySelectorAll('[data-drawer-btn]').forEach((btn) => {
     btn.onclick = () => toggleDrawer(btn.dataset.drawerBtn);
@@ -354,11 +431,15 @@ function wireDesktopEvents() {
   let shieldArmTimer = null;
   const disarmShield = () => {
     clearTimeout(shieldArmTimer);
+    shieldArmed = false;
+    syncDockHold();
     shieldBtn.classList.remove('armed');
     shieldBtn.textContent = '退出护盾';
   };
   shieldBtn.onclick = () => {
     if (!shieldBtn.classList.contains('armed')) {
+      shieldArmed = true;
+      syncDockHold();
       shieldBtn.classList.add('armed');
       shieldBtn.textContent = '确认退出?';
       setSubStatus('将关闭 Claude/CLI 并还原网络，5s 内再点确认', true);
@@ -456,9 +537,13 @@ function wireDesktopEvents() {
       true
     );
     if (res?.exit_code === 0 && activeDrawer === 'settings') {
-      toggleDrawer('settings');
+      toggleDrawer(null);
     }
   };
+
+  listen('dock-state', (event) => {
+    applyDockPayload(event?.payload);
+  }).catch(() => {});
 
   listen('tray-action', (event) => {
     const action = String(event?.payload || '');
@@ -532,6 +617,9 @@ function init() {
     renderCheckSkeleton();
     renderOptionalTiles([]);
     wireDesktopEvents();
+    invoke('get_dock_state')
+      .then((st) => applyDockPayload(st))
+      .catch(() => {});
     syncPodHeight();
     refreshDesktopState(false).then(() => refreshDesktopState(true));
   } else {
