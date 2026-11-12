@@ -18,19 +18,11 @@ import {
   normalizeSafeUrl,
   computePrimaryIslandAction,
   formatUpdateCheckReport,
-  describeUpdateProgress,
-  describeOrbModeMeta,
-  computeImpactSquash
+  describeUpdateProgress
 } from './hig-model.js';
 
 const EASE_OUT = 'cubic-bezier(0.23, 1, 0.32, 1)';
 const EASE_DRAWER = 'cubic-bezier(0.32, 0.72, 0, 1)';
-
-const ORB_MARK_PATHS = {
-  ok: 'm9.2 12.1 2 2.05 3.85-3.95',
-  blocked: 'M12 8.2v4.6M12 16.2h.01',
-  auditing: 'M9.5 12h.01M12 12h.01M14.5 12h.01'
-};
 
 const TAB_ORDER = ['overview', 'tools', 'settings'];
 const TAB_INDEX = {
@@ -66,16 +58,9 @@ let lastPodHeight = 0;
 
 let isPinned = false;
 let isTucked = false;
-let isOrb = false;
-let isPlayMode = false;
-let standbyTone = '';
-let standbyMode = 'edge';
 let hasFocusWithin = false;
 let popupOpen = false;
 let shieldArmed = false;
-let orbSquashAnim = null;
-let orbCharged = false;
-let orbComboPopAnim = null;
 
 // Overview progressive disclosure state
 let matrixOpen = false;
@@ -109,30 +94,9 @@ function setSubStatus(text, isErr = false, autoRevertMs = 0) {
   }
 }
 
-function syncOrbA11yMeta() {
-  const orb = document.getElementById('shieldOrb');
-  if (!orb) return;
-  const meta = describeOrbModeMeta({ tone: standbyTone, playMode: isPlayMode });
-  orb.setAttribute('aria-label', meta.ariaLabel);
-  orb.title = meta.title;
-}
-
 function setStandbyTone(tone) {
-  standbyTone = tone || '';
   const bar = document.getElementById('edgeStatusBar');
   if (bar) bar.className = tone ? `edge-bar ${tone}` : 'edge-bar';
-
-  const orb = document.getElementById('shieldOrb');
-  if (orb) {
-    orb.className = tone ? `shield-orb ${tone}` : 'shield-orb';
-    syncOrbA11yMeta();
-  }
-
-  const mark = document.getElementById('orbMarkPath');
-  if (mark) {
-    const key = tone === 'blocked' ? 'blocked' : tone === 'auditing' ? 'auditing' : 'ok';
-    mark.setAttribute('d', ORB_MARK_PATHS[key]);
-  }
 
   const pod = document.getElementById('podCard');
   if (pod) {
@@ -142,93 +106,6 @@ function setStandbyTone(tone) {
       pod.removeAttribute('data-alert');
     }
   }
-}
-
-function applyOrbFxPayload(fx) {
-  if (!fx) return;
-  const rotor = document.getElementById('orbRotor');
-  const body = document.getElementById('orbBody');
-  const badge = document.getElementById('orbComboBadge');
-  const reduced = prefersReducedMotion();
-
-  if (rotor) {
-    const deg = reduced || !fx.angle ? 0 : Number(fx.angle.toFixed(1));
-    rotor.style.transform = deg ? `rotate(${deg}deg)` : '';
-  }
-
-  if (badge) {
-    const combo = Number(fx.combo) || 0;
-    if (isPlayMode && combo >= 2) {
-      badge.textContent = `×${combo}`;
-      badge.hidden = false;
-      if (!reduced && typeof badge.animate === 'function') {
-        if (orbComboPopAnim) {
-          try { orbComboPopAnim.cancel(); } catch {}
-        }
-        orbComboPopAnim = badge.animate(
-          [
-            { transform: 'scale3d(0.86, 0.86, 1)' },
-            { transform: 'scale3d(1.18, 1.18, 1)' },
-            { transform: 'scale3d(1, 1, 1)' }
-          ],
-          { duration: 210, easing: EASE_OUT }
-        );
-      }
-    } else {
-      badge.hidden = true;
-    }
-  }
-
-  if (reduced || !body || typeof body.animate !== 'function') return;
-
-  if (fx.charge) {
-    // A tap in play mode: the ball squashes down and holds, like a spring being pressed,
-    // until Rust either pops it up or a second press ends play mode.
-    cancelOrbSquash();
-    orbSquashAnim = body.animate(
-      [
-        { transform: 'scale3d(1, 1, 1)' },
-        { transform: 'scale3d(1.1, 0.88, 1)' }
-      ],
-      { duration: 140, easing: EASE_OUT, fill: 'forwards' }
-    );
-    orbCharged = true;
-  } else if (fx.impact_axis && fx.impact_speed >= 95) {
-    const releasedFromCharge = orbCharged;
-    cancelOrbSquash();
-    if (releasedFromCharge) {
-      orbSquashAnim = body.animate(
-        [
-          { transform: 'scale3d(1.1, 0.88, 1)' },
-          { transform: 'scale3d(0.9, 1.12, 1)', offset: 0.34 },
-          { transform: 'scale3d(1.03, 0.98, 1)', offset: 0.7 },
-          { transform: 'scale3d(1, 1, 1)' }
-        ],
-        { duration: 260, easing: EASE_OUT }
-      );
-    } else {
-      const sq = computeImpactSquash(fx.impact_speed, fx.impact_axis);
-      orbSquashAnim = body.animate(
-        [
-          { transform: 'scale3d(1, 1, 1)' },
-          { transform: `scale3d(${sq.compress.sx}, ${sq.compress.sy}, 1)`, offset: 0.28 },
-          { transform: `scale3d(${sq.rebound.sx}, ${sq.rebound.sy}, 1)`, offset: 0.66 },
-          { transform: 'scale3d(1, 1, 1)' }
-        ],
-        { duration: 230, easing: EASE_OUT }
-      );
-    }
-  } else if (orbCharged) {
-    cancelOrbSquash();
-  }
-}
-
-function cancelOrbSquash() {
-  if (orbSquashAnim) {
-    try { orbSquashAnim.cancel(); } catch {}
-    orbSquashAnim = null;
-  }
-  orbCharged = false;
 }
 
 function syncDockHold() {
@@ -296,7 +173,7 @@ class IslandEnvelopeController {
   }
 
   async commitHwndEnvelope(targetH, collapsed = false) {
-    if (!isTauri || isTucked || isOrb) return;
+    if (!isTauri || isTucked) return;
     const h = Math.max(POD_COMPACT_HEIGHT, Math.ceil(targetH));
     if (Math.abs(h - this.hwndHeight) < 2 && !collapsed) return;
     this.hwndHeight = h;
@@ -572,7 +449,7 @@ class IslandEnvelopeController {
   }
 
   syncIdleHeight() {
-    if (this.isAnimating || !isTauri || isTucked || isOrb) return;
+    if (this.isAnimating || !isTauri || isTucked) return;
     const stage = document.getElementById('pcApp');
     if (!stage) return;
     const h = Math.max(POD_COMPACT_HEIGHT, Math.ceil(stage.offsetHeight));
@@ -591,58 +468,31 @@ function applyDockPayload(payload) {
   if (!payload) return;
   const root = document.documentElement;
   const edge = payload.edge || 'none';
-  const prevOrb = isOrb;
   isTucked = Boolean(payload.tucked);
-  isOrb = Boolean(payload.orb);
-  isPlayMode = Boolean(payload.play);
-  standbyMode = payload.standby_mode || 'edge';
   const seam = Boolean(payload.seam);
   const idle = Boolean(payload.idle);
   const preview = payload.preview || 'none';
   isPinned = Boolean(payload.pinned);
 
   root.setAttribute('data-dock', edge);
-  root.setAttribute('data-standby', standbyMode);
-  root.setAttribute('data-orb', String(isOrb));
-  root.setAttribute('data-play', String(isPlayMode));
   root.setAttribute('data-tucked', String(isTucked));
   root.setAttribute('data-seam', String(seam));
   root.setAttribute('data-idle', String(idle));
   root.setAttribute('data-preview', preview);
-  syncOrbA11yMeta();
-  if (!isPlayMode) {
-    const badge = document.getElementById('orbComboBadge');
-    if (badge) badge.hidden = true;
-    if (orbCharged) cancelOrbSquash();
-  }
-
-  document.querySelectorAll('[data-standby-pick]').forEach((btn) => {
-    const on = btn.dataset.standbyPick === standbyMode;
-    btn.classList.toggle('on', on);
-    btn.setAttribute('aria-checked', String(on));
-  });
 
   const pinBtn = document.getElementById('btnPinPod');
   if (pinBtn) {
     pinBtn.classList.toggle('toggled', isPinned);
     pinBtn.setAttribute('aria-pressed', String(isPinned));
-    pinBtn.title = isPinned
-      ? '已固定展开（点击恢复自动待机）'
-      : (standbyMode === 'orb' ? '自动收缩为陶瓷盾球（点击固定展开）' : '自动贴边隐藏中（点击固定展开）');
+    pinBtn.title = isPinned ? '已固定展开（点击恢复自动待机）' : '自动贴边隐藏中（点击固定展开）';
   }
 
   const hideBtn = document.getElementById('btnHideWin');
   if (hideBtn) {
-    hideBtn.title = standbyMode === 'orb'
-      ? '收起为陶瓷盾球 (Esc)'
-      : (edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)');
+    hideBtn.title = edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)';
   }
 
-  if (prevOrb && !isOrb) {
-    envelopeCtrl.hwndHeight = 0;
-    lastPodHeight = 0;
-  }
-  if (!isTucked && !isOrb) {
+  if (!isTucked) {
     requestAnimationFrame(syncPodHeight);
   }
 }
@@ -1381,26 +1231,11 @@ function wireShieldDestructiveRitual(onConfirmRestore) {
   return { arm, disarm };
 }
 
-/* ================= CAPSULE DRAG SURFACES & CLICK GUARDS ================= */
+/* ================= CAPSULE DRAG SURFACES ================= */
 // The window is dragged by Rust, not by the system drag loop, so the page still receives
 // the mouseup and fires a click on whatever the press started on. That click belongs to
 // the drag and is swallowed once, in the capture phase, before any button sees it.
 let swallowNextClick = false;
-
-// Armed when the ball has just turned into the capsule under the cursor. A click the user
-// aimed at the ball must not operate the capsule that appeared in its place.
-let podClickGuard = null;
-
-function armPodClickGuard() {
-  podClickGuard = { until: performance.now() + 650, origin: null };
-}
-
-function requestTogglePlayMode() {
-  if (!isTauri) return;
-  invoke('toggle_orb_play_mode')
-    .then((st) => applyDockPayload(st))
-    .catch(() => {});
-}
 
 function wireDeadzoneDragSurfaces() {
   const interactiveSelector = 'button:not(.pod-summary-trigger), input, select, a, pre, .apple-popup';
@@ -1415,14 +1250,6 @@ function wireDeadzoneDragSurfaces() {
   });
 
   window.addEventListener('mousemove', (e) => {
-    if (podClickGuard) {
-      // The guard only covers a cursor that has not moved since the capsule appeared.
-      if (!podClickGuard.origin) {
-        podClickGuard.origin = { x: e.screenX, y: e.screenY };
-      } else if (Math.hypot(e.screenX - podClickGuard.origin.x, e.screenY - podClickGuard.origin.y) > 6) {
-        podClickGuard = null;
-      }
-    }
     if (!down) return;
     if (!(e.buttons & 1)) {
       // The release happened where the page could not see it.
@@ -1454,64 +1281,13 @@ function wireDeadzoneDragSurfaces() {
       swallowNextClick = false;
       e.stopPropagation();
       e.preventDefault();
-      return;
     }
-    if (!podClickGuard || e.detail === 0) return;
-    if (performance.now() > podClickGuard.until) {
-      podClickGuard = null;
-      return;
-    }
-    if (!(e.target instanceof Element) || !e.target.closest('#podCard')) return;
-    e.stopPropagation();
-    e.preventDefault();
-    if (e.detail >= 2) {
-      // A double click that was meant for the ball still starts play mode.
-      podClickGuard = null;
-      requestTogglePlayMode();
-      return;
-    }
-    // Stay armed long enough to catch the second click of a double click.
-    podClickGuard.until = Math.max(podClickGuard.until, performance.now() + 450);
   }, true);
 
   const sumBtn = document.getElementById('btnSummaryToggle');
   if (sumBtn) {
-    let ringClickTimer = null;
     sumBtn.onclick = (e) => {
-      if (e.detail === 0) {
-        envelopeCtrl.setExpanded(!isExpanded, { source: 'keyboard' });
-        return;
-      }
-
-      // Double click on the ring at the left of the capsule turns it into the play ball.
-      const ringEl = document.getElementById('ringGauge');
-      let hitRing = false;
-      if (ringEl) {
-        const rect = ringEl.getBoundingClientRect();
-        hitRing = e.clientX >= rect.left - 4
-          && e.clientX <= rect.right + 4
-          && e.clientY >= rect.top - 4
-          && e.clientY <= rect.bottom + 4;
-      }
-
-      if (hitRing && isTauri) {
-        if (e.detail >= 2) {
-          clearTimeout(ringClickTimer);
-          ringClickTimer = null;
-          requestTogglePlayMode();
-          return;
-        }
-        // A single click on the ring waits a moment so a double click does not also
-        // flash the panel open. Clicks anywhere else on the summary stay immediate.
-        clearTimeout(ringClickTimer);
-        ringClickTimer = setTimeout(() => {
-          ringClickTimer = null;
-          envelopeCtrl.setExpanded(!isExpanded, { source: 'pointer' });
-        }, 250);
-        return;
-      }
-
-      envelopeCtrl.setExpanded(!isExpanded, { source: 'pointer' });
+      envelopeCtrl.setExpanded(!isExpanded, { source: e.detail === 0 ? 'keyboard' : 'pointer' });
     };
   }
 }
@@ -1563,15 +1339,10 @@ function wireDesktopEvents() {
 
   document.getElementById('btnHideWin').onclick = requestTuckOrHide;
 
-  // Escape peels off one layer at a time. Play mode comes first, and the panel-only layers
-  // are checked only while the panel is open, so state left over from an earlier visit
-  // can never swallow the key invisibly.
+  // Escape peels off one layer at a time. The panel-only layers are checked only while the
+  // panel is open, so state left over from an earlier visit can never swallow the key.
   window.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (isPlayMode) {
-      if (isTauri) invoke('exit_orb_play').catch(() => {});
-      return;
-    }
     if (popupOpen) {
       closeProxyPopup();
       return;
@@ -1636,56 +1407,6 @@ function wireDesktopEvents() {
       .then((st) => applyDockPayload(st))
       .catch(() => {});
   };
-
-  document.querySelectorAll('[data-standby-pick]').forEach((btn) => {
-    btn.onclick = () => {
-      const mode = btn.dataset.standbyPick;
-      invoke('set_standby_mode', { mode })
-        .then((st) => {
-          applyDockPayload(st);
-          setSubStatus(mode === 'orb' ? '待机已切换为：陶瓷盾球' : '待机已切换为：贴边光条', false, 2400);
-        })
-        .catch(() => {});
-    };
-  });
-
-  // The ball. The page only reports that the primary button went down or up on it; Rust
-  // follows the cursor and the button from there and decides between tap, double press,
-  // hold and drag. Counting clicks here would break as soon as the window moves under
-  // the cursor, which is exactly what the ball does in play mode.
-  const orbEl = document.getElementById('shieldOrb');
-  if (orbEl) {
-    orbEl.addEventListener('pointerdown', (e) => {
-      if (!isTauri || e.button !== 0) return;
-      invoke('orb_pointer_down', { offX: e.clientX, offY: e.clientY, sentAt: Date.now() }).catch(() => {});
-    });
-    orbEl.addEventListener('pointerup', (e) => {
-      if (isTauri && e.button === 0) invoke('orb_pointer_up').catch(() => {});
-    });
-    // Enter or Space on the focused ball opens the capsule at once.
-    orbEl.addEventListener('click', (e) => {
-      if (isTauri && e.detail === 0) invoke('expand_from_orb').catch(() => {});
-    });
-  }
-
-  // Ways out of play mode besides a double press: the close badge beside the ball and a
-  // right click anywhere on the ball's window. Both act on the press, not the release.
-  const exitBadge = document.getElementById('orbExitBadge');
-  if (exitBadge) {
-    exitBadge.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      if (isTauri) invoke('exit_orb_play').catch(() => {});
-    });
-    exitBadge.addEventListener('click', (e) => {
-      if (isTauri && e.detail === 0) invoke('exit_orb_play').catch(() => {});
-    });
-  }
-  document.getElementById('pcApp')?.addEventListener('pointerdown', (e) => {
-    if (e.button === 2 && isPlayMode && isOrb && isTauri) {
-      invoke('exit_orb_play').catch(() => {});
-    }
-  });
 
   // Overview: 2x2 Control Center Tiles filter & expand check matrix
   document.querySelectorAll('.cc-tile[data-cc]').forEach((tile) => {
@@ -2024,14 +1745,6 @@ function wireDesktopEvents() {
 
   listen('dock-state', (event) => {
     applyDockPayload(event?.payload);
-  }).catch(() => {});
-
-  listen('orb-fx', (event) => {
-    applyOrbFxPayload(event?.payload);
-  }).catch(() => {});
-
-  listen('pod-click-guard', () => {
-    armPodClickGuard();
   }).catch(() => {});
 
   listen('tray-action', (event) => {

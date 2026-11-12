@@ -1,6 +1,6 @@
 [package]
 name = "claude-envguard"
-version = "2.1.0"
+version = "2.1.1"
 description = "Claude 环境卫士 (EnvGuard) — 启动门禁与运行期进程急停控制台"
 license = "AGPL-3.0-only"
 authors = ["EnvGuard"]

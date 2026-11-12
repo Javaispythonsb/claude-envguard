@@ -168,14 +168,6 @@ input:focus-visible {
   width: 480px;
   background: transparent;
 }
-/* 72×72 stage centers the 56×56 ceramic orb with an 8px transparent anti-clip buffer for breathing halo & bounce squash */
-:root[data-orb="true"] .pod-stage {
-  width: 72px;
-  height: 72px;
-  display: grid;
-  place-items: center;
-}
-
 /* Live Magnetic Edge Snap Guide */
 .snap-guide {
   position: fixed;
@@ -283,290 +275,6 @@ input:focus-visible {
 :root[data-dock="right"][data-seam="true"][data-tucked="true"] .edge-handle {
   left: auto;
   right: 0;
-}
-
-/* ================= MINIMAL MODE 2: 56×56 LUMINOUS BREATHING CERAMIC ORB ================= */
-/* The halo never grows past scale 1: at 68px wide it already sits 2px inside the 72px
-   window on every side, so nothing is ever cut off flat by the window edge. */
-@keyframes orbHaloBreathe {
-  0%, 100% {
-    opacity: 0.4;
-    transform: scale3d(0.94, 0.94, 1);
-  }
-  50% {
-    opacity: 1;
-    transform: scale3d(1, 1, 1);
-  }
-}
-
-@keyframes orbCoreBreathe {
-  0%, 100% {
-    opacity: 0.45;
-    transform: scale3d(0.92, 0.92, 1);
-  }
-  50% {
-    opacity: 0.95;
-    transform: scale3d(1.06, 1.06, 1);
-  }
-}
-
-@keyframes orbRingBreathe {
-  0%, 100% { opacity: 0.42; }
-  50% { opacity: 0.9; }
-}
-
-@keyframes orbRingSpin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.shield-orb {
-  --orb-breathe-dur: 3.6s;
-  position: relative;
-  display: none;
-  width: 56px;
-  height: 56px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--sys-green);
-  place-items: center;
-  cursor: grab;
-  overflow: visible;
-  transition: transform 160ms var(--ease-out), color 200ms ease;
-}
-.shield-orb:active {
-  cursor: grabbing;
-}
-.shield-orb.auditing {
-  --orb-breathe-dur: 2.3s;
-  color: var(--sys-amber);
-}
-.shield-orb.blocked {
-  --orb-breathe-dur: 1.75s;
-  color: var(--sys-red);
-}
-:root[data-play="true"] .shield-orb {
-  --orb-breathe-dur: 2.1s;
-}
-
-/* Outer breathing aura. `closest-side` makes 100% the edge of this 68px disc, so the glow
-   starts just under the rim of the 56px ball (82%) and fades to nothing at the disc edge.
-   The dark layer underneath keeps the glow readable on a white wallpaper. */
-.shield-orb .orb-halo {
-  position: absolute;
-  inset: -6px;
-  border-radius: 50%;
-  background:
-    radial-gradient(
-      circle closest-side,
-      transparent 76%,
-      color-mix(in srgb, currentColor 58%, transparent) 82%,
-      color-mix(in srgb, currentColor 26%, transparent) 91%,
-      transparent 100%
-    ),
-    radial-gradient(
-      circle closest-side,
-      transparent 76%,
-      rgba(0, 0, 0, 0.3) 83%,
-      rgba(0, 0, 0, 0.1) 92%,
-      transparent 100%
-    );
-  pointer-events: none;
-  will-change: transform, opacity;
-  animation: orbHaloBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
-}
-
-/* 3D Obsidian Ceramic Sphere Body (receives GPU squash/stretch on bounce impacts) */
-.shield-orb .orb-body {
-  position: relative;
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: linear-gradient(180deg, #1b202c 0%, #0a0d14 54%, #040508 100%);
-  box-shadow:
-    0 2px 4px rgba(0, 0, 0, 0.38),
-    inset 0 0 0 1px rgba(0, 0, 0, 0.96),
-    inset 0 1.5px 1px rgba(255, 255, 255, 0.34),
-    inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.08);
-  display: grid;
-  place-items: center;
-  overflow: hidden;
-  pointer-events: none;
-  will-change: transform;
-}
-.shield-orb.blocked .orb-body {
-  box-shadow:
-    0 2px 4.5px rgba(0, 0, 0, 0.44),
-    inset 0 0 0 1px rgba(0, 0, 0, 0.96),
-    inset 0 1.5px 1px rgba(255, 145, 140, 0.40),
-    inset 0 -1.5px 2px rgba(255, 69, 58, 0.28);
-}
-
-/* Inner luminous breathing ring (high contrast against dark obsidian on both white & black wallpapers) */
-.shield-orb .orb-ring {
-  position: absolute;
-  inset: 2px;
-  border-radius: 50%;
-  padding: 1.5px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in srgb, currentColor 68%, #ffffff) 0%,
-    color-mix(in srgb, currentColor 32%, transparent) 52%,
-    color-mix(in srgb, currentColor 76%, transparent) 100%
-  );
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  opacity: 0.62;
-  pointer-events: none;
-  will-change: opacity;
-  animation: orbRingBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
-}
-
-/* Gravity Play Mode: kinetic orbital specular ring */
-:root[data-play="true"] .shield-orb .orb-ring {
-  padding: 2px;
-  background: conic-gradient(
-    from 0deg,
-    transparent 0deg,
-    color-mix(in srgb, currentColor 88%, #ffffff) 75deg,
-    color-mix(in srgb, currentColor 28%, transparent) 160deg,
-    transparent 230deg,
-    color-mix(in srgb, currentColor 72%, #ffffff) 315deg,
-    transparent 360deg
-  );
-  opacity: 0.92;
-  will-change: transform;
-  animation: orbRingSpin 2.6s linear infinite;
-}
-
-/* Volumetric inner core breathing light */
-.shield-orb .orb-glow {
-  position: absolute;
-  inset: 6px;
-  border-radius: 50%;
-  background: radial-gradient(
-    circle closest-side,
-    color-mix(in srgb, currentColor 46%, transparent) 0%,
-    color-mix(in srgb, currentColor 16%, transparent) 58%,
-    transparent 100%
-  );
-  pointer-events: none;
-  will-change: transform, opacity;
-  animation: orbCoreBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
-}
-
-/* World-space zenith glass specular + bottom colored fresnel bounce (stays top-lit even while emblem spins!) */
-.shield-orb .orb-lighting {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  background:
-    radial-gradient(72% 40% at 50% 9%, rgba(255, 255, 255, 0.28) 0%, rgba(255, 255, 255, 0.04) 58%, transparent 100%),
-    radial-gradient(68% 34% at 50% 95%, color-mix(in srgb, currentColor 30%, transparent) 0%, transparent 100%);
-  pointer-events: none;
-}
-
-.shield-orb .orb-rotor {
-  position: relative;
-  z-index: 2;
-  width: 26px;
-  height: 26px;
-  display: grid;
-  place-items: center;
-  pointer-events: none;
-  will-change: transform;
-}
-
-.orb-shield {
-  width: 26px;
-  height: 26px;
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  pointer-events: none;
-  filter: drop-shadow(0 0 5px color-mix(in srgb, currentColor 45%, transparent)) drop-shadow(0 1px 2px rgba(0, 0, 0, 0.65));
-}
-.orb-shield .shield-outline {
-  stroke-width: 1.85;
-  fill: currentColor;
-  fill-opacity: 0.16;
-}
-.orb-shield .shield-mark {
-  stroke-width: 2.15;
-}
-
-/* Keepie-uppie juggle combo pill in Gravity Play Mode. Top-left, because the top-right
-   corner of the stage belongs to the close badge. */
-.orb-combo {
-  position: absolute;
-  top: -5px;
-  left: -6px;
-  z-index: 4;
-  min-width: 22px;
-  height: 16px;
-  padding: 0 5px;
-  border-radius: 999px;
-  background: #0b0e15;
-  box-shadow:
-    0 1px 3px rgba(0, 0, 0, 0.55),
-    inset 0 0 0 1px color-mix(in srgb, currentColor 65%, rgba(255, 255, 255, 0.25));
-  color: var(--label-1);
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 16px;
-  text-align: center;
-  pointer-events: none;
-  transition: transform 150ms var(--ease-out), opacity 150ms ease;
-}
-.orb-combo[hidden] {
-  display: none !important;
-}
-
-/* Close badge for play mode. A sibling of the ball in the top-right corner of the 72px
-   stage, always visible while playing so there is an obvious way out. */
-.orb-exit {
-  position: absolute;
-  top: 0;
-  right: 0;
-  z-index: 6;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  border: none;
-  border-radius: 50%;
-  display: none;
-  place-items: center;
-  background: #0b0e15;
-  box-shadow:
-    0 1px 3px rgba(0, 0, 0, 0.55),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.26);
-  color: var(--label-2);
-  cursor: pointer;
-  transition: background-color 140ms ease, color 140ms ease, transform 140ms var(--ease-out);
-}
-.orb-exit svg {
-  width: 10px;
-  height: 10px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.9;
-  stroke-linecap: round;
-  pointer-events: none;
-}
-.orb-exit:active {
-  transform: scale(0.92);
-}
-:root[data-orb="true"][data-play="true"] .orb-exit { display: grid; }
-
-:root[data-orb="true"] .shield-orb { display: grid; }
-:root[data-orb="true"] .pod,
-:root[data-orb="true"] .edge-handle,
-:root[data-orb="true"] .snap-guide {
-  display: none !important;
 }
 
 /* ================= COMPACT & EXPANDED DYNAMIC ISLAND SURFACE ================= */
@@ -1740,36 +1448,6 @@ input:focus-visible {
 }
 .mini-pill:disabled { opacity: 0.36; cursor: not-allowed; }
 
-.seg-mini {
-  display: inline-flex;
-  padding: 2px;
-  border-radius: 999px;
-  background: var(--well-bg);
-  box-shadow: var(--well-shadow);
-  gap: 2px;
-}
-.seg-mini-btn {
-  height: 24px;
-  padding: 0 11px;
-  border: none;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--label-2);
-  font-family: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  cursor: pointer;
-}
-/* Unified Elevated Smoky Glider Material (does not compete with primary CTAs) */
-.seg-mini-btn.on {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.14) 100%);
-  color: var(--label-1);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.26),
-    0 1px 3px rgba(0, 0, 0, 0.45);
-  font-weight: 600;
-}
-
 .section-caption {
   padding: 0 4px;
   display: flex;
@@ -1874,7 +1552,6 @@ input:focus-visible {
 .cc-tile,
 .tool-tile,
 .seg-tab,
-.seg-mini-btn,
 .switch-cell,
 .apple-popup-btn,
 .matrix-fold-bar,
@@ -1904,35 +1581,18 @@ input:focus-visible {
 .mini-pill:active:not(:disabled),
 .well-aux-btn:active:not(:disabled),
 .apple-popup-btn:active:not(:disabled),
-.seg-tab:active:not(.active),
-.seg-mini-btn:active:not(.on) {
+.seg-tab:active:not(.active) {
   transform: scale(0.965);
 }
 
-/* L3: Compact circular buttons & orb (0.95) */
+/* L3: Compact circular buttons (0.95) */
 .circle-icon:active:not(:disabled),
 .well-clear-btn:active:not(:disabled),
-.shield-orb:active,
 .switch-cell:active .ios-switch {
   transform: scale(0.95);
 }
 
 @media (hover: hover) and (pointer: fine) {
-  /* No hover growth in play mode: the ball keeps passing under the cursor there. */
-  :root:not([data-play="true"]) .shield-orb:hover:not(:active) {
-    transform: scale3d(1.045, 1.045, 1);
-  }
-  .orb-exit:hover {
-    background: var(--sys-red);
-    color: #ffffff;
-  }
-  .shield-orb:hover .orb-body {
-    box-shadow:
-      0 2.5px 5px rgba(0, 0, 0, 0.46),
-      inset 0 0 0 1px rgba(0, 0, 0, 0.96),
-      inset 0 1.5px 1.2px rgba(255, 255, 255, 0.48),
-      inset 0 -1.5px 2px color-mix(in srgb, currentColor 38%, rgba(255, 255, 255, 0.14));
-  }
   .capsule-secondary:hover:not(:disabled),
   .circle-icon:hover:not(:disabled),
   .mini-pill:hover:not(:disabled),
@@ -1962,8 +1622,7 @@ input:focus-visible {
     background: var(--btn-blue-bg);
     color: #ffffff;
   }
-  .seg-tab:hover:not(.active),
-  .seg-mini-btn:hover:not(.on) { color: var(--label-1); }
+  .seg-tab:hover:not(.active) { color: var(--label-1); }
   .matrix-fold-bar:hover,
   .check-row:hover,
   .switch-cell:hover { background: rgba(255, 255, 255, 0.038); }
@@ -2022,28 +1681,14 @@ input:focus-visible {
 /* ================= ACCESSIBLE REDUCED MOTION (KEEP COMPREHENSION FADES, DROP MOTION) ================= */
 @media (prefers-reduced-motion: reduce) {
   .ring-gauge.auditing .ring-svg,
-  #btnRecheck.is-spinning svg,
-  .shield-orb .orb-halo,
-  .shield-orb .orb-ring,
-  .shield-orb .orb-glow {
+  #btnRecheck.is-spinning svg {
     animation: none !important;
-  }
-  .shield-orb .orb-halo {
-    opacity: 0.6;
   }
   .seg-glider,
   .ios-thumb,
   .expand-btn .chev,
-  .fold-chev,
-  .shield-orb,
-  .orb-combo,
-  .orb-exit {
+  .fold-chev {
     transition-duration: 0ms !important;
-  }
-  .shield-orb:hover,
-  .shield-orb:active,
-  .orb-exit:active {
-    transform: none !important;
   }
   .capsule-primary:active,
   .capsule-secondary:active,

@@ -14,11 +14,7 @@ import {
   formatUpdateCheckReport,
   formatBuildTime,
   plainReleaseNote,
-  describeUpdateProgress,
-  ORB_STAGE_SIZE,
-  ORB_VISUAL_SIZE,
-  describeOrbModeMeta,
-  computeImpactSquash
+  describeUpdateProgress
 } from '../src/hig-model.js';
 
 test('Compact 灵动岛几何常量与 14 项四域全覆盖无遗漏', () => {
@@ -194,27 +190,4 @@ test('plainReleaseNote 与 describeUpdateProgress', () => {
   assert.equal(describeUpdateProgress('verify', 30, 60).percent, 60, '进度条不能倒退');
   assert.equal(describeUpdateProgress('restart', 180, 0).percent, 100);
   assert.equal(describeUpdateProgress('unknown-stage', 5).label, '正在更新');
-});
-
-test('悬浮球舞台几何缓冲、待机/游戏模式文案与碰撞弹性形变计算', () => {
-  assert.equal(ORB_STAGE_SIZE, 72);
-  assert.equal(ORB_VISUAL_SIZE, 56);
-  assert.ok(ORB_STAGE_SIZE - ORB_VISUAL_SIZE >= 14, '呼吸光晕与撞击压扁需要每侧至少 7px 防裁切缓冲');
-
-  const standbyMeta = describeOrbModeMeta({ tone: '', playMode: false });
-  assert.match(standbyMeta.title, /悬停展开/);
-  assert.match(standbyMeta.title, /双击/);
-  assert.ok(!standbyMeta.title.includes('—'));
-
-  const playBlockedMeta = describeOrbModeMeta({ tone: 'blocked', playMode: true });
-  assert.match(playBlockedMeta.ariaLabel, /阻断项/);
-  assert.match(playBlockedMeta.title, /重力解压模式/);
-  assert.ok(!playBlockedMeta.title.includes('—'));
-
-  const floorHit = computeImpactSquash(1200, 'y');
-  assert.ok(floorHit.compress.sx > 1 && floorHit.compress.sy < 1, '垂直撞地应横向舒展、纵向压扁');
-  assert.ok(floorHit.rebound.sx < 1 && floorHit.rebound.sy > 1, '垂直回弹应纵向微拉伸');
-
-  const wallHit = computeImpactSquash(1200, 'x');
-  assert.ok(wallHit.compress.sx < 1 && wallHit.compress.sy > 1, '水平撞墙应横向压扁、纵向舒展');
 });
