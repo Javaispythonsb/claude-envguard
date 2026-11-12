@@ -1443,6 +1443,8 @@ function Write-ClashScriptRules {
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
             "  const pinnedRules = $json;`r`n" +
             "  config.rules = pinnedRules.concat((config.rules||[]).filter(r=>!pinnedRules.includes(r)));`r`n" +
+            "  config.ipv6 = false;`r`n" +
+            "  if (config.dns && typeof config.dns === 'object') { config.dns.ipv6 = false; }`r`n" +
             "  if (config.tun && typeof config.tun === 'object') { config.tun['strict-route'] = true; }`r`n" +
             "// <<< claude-switcher managed rules <<<"
 
@@ -1980,54 +1982,7 @@ function Invoke-Fix {
         else { "FIX:TUN 未在线($pname),请检查客户端 TUN 开关" }
     }
 
-    # B. 时区/IPv6/DNS/保镖(需管理员:通过 UAC 弹一次)
-    $adminScript = @()
-    if ((Get-TimeZone).Id -ne $TZ_TARGET) {
-        Save-HomeTimeZone $TZ_TARGET
-        $tzEscFix = $TZ_TARGET.Replace("'", "''")
-        $adminScript += "Set-TimeZone -Id '$tzEscFix'"
-    }
-    if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) {
-        Save-HomeIpv6State
-        $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false"
-    }
-    if (-not (Test-SmhnrDisabled)) {
-        Save-HomeSmhnrState
-        $adminScript += "if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient')) { New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Force | Out-Null }; Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -Value 1 -Type DWord -Force; `$null = gpupdate /target:computer /force 2>&1"
-    }
-    $bgFix = Get-BodyguardHealth
-    $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
-    $targetBg  = Join-Path $BASE 'claude-bodyguard.ps1'
-    if ($siblingBg -and (Test-Path -LiteralPath $siblingBg -PathType Leaf) -and (-not (Test-Path -LiteralPath $targetBg) -or $bgFix.legacyPolicy)) {
-        try {
-            New-Item -ItemType Directory -Force -Path $BASE | Out-Null
-            if (([IO.Path]::GetFullPath($siblingBg)) -ine ([IO.Path]::GetFullPath($targetBg))) {
-                Copy-Item -LiteralPath $siblingBg -Destination $targetBg -Force -ErrorAction Stop
-            }
-        } catch {}
-    }
-    if (-not $bgFix.installed -or $bgFix.legacyPolicy) {
-        $bgPathEsc = ("$BASE\claude-bodyguard.ps1").Replace("'", "''")
-        $adminScript += "`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"' + '$bgPathEsc' + '`"'); `$t = New-ScheduledTaskTrigger -AtLogOn; `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Settings `$s -Force | Out-Null; Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
-    } elseif (-not $bgFix.running) {
-        try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop; "FIX:保镖任务已在用户态重新拉起 ✓" } catch {
-            $adminScript += "Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
-        }
-    }
-    if ($adminScript.Count -gt 0) {
-        $adminScript += "Clear-DnsClientCache"
-        "FIX:修复时区/IPv6/DNS防漏/保镖(需要管理员授权)..."
-        $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
-        [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
-        try { Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" } catch { "FIX:管理员授权被取消" }
-        Remove-Item $tmp -ErrorAction SilentlyContinue
-        "FIX:时区/IPv6/DNS防漏/保镖 ✓"
-    } else {
-        try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
-        "FIX:时区/IPv6/DNS防漏/保镖 无需修复 ✓"
-    }
-
-    # B2. 置顶规则:先识别 Clash 模式,绝不盲目写 Merge.yaml
+    # A2. 置顶规则(优先于管理员 UAC 步骤:Clash Verge 重启会重建 TUN 网卡并默认开启其 ms_tcpip6,放在前面可一次 UAC 一并关闭)
     if ($PROXY_MODE -ne 'clash-verge') {
         "FIX:请在 $(Get-ProxyName) 中自行添加 Claude 域名置顶/直连规则"
     } else {
@@ -2106,6 +2061,53 @@ function Invoke-Fix {
                 }
             }
         }
+    }
+
+    # B. 时区/IPv6/DNS防漏/保镖(需管理员:通过 UAC 弹一次)
+    $adminScript = @()
+    if ((Get-TimeZone).Id -ne $TZ_TARGET) {
+        Save-HomeTimeZone $TZ_TARGET
+        $tzEscFix = $TZ_TARGET.Replace("'", "''")
+        $adminScript += "Set-TimeZone -Id '$tzEscFix'"
+    }
+    if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) {
+        Save-HomeIpv6State
+        $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false"
+    }
+    if (-not (Test-SmhnrDisabled)) {
+        Save-HomeSmhnrState
+        $adminScript += "if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient')) { New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Force | Out-Null }; Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -Value 1 -Type DWord -Force; `$null = gpupdate /target:computer /force 2>&1"
+    }
+    $bgFix = Get-BodyguardHealth
+    $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
+    $targetBg  = Join-Path $BASE 'claude-bodyguard.ps1'
+    if ($siblingBg -and (Test-Path -LiteralPath $siblingBg -PathType Leaf) -and (-not (Test-Path -LiteralPath $targetBg) -or $bgFix.legacyPolicy)) {
+        try {
+            New-Item -ItemType Directory -Force -Path $BASE | Out-Null
+            if (([IO.Path]::GetFullPath($siblingBg)) -ine ([IO.Path]::GetFullPath($targetBg))) {
+                Copy-Item -LiteralPath $siblingBg -Destination $targetBg -Force -ErrorAction Stop
+            }
+        } catch {}
+    }
+    if (-not $bgFix.installed -or $bgFix.legacyPolicy) {
+        $bgPathEsc = ("$BASE\claude-bodyguard.ps1").Replace("'", "''")
+        $adminScript += "`$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"' + '$bgPathEsc' + '`"'); `$t = New-ScheduledTaskTrigger -AtLogOn; `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); Register-ScheduledTask -TaskName 'ClaudeBodyguard' -Action `$a -Trigger `$t -Settings `$s -Force | Out-Null; Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+    } elseif (-not $bgFix.running) {
+        try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop; "FIX:保镖任务已在用户态重新拉起 ✓" } catch {
+            $adminScript += "Start-ScheduledTask -TaskName 'ClaudeBodyguard'"
+        }
+    }
+    if ($adminScript.Count -gt 0) {
+        $adminScript += "Clear-DnsClientCache"
+        "FIX:修复时区/IPv6/DNS防漏/保镖(需要管理员授权)..."
+        $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
+        [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+        try { Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" } catch { "FIX:管理员授权被取消" }
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+        "FIX:时区/IPv6/DNS防漏/保镖 ✓"
+    } else {
+        try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+        "FIX:时区/IPv6/DNS防漏/保镖 无需修复 ✓"
     }
 
     # C. 出口IP最终验证
