@@ -150,8 +150,11 @@ jobs:
             git tag -f latest $env:GH_SHA
             git push origin refs/tags/latest --force
 
-            gh release view latest 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = 'Continue'
+            gh release view latest *> $null
+            $exists = ($LASTEXITCODE -eq 0)
+            $ErrorActionPreference = 'Stop'
+            if (-not $exists) {
               gh release create latest @assets --title "Claude 环境卫士 · Latest ($($info.short_commit))" --notes-file $notesFile
             } else {
               gh release upload latest @assets --clobber
@@ -161,8 +164,11 @@ jobs:
 
           if ($env:GH_REF.StartsWith('refs/tags/v')) {
             $tagName = $env:GH_REF_NAME
-            gh release view $tagName 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = 'Continue'
+            gh release view $tagName *> $null
+            $exists = ($LASTEXITCODE -eq 0)
+            $ErrorActionPreference = 'Stop'
+            if (-not $exists) {
               gh release create $tagName @assets --title "Claude 环境卫士 $tagName" --notes-file $notesFile
             } else {
               gh release upload $tagName @assets --clobber
