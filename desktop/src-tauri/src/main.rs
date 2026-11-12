@@ -363,6 +363,8 @@ fn execute_core_blocking(
         .arg(&script)
         .args(&args)
         .env("ENVGUARD_APP_VERSION", app_version)
+        .env("ENVGUARD_APP_COMMIT", env!("ENVGUARD_GIT_SHA"))
+        .env("ENVGUARD_APP_COMMIT_UNIX", env!("ENVGUARD_GIT_COMMIT_UNIX"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -491,7 +493,15 @@ async fn get_ui_state(
         .find(|l| l.trim_start().starts_with('{'))
         .ok_or_else(|| format!("状态解析失败: {}", res.output))?;
 
-    serde_json::from_str(json_line).map_err(|e| format!("状态 JSON 无效: {e}"))
+    let mut val: serde_json::Value =
+        serde_json::from_str(json_line).map_err(|e| format!("状态 JSON 无效: {e}"))?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert(
+            "git_short_sha".to_string(),
+            serde_json::Value::String(env!("ENVGUARD_GIT_SHORT_SHA").to_string()),
+        );
+    }
+    Ok(val)
 }
 
 #[tauri::command]
@@ -597,6 +607,117 @@ async fn export_diagnostics(
     if outcome.exit_code == 0 {
         outcome.output = format!("{}\n已保存到: {}", outcome.output, target.display());
     }
+    Ok(outcome)
+}
+
+fn sibling_path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+fn cleanup_stale_old_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        let old_exe = sibling_path_with_suffix(&exe, ".old");
+        let _ = std::fs::remove_file(old_exe);
+        if let Some(dir) = exe.parent() {
+            let _ = std::fs::remove_file(dir.join("claude-envguard.exe.old"));
+            let _ = std::fs::remove_file(dir.join("claude-envguard.exe.new"));
+        }
+    }
+}
+
+#[tauri::command]
+async fn check_app_update(app: AppHandle) -> Result<serde_json::Value, String> {
+    let res = run_core_async(&app, vec!["check-app-update".to_string()]).await?;
+    let json_line = res
+        .output
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| format!("检查更新返回无效: {}", res.output))?;
+    serde_json::from_str(json_line).map_err(|e| format!("解析更新状态失败: {e}"))
+}
+
+#[tauri::command]
+async fn apply_app_update(
+    app: AppHandle,
+    guard: State<'_, OpGuard>,
+) -> Result<CommandOutcome, String> {
+    let _lease = BusyLease::try_acquire(&guard.busy)?;
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("无法获取当前程序路径: {e}"))?;
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| "无法定位当前程序所在目录".to_string())?
+        .to_path_buf();
+
+    let outcome = run_core_async(
+        &app,
+        vec![
+            "stage-app-update".to_string(),
+            exe_dir.to_string_lossy().into_owned(),
+        ],
+    )
+    .await?;
+
+    if outcome.exit_code != 0 {
+        return Ok(outcome);
+    }
+
+    let staged_exe = exe_dir.join("claude-envguard.exe.new");
+    if !staged_exe.is_file() {
+        return Ok(outcome);
+    }
+
+    let old_exe = sibling_path_with_suffix(&current_exe, ".old");
+    let _ = std::fs::remove_file(&old_exe);
+
+    std::fs::rename(&current_exe, &old_exe).map_err(|e| {
+        let _ = std::fs::remove_file(&staged_exe);
+        format!("重命名当前运行程序失败: {e}")
+    })?;
+
+    if let Err(e) = std::fs::rename(&staged_exe, &current_exe) {
+        let _ = std::fs::rename(&old_exe, &current_exe);
+        let _ = std::fs::remove_file(&staged_exe);
+        return Err(format!("替换新版可执行文件失败(已回滚): {e}"));
+    }
+
+    let mut relaunch = Command::new("powershell.exe");
+    relaunch
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "try { Wait-Process -Id ([int]$env:_EG_OLD_PID) -Timeout 12 -ErrorAction SilentlyContinue } catch {}; Start-Sleep -Milliseconds 120; Remove-Item -LiteralPath $env:_EG_OLD_EXE -Force -ErrorAction SilentlyContinue; Start-Process -FilePath $env:_EG_NEW_EXE",
+        ])
+        .env("_EG_OLD_PID", std::process::id().to_string())
+        .env("_EG_OLD_EXE", &old_exe)
+        .env("_EG_NEW_EXE", &current_exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    relaunch.creation_flags(CREATE_NO_WINDOW);
+
+    if let Err(e) = relaunch.spawn() {
+        // Restore original executable name if helper process could not spawn
+        let _ = std::fs::remove_file(&current_exe);
+        let _ = std::fs::rename(&old_exe, &current_exe);
+        return Err(format!("启动热更新重启助手失败(已回滚): {e}"));
+    }
+
+    let quitting_flag = Arc::clone(&guard.quitting);
+    let app_for_exit = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(220));
+        quitting_flag.store(true, Ordering::SeqCst);
+        app_for_exit.exit(0);
+    });
+
     Ok(outcome)
 }
 
@@ -1841,6 +1962,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn main() {
+    cleanup_stale_old_exe();
     let quitting = Arc::new(AtomicBool::new(false));
     let dock_inner = Arc::new(Mutex::new(DockInner::new()));
 
@@ -1918,6 +2040,8 @@ fn main() {
             save_check_config,
             run_tool,
             export_diagnostics,
+            check_app_update,
+            apply_app_update,
             get_dock_state,
             set_dock_hold,
             set_pod_envelope,
@@ -2149,5 +2273,18 @@ mod tests {
         // Dragging the Orb to middle of screen (1200, 500) updates pod home to Free-floating centered on the orb
         let (px2, py2, edge2) = compute_pod_pos_from_orb(1200, 500, 60, 480, 64, area, 8);
         assert_eq!((px2, py2, edge2), (990, 498, DockEdge::None));
+    }
+
+    #[test]
+    fn hot_update_sibling_path_and_build_git_meta() {
+        let p = PathBuf::from(r"C:\Users\demo\.claude-switcher\envguard\claude.envguard.exe");
+        assert_eq!(
+            sibling_path_with_suffix(&p, ".old"),
+            PathBuf::from(r"C:\Users\demo\.claude-switcher\envguard\claude.envguard.exe.old")
+        );
+        let sha = env!("ENVGUARD_GIT_SHA");
+        let short_sha = env!("ENVGUARD_GIT_SHORT_SHA");
+        assert!(sha == "unknown" || sha.len() == 40);
+        assert!(short_sha == "unknown" || short_sha.len() == 7);
     }
 }

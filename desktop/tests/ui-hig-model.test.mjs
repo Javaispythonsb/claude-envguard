@@ -10,7 +10,8 @@ import {
   buildAnomalyCallouts,
   summarizeMatrixCounts,
   normalizeSafeUrl,
-  computePrimaryIslandAction
+  computePrimaryIslandAction,
+  formatUpdateCheckReport
 } from '../src/hig-model.js';
 
 test('Compact 灵动岛几何常量与 14 项四域全覆盖无遗漏', () => {
@@ -114,4 +115,42 @@ test('computePrimaryIslandAction 遵循 Apple HIG 主操作角色切换', () => 
   assert.equal(locked.mode, 'blocked');
   assert.equal(locked.tone, 'red');
   assert.equal(locked.disabled, true);
+});
+
+test('formatUpdateCheckReport 准确控制立即热更新按钮显隐与云端编译提示', () => {
+  const avail = formatUpdateCheckReport({
+    status: 'update_available',
+    repo: 'Javaispythonsb/claude-envguard',
+    current_version: '2.0.0',
+    current_commit: '1111111',
+    latest_version: '2.0.0',
+    latest_commit: '2222222',
+    notes: 'feat: hot update',
+    built_at: '2026-11-12T08:00:00Z'
+  });
+  assert.equal(avail.canHotUpdate, true);
+  assert.match(avail.body, /2222222/);
+  assert.ok(!avail.body.includes('—'));
+
+  const upToDatePending = formatUpdateCheckReport({
+    status: 'up_to_date',
+    repo: 'Javaispythonsb/claude-envguard',
+    current_version: '2.0.0',
+    current_commit: '2222222',
+    ci_building: true,
+    ci_head_commit: '3333333',
+    ci_head_title: 'fix: polish'
+  });
+  assert.equal(upToDatePending.canHotUpdate, false);
+  assert.match(upToDatePending.body, /3333333/);
+
+  const building = formatUpdateCheckReport({
+    status: 'building',
+    repo: 'Javaispythonsb/claude-envguard',
+    current_version: '2.0.0',
+    current_commit: '2222222',
+    latest_commit: '3333333'
+  });
+  assert.equal(building.canHotUpdate, false);
+  assert.match(building.title, /编译中/);
 });

@@ -5,9 +5,10 @@
 **Windows 启动前环境审计门禁 · 运行期进程级急停 · 浏览器侧防漏自检**
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-blue.svg)](LICENSE)
+[![CI & Hot-Update Release](https://github.com/Javaispythonsb/claude-envguard/actions/workflows/windows.yml/badge.svg)](https://github.com/Javaispythonsb/claude-envguard/actions/workflows/windows.yml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg)](desktop/)
 [![Desktop](https://img.shields.io/badge/Desktop-Tauri%20v2%20%2B%20PowerShell-24C8DB.svg)](desktop/)
-[![Web/PWA](https://img.shields.io/badge/Web%20%2F%20PWA-Browser%20Self--Check-39FF14.svg)](desktop/)
+[![Web/PWA](https://img.shields.io/badge/Web%20%2F%20PWA-Browser%20Self--Check-30D158.svg)](desktop/)
 
 </div>
 
@@ -49,9 +50,9 @@
    - 关闭主窗口自动隐藏驻留至系统托盘（不退出监控台、不停后台保镖）；左键托盘图标或重复运行程序会自动唤醒已有主窗口；右键托盘提供「安全启动 Claude / CLI」「重新检查环境」「退出护盾」「退出控制台」快捷菜单。
 5. **收工退出护盾（按快照精准还原）**
    - 5 秒内二次点击确认；先关闭 Claude 桌面版与所有 Claude Code CLI 会话（任一未退出则拒绝撤防），再暂停保镖、按 `ipv6-state.json` 逐块恢复各网卡原始 IPv6 绑定状态，并按 `home-tz.txt` 还原原系统时区（缺失旧快照时明确告警提示）。
-6. **6 项实用工具 + 双极客主题**
-   - 内置**一次性隔离浏览器 (`open-safe`)**、**换节点重锁地区 (`set-region`)**、**Clash 置顶规则透视 (`rules-status`)**、**硬件与虚拟化指纹 (`fingerprint`)**、**导出桌面脱敏诊断包 (`export-diagnostics`)**、**检查上游更新 (`upstream-status`)**。
-   - 支持 `终端黑客绿 (Terminal)` 与 `赛博霓虹 (Cyber)` 双主题一键切换。
+6. **Apple HIG 三态灵动岛桌面悬浮窗 + GitHub 一键热更新**
+   - 采用 `Minimal`（`9px` 贴边微光感应条 / `56×56` 陶瓷黑高光微球）⇄ `Compact`（`480×64` 单行灵动岛胶囊）⇄ `Expanded`（`480px` 同心圆角控制中心托盘）渐进披露架构，支持上/左/右三边磁吸贴靠自动隐藏与系统托盘驻留。
+   - 内置**一次性无痕隔离浏览器 (`open-safe`)**、**换节点重锁地区 (`set-region`)**、**Clash 置顶规则透视 (`rules-status`)**、**硬件与虚拟化指纹 (`fingerprint`)**、**导出桌面脱敏诊断包 (`export-diagnostics`)**、以及 **GitHub 在线检查更新与一键热更新 (`check-app-update` / `stage-app-update`)**：每次推送到 `main` 后由 GitHub Actions 自动编译并签名发布 `latest` 固件包，客户端一键校验 `SHA-256`、保留全部本机锁定配置后无缝热替换重启。
 
 ### 二、浏览器侧自检页（Web / PWA）
 

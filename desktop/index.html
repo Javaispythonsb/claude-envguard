@@ -210,7 +210,7 @@
                 <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 <span>导出诊断</span>
               </button>
-              <button type="button" class="tool-tile" data-tool="upstream-status">
+              <button type="button" class="tool-tile" id="btnCheckAppUpdate">
                 <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
                 <span>检查更新</span>
               </button>
@@ -220,6 +220,7 @@
               <div class="drawer-toolbar">
                 <span class="drawer-title" id="toolOutputTitle">执行输出</span>
                 <div class="drawer-actions">
+                  <button type="button" class="pill-hot-update" id="btnApplyHotUpdate" hidden>立即热更新</button>
                   <button type="button" class="mini-pill" id="btnCopyToolOut">复制结果</button>
                   <button type="button" class="well-clear-btn" id="btnCloseToolOut" aria-label="收起输出" title="收起">
                     <svg class="ico xs" viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>

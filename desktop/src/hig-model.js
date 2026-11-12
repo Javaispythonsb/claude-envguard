@@ -427,3 +427,105 @@ export function computePrimaryIslandAction({ busy, busyLabel, complete, ready, n
     title: '正在执行启动前安全审计…'
   };
 }
+
+/**
+ * Formats the JSON payload from `check_app_update` into structured UI drawer state.
+ */
+export function formatUpdateCheckReport(info) {
+  if (!info || typeof info !== 'object') {
+    return {
+      title: '检查更新 · 异常',
+      canHotUpdate: false,
+      summary: '未能读取更新状态',
+      body: '未收到有效的更新检查结果，请稍后重试。'
+    };
+  }
+
+  const st = String(info.status || 'error');
+  const repo = info.repo || 'Javaispythonsb/claude-envguard';
+  const curVer = info.current_version || '2.0.0';
+  const curSha = info.current_commit && info.current_commit !== 'unknown' ? ` (${info.current_commit})` : '';
+  const latVer = info.latest_version || curVer;
+  const latSha = info.latest_commit ? ` (${info.latest_commit})` : '';
+
+  if (st === 'update_available') {
+    const lines = [
+      `状态：发现可用热更新`,
+      `本机版本：v${curVer}${curSha}`,
+      `最新版本：v${latVer}${latSha}`
+    ];
+    if (info.notes) lines.push(`更新内容：${info.notes}`);
+    if (info.built_at) lines.push(`构建时间：${info.built_at}`);
+    lines.push(`开源仓库：https://github.com/${repo}`);
+    lines.push('');
+    lines.push('点击右上角「立即热更新」将自动校验 SHA-256 签名，保留全部本机设置后无缝替换重启。');
+    return {
+      title: '检查更新 · 发现新版',
+      canHotUpdate: true,
+      summary: info.message || `发现 GitHub 新版本 v${latVer}${latSha}`,
+      body: lines.join('\n')
+    };
+  }
+
+  if (st === 'up_to_date') {
+    const lines = [
+      `状态：当前已是最新版本`,
+      `本机版本：v${curVer}${curSha}`,
+      `开源仓库：https://github.com/${repo}`
+    ];
+    if (info.built_at) lines.push(`最新构建：${info.built_at}`);
+    if (info.ci_building && info.ci_head_commit) {
+      lines.push('');
+      lines.push(`提示：检测到 main 分支刚推送新提交 (${info.ci_head_commit}${info.ci_head_title ? ': ' + info.ci_head_title : ''})，GitHub Actions 正在后台编译打包，约 1~2 分钟后再次检查即可拉取热更新。`);
+    }
+    return {
+      title: info.ci_building ? '检查更新 · 云端同步中' : '检查更新 · 已是最新',
+      canHotUpdate: false,
+      summary: info.message || `当前已是最新版本 v${curVer}${curSha}`,
+      body: lines.join('\n')
+    };
+  }
+
+  if (st === 'building') {
+    const lines = [
+      `状态：GitHub Actions 正在编译打包首个 Release`,
+      `本机版本：v${curVer}${curSha}`,
+      `最新提交：${info.latest_commit || '--'}${info.notes ? ' · ' + info.notes : ''}`,
+      `构建进度：https://github.com/${repo}/actions`,
+      '',
+      '云端编译完成后（约 1~2 分钟），再次点击「检查更新」即可一键热更新。'
+    ];
+    return {
+      title: '检查更新 · 云端编译中',
+      canHotUpdate: false,
+      summary: info.message || 'GitHub Actions 正在后台编译打包中',
+      body: lines.join('\n')
+    };
+  }
+
+  if (st === 'ahead') {
+    const lines = [
+      `状态：本地构建新于云端 Release（防倒退保护已生效）`,
+      `本机版本：v${curVer}${curSha}`,
+      `云端构建：v${latVer}${latSha}`,
+      `开源仓库：https://github.com/${repo}`
+    ];
+    if (info.ci_building) {
+      lines.push('');
+      lines.push('GitHub Actions 正在编译最新提交，请等待云端构建完成后再检查。');
+    }
+    return {
+      title: '检查更新 · 本地超前',
+      canHotUpdate: false,
+      summary: info.message || '当前本地版本新于云端 Release',
+      body: lines.join('\n')
+    };
+  }
+
+  return {
+    title: '检查更新 · 失败',
+    canHotUpdate: false,
+    summary: info.message || '无法连接 GitHub 更新源',
+    body: `${info.message || '检查更新失败'}\n开源仓库：https://github.com/${repo}`
+  };
+}

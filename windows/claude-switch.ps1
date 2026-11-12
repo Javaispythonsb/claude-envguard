@@ -120,7 +120,7 @@ $CLASH_DIR = @(
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
 # check-update / rules-status / diagnose-proxy / upstream-status / 只读 uistate 不在检查路径上创建任何目录;
 # accounts 子目录仅在旧版切换/快照命令中按需创建,EnvGuard 命令只建 $BASE
-$readOnlyCommands = @('check-update','rules-status','diagnose-proxy','upstream-status')
+$readOnlyCommands = @('check-update','check-app-update','rules-status','diagnose-proxy','upstream-status')
 $accountCommands = @('status','switch','snapshot-export','snapshot-import')
 if ($args.Count -eq 0) {
     New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
@@ -3162,30 +3162,419 @@ function Import-EncryptedSnapshot([string]$File, [string]$Target, [string]$Mode)
     }
 }
 
-function Get-ReleaseInfo {
-    $current = Get-AppVersion
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        # GitHub 要求 User-Agent;PowerShell 5.1 的 -Headers 不允许改它,-UserAgent 等价写入请求头
-        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/YOURSJEYO/claude-switcher/releases/latest' -UserAgent 'ClaudeSwitcher' -TimeoutSec 8
-        $latest = ([string]$rel.tag_name).Trim() -replace '^[vV]', ''
-        if (-not $latest) { throw '无法解析最新版本号' }
+# 本项目开源仓库(热更新与版本检查默认源)
+$ENVGUARD_REPO = if ($env:ENVGUARD_GITHUB_REPO -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { [string]$env:ENVGUARD_GITHUB_REPO } else { 'Javaispythonsb/claude-envguard' }
 
-        $zip = @($rel.assets) | Where-Object { $_ -and $_.name -like '*-windows.zip' } | Select-Object -First 1
-        $sums = @($rel.assets) | Where-Object { $_ -and $_.name -eq 'SHA256SUMS-release.txt' } | Select-Object -First 1
-        $zipUrl = if ($zip) { [string]$zip.browser_download_url } else { '' }
-        $sumsUrl = if ($sums) { [string]$sums.browser_download_url } else { '' }
-        $pageUrl = [string]$rel.html_url
-        $status = if ((Compare-Version $latest $current) -gt 0) { 'update_available' } else { 'latest' }
+function Test-EnvGuardReleaseUrl([string]$url, [string]$repo = $ENVGUARD_REPO) {
+    if (-not (Test-GitHubDownloadUrl $url)) { return $false }
+    try { $u = [Uri]$url } catch { return $false }
+    if ($u.Host.ToLowerInvariant() -eq 'github.com') {
+        $prefix = "/$repo/releases/download/".ToLowerInvariant()
+        return $u.AbsolutePath.ToLowerInvariant().StartsWith($prefix)
+    }
+    return $true
+}
 
-        if ($status -eq 'update_available' -and (-not (Test-GitHubDownloadUrl $zipUrl) -or -not (Test-GitHubDownloadUrl $sumsUrl))) {
-            return @{ status = 'error'; current = $current; latest = $latest; zip = ''; sums = ''; page = ''; message = '更新资产缺失或下载地址不是 GitHub 官方域名' }
+function Get-LocalBuildMeta {
+    $ver = Get-AppVersion
+    $sha = 'unknown'
+    $unix = [int64]0
+    if ($env:ENVGUARD_APP_COMMIT -match '^[0-9a-fA-F]{40}$') {
+        $sha = $env:ENVGUARD_APP_COMMIT.ToLowerInvariant()
+    }
+    if ($env:ENVGUARD_APP_COMMIT_UNIX -match '^\d+$') {
+        $unix = [int64]$env:ENVGUARD_APP_COMMIT_UNIX
+    }
+    $metaFile = Join-Path $BASE 'build-info.json'
+    if (($sha -eq 'unknown' -or $unix -le 0) -and (Test-Path -LiteralPath $metaFile -PathType Leaf)) {
+        try {
+            $m = [IO.File]::ReadAllText($metaFile, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
+            if ($sha -eq 'unknown' -and $m.commit -match '^[0-9a-fA-F]{40}$') { $sha = ([string]$m.commit).ToLowerInvariant() }
+            if ($unix -le 0 -and $null -ne $m.commit_unix) { $unix = [int64]$m.commit_unix }
+            if ($ver -eq 'unknown' -and $m.version) { $ver = [string]$m.version }
+        } catch {}
+    }
+    $shortSha = if ($sha -ne 'unknown' -and $sha.Length -ge 7) { $sha.Substring(0, 7) } else { 'unknown' }
+    return @{
+        version     = $ver
+        commit      = $sha
+        short_commit = $shortSha
+        commit_unix = $unix
+    }
+}
+
+function Invoke-Utf8WebText([string]$Uri, [int]$TimeoutSec = 10) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $resp = Invoke-WebRequest -Uri $Uri -UserAgent 'ClaudeEnvGuard/2.0' -Headers @{ 'Cache-Control' = 'no-cache' } -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    if ($resp.RawContentStream) {
+        $bytes = $resp.RawContentStream.ToArray()
+        # Strip optional UTF-8 BOM if present
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
         }
-        return @{ status = $status; current = $current; latest = $latest; zip = $zipUrl; sums = $sumsUrl; page = $pageUrl; message = '' }
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+    return [string]$resp.Content
+}
+
+function Get-EnvGuardRemoteManifest {
+    $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $manifestUrl = "https://github.com/$ENVGUARD_REPO/releases/download/latest/BUILD_INFO.json?t=$stamp"
+    $rawJson = Invoke-Utf8WebText $manifestUrl 10
+    return ($rawJson | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Get-EnvGuardMainAtomHead {
+    try {
+        $atomXml = Invoke-Utf8WebText "https://github.com/$ENVGUARD_REPO/commits/main.atom" 6
+        $entry = @(([xml]$atomXml).feed.entry) | Select-Object -First 1
+        if (-not $entry) { return $null }
+        $sha = (([string]$entry.id) -replace '^.*/', '').Trim().ToLowerInvariant()
+        if ($sha -notmatch '^[0-9a-f]{40}$') { return $null }
+        $title = $entry.title
+        if ($title -isnot [string]) { $title = [string]$title.'#text' }
+        return @{
+            commit = $sha
+            short_commit = $sha.Substring(0, 7)
+            title = ([string]$title).Trim()
+        }
     } catch {
-        $msg = ([string]$_.Exception.Message) -replace '\r?\n', ' '
-        if ($msg -match 'rate limit|API rate|403') { $msg = 'GitHub 接口限流，请稍后再试' }
-        return @{ status = 'error'; current = $current; latest = ''; zip = ''; sums = ''; page = ''; message = $msg }
+        return $null
+    }
+}
+
+function Compare-EnvGuardBuild($localMeta, $remoteManifest, $atomHead = $null) {
+    $rVer = (([string]$remoteManifest.version).Trim() -replace '^[vV]', '')
+    $rSha = (([string]$remoteManifest.commit).Trim()).ToLowerInvariant()
+    if (-not $rVer -or $rSha -notmatch '^[0-9a-f]{40}$') {
+        throw '远端 BUILD_INFO.json 缺少有效的版本号或提交哈希'
+    }
+    $rShort = if ($remoteManifest.short_commit) { [string]$remoteManifest.short_commit } else { $rSha.Substring(0, 7) }
+    $rUnix = if ($null -ne $remoteManifest.commit_unix) { [int64]$remoteManifest.commit_unix } else { [int64]0 }
+    $builtAt = if ($remoteManifest.built_at) { [string]$remoteManifest.built_at } else { '' }
+    $notes = if ($remoteManifest.notes) { ([string]$remoteManifest.notes).Trim() } else { '' }
+
+    $zipName = if ($remoteManifest.zip_name) { [string]$remoteManifest.zip_name } else { 'claude-envguard-windows-x64.zip' }
+    $sumsName = if ($remoteManifest.sums_name) { [string]$remoteManifest.sums_name } else { 'SHA256SUMS-release.txt' }
+    $zipUrl = if ($remoteManifest.zip_url) { [string]$remoteManifest.zip_url } else { "https://github.com/$ENVGUARD_REPO/releases/download/latest/$zipName" }
+    $sumsUrl = if ($remoteManifest.sums_url) { [string]$remoteManifest.sums_url } else { "https://github.com/$ENVGUARD_REPO/releases/download/latest/$sumsName" }
+    $pageUrl = "https://github.com/$ENVGUARD_REPO/releases/tag/latest"
+
+    if (-not (Test-EnvGuardReleaseUrl $zipUrl) -or -not (Test-EnvGuardReleaseUrl $sumsUrl)) {
+        throw '远端更新包地址未通过 GitHub 官方仓库域名校验'
+    }
+
+    $verCmp = Compare-Version $rVer $localMeta.version
+    $status = 'up_to_date'
+    if ($localMeta.commit -ne 'unknown' -and $rSha -eq $localMeta.commit) {
+        $status = 'up_to_date'
+    } elseif ($verCmp -gt 0) {
+        $status = 'update_available'
+    } elseif ($verCmp -lt 0) {
+        $status = 'ahead'
+    } else {
+        if ($localMeta.commit -eq 'unknown') {
+            $status = 'up_to_date'
+        } elseif ($localMeta.commit_unix -gt 0 -and $rUnix -gt 0 -and $localMeta.commit_unix -gt $rUnix) {
+            $status = 'ahead'
+        } else {
+            $status = 'update_available'
+        }
+    }
+
+    $ciBuilding = $false
+    $ciHeadShort = ''
+    $ciHeadTitle = ''
+    if ($atomHead -and $atomHead.commit -and $atomHead.commit -ne $rSha) {
+        $ciBuilding = $true
+        $ciHeadShort = [string]$atomHead.short_commit
+        $ciHeadTitle = [string]$atomHead.title
+    }
+
+    $msg = switch ($status) {
+        'update_available' {
+            "发现 GitHub 新版本 v$rVer ($rShort)，可一键校验并热更新重启"
+        }
+        'ahead' {
+            if ($ciBuilding -and $atomHead.commit -eq $localMeta.commit) {
+                "当前已是最新提交 ($($localMeta.short_commit))，云端 Release ($rShort) 正在由 GitHub Actions 编译同步中"
+            } else {
+                "当前本地版本 v$($localMeta.version) ($($localMeta.short_commit)) 新于云端构建 v$rVer ($rShort)"
+            }
+        }
+        default {
+            if ($ciBuilding) {
+                "当前运行 v$($localMeta.version) ($($localMeta.short_commit))；检测到 main 新提交 $ciHeadShort 正在云端打包，稍后可拉取"
+            } else {
+                "当前已是 GitHub 最新版本 v$($localMeta.version) ($($localMeta.short_commit))"
+            }
+        }
+    }
+
+    return [ordered]@{
+        status           = $status
+        repo             = $ENVGUARD_REPO
+        current_version  = $localMeta.version
+        current_commit   = $localMeta.short_commit
+        latest_version   = $rVer
+        latest_commit    = $rShort
+        latest_full_sha  = $rSha
+        built_at         = $builtAt
+        notes            = $notes
+        ci_building      = $ciBuilding
+        ci_head_commit   = $ciHeadShort
+        ci_head_title    = $ciHeadTitle
+        zip_url          = $zipUrl
+        sums_url         = $sumsUrl
+        page_url         = $pageUrl
+        message          = $msg
+    }
+}
+
+function Get-EnvGuardUpdateState {
+    $localMeta = Get-LocalBuildMeta
+    $atomHead = Get-EnvGuardMainAtomHead
+    try {
+        $manifest = Get-EnvGuardRemoteManifest
+        return (Compare-EnvGuardBuild $localMeta $manifest $atomHead)
+    } catch {
+        $rawErr = ([string]$_.Exception.Message) -replace '\r?\n', ' '
+        if ($rawErr -match '404' -and $atomHead) {
+            return [ordered]@{
+                status          = 'building'
+                repo            = $ENVGUARD_REPO
+                current_version = $localMeta.version
+                current_commit  = $localMeta.short_commit
+                latest_version  = $localMeta.version
+                latest_commit   = $atomHead.short_commit
+                latest_full_sha = $atomHead.commit
+                built_at        = ''
+                notes           = $atomHead.title
+                ci_building     = $true
+                ci_head_commit  = $atomHead.short_commit
+                ci_head_title   = $atomHead.title
+                zip_url         = ''
+                sums_url        = ''
+                page_url        = "https://github.com/$ENVGUARD_REPO/actions"
+                message         = "仓库最新提交 ($($atomHead.short_commit)) 正在由 GitHub Actions 首次打包发布，请约 1~2 分钟后再试"
+            }
+        }
+        return [ordered]@{
+            status          = 'error'
+            repo            = $ENVGUARD_REPO
+            current_version = $localMeta.version
+            current_commit  = $localMeta.short_commit
+            latest_version  = ''
+            latest_commit   = ''
+            latest_full_sha = ''
+            built_at        = ''
+            notes           = ''
+            ci_building     = $false
+            ci_head_commit  = ''
+            ci_head_title   = ''
+            zip_url         = ''
+            sums_url        = ''
+            page_url        = "https://github.com/$ENVGUARD_REPO/releases"
+            message         = "检查 GitHub 更新失败: $rawErr"
+        }
+    }
+}
+
+function Invoke-CheckAppUpdate {
+    $st = Get-EnvGuardUpdateState
+    if ($st.status -eq 'error') { $script:exitCode = 1 }
+    ([pscustomobject]$st) | ConvertTo-Json -Depth 4 -Compress
+}
+
+function Write-Utf8BomLf([string]$Path, [string]$Text) {
+    $normalized = ($Text -replace "`r`n", "`n") -replace "`r", "`n"
+    [System.IO.File]::WriteAllText($Path, $normalized, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function Invoke-StageAppUpdate([string]$TargetAppDir) {
+    if ([string]::IsNullOrWhiteSpace($TargetAppDir) -or -not (Test-Path -LiteralPath $TargetAppDir -PathType Container)) {
+        $script:exitCode = 1
+        'FAIL:未提供有效的应用安装目录'
+        return
+    }
+    $appDirFull = [System.IO.Path]::GetFullPath($TargetAppDir)
+
+    # 先验证目标目录可写性（如安装在受保护目录则提前报错，绝不半途改乱脚本）
+    $writeProbe = Join-Path $appDirFull ('.envguard-write-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [System.IO.File]::WriteAllText($writeProbe, 'ok', [System.Text.Encoding]::ASCII)
+        Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
+    } catch {
+        $script:exitCode = 1
+        "FAIL:当前应用目录无写入权限($appDirFull)，请下载安装包覆盖升级或移至用户目录运行"
+        return
+    }
+
+    $state = Get-EnvGuardUpdateState
+    if ($state.status -ne 'update_available') {
+        if ($state.status -eq 'error') {
+            $script:exitCode = 1
+            "FAIL:$($state.message)"
+        } else {
+            "OK:$($state.message)"
+        }
+        return
+    }
+
+    $tmp = Join-Path $env:TEMP ('envguard-hotupdate-' + [guid]::NewGuid().ToString('N'))
+    $stagedExe = Join-Path $appDirFull 'claude-envguard.exe.new'
+    $appResDir = Join-Path $appDirFull 'resources'
+    $backupDir = Join-Path $BASE ('backup-update-' + (Get-Date -Format 'yyyyMMddHHmmss'))
+    $backedBase = @{}
+    $backedAppRes = @{}
+    $task = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+
+    try {
+        New-Item -ItemType Directory -Force -Path $tmp -ErrorAction Stop | Out-Null
+
+        $zipUrl = [string]$state.zip_url
+        $sumsUrl = [string]$state.sums_url
+        if (-not (Test-EnvGuardReleaseUrl $zipUrl) -or -not (Test-EnvGuardReleaseUrl $sumsUrl)) {
+            throw '更新资产地址不是受信任的 GitHub Release 域名'
+        }
+
+        $zipName = [System.IO.Path]::GetFileName(([Uri]$zipUrl).AbsolutePath)
+        if ([string]::IsNullOrWhiteSpace($zipName)) { $zipName = 'claude-envguard-windows-x64.zip' }
+        $zipPath = Join-Path $tmp $zipName
+        $sumsPath = Join-Path $tmp 'SHA256SUMS-release.txt'
+
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $zipUrl -UserAgent 'ClaudeEnvGuard/2.0' -OutFile $zipPath -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        Invoke-WebRequest -Uri $sumsUrl -UserAgent 'ClaudeEnvGuard/2.0' -OutFile $sumsPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+
+        $expectedHash = $null
+        foreach ($line in Get-Content -LiteralPath $sumsPath -Encoding UTF8 -ErrorAction Stop) {
+            if ($line -match '^([0-9A-Fa-f]{64})\s+\*?(.+?)\s*$') {
+                $entryFile = [System.IO.Path]::GetFileName($Matches[2].Trim())
+                if ($entryFile -ieq $zipName) {
+                    $expectedHash = $Matches[1].ToUpperInvariant()
+                    break
+                }
+            }
+        }
+        if (-not $expectedHash) { throw "SHA256SUMS-release.txt 中未找到 $zipName 的校验条目" }
+        $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        if ($actualHash -ne $expectedHash) { throw '更新包 SHA-256 哈希校验不匹配，已拒绝安装' }
+
+        $extract = Join-Path $tmp 'extract'
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extract -Force -ErrorAction Stop
+
+        $newExe = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-envguard.exe' -File -ErrorAction Stop | Select-Object -First 1
+        $newCore = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-switch.ps1' -File -ErrorAction Stop | Select-Object -First 1
+        $newGuard = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-bodyguard.ps1' -File -ErrorAction Stop | Select-Object -First 1
+        if (-not $newExe -or $newExe.Length -lt 524288) { throw '更新包缺少有效的 claude-envguard.exe' }
+        if (-not $newCore -or -not $newGuard) { throw '更新包缺少核心安全脚本 claude-switch.ps1 或 claude-bodyguard.ps1' }
+
+        $peHeader = New-Object byte[] 2
+        $fs = [System.IO.File]::OpenRead($newExe.FullName)
+        try { [void]$fs.Read($peHeader, 0, 2) } finally { $fs.Dispose() }
+        if ($peHeader[0] -ne 0x4D -or $peHeader[1] -ne 0x5A) { throw 'claude-envguard.exe PE 签名头无效' }
+
+        # 读取新版核心脚本并准备保留用户锁定配置的版本
+        $rawNewCoreText = [System.IO.File]::ReadAllText($newCore.FullName, [System.Text.Encoding]::UTF8)
+        $rawNewGuardText = [System.IO.File]::ReadAllText($newGuard.FullName, [System.Text.Encoding]::UTF8)
+        $mergedBaseCoreText = $rawNewCoreText
+        $baseCorePath = Join-Path $BASE 'claude-switch.ps1'
+        if (Test-Path -LiteralPath $baseCorePath -PathType Leaf) {
+            $oldBaseText = [System.IO.File]::ReadAllText($baseCorePath, [System.Text.Encoding]::UTF8)
+            foreach ($cfgName in @('PROXY_MODE', 'COUNTRY_TARGET', 'TZ_TARGET', 'LOCALE_TARGET', 'PROXY_GROUP')) {
+                $val = Get-ScriptConfigValue $oldBaseText $cfgName
+                if ($null -ne $val) { $mergedBaseCoreText = Set-ScriptConfigValue $mergedBaseCoreText $cfgName ([string]$val) }
+            }
+        }
+
+        New-Item -ItemType Directory -Force -Path $backupDir -ErrorAction Stop | Out-Null
+        foreach ($fn in @('claude-switch.ps1', 'claude-bodyguard.ps1', 'version.txt', 'build-info.json')) {
+            $p = Join-Path $BASE $fn
+            if (Test-Path -LiteralPath $p -PathType Leaf) {
+                Copy-Item -LiteralPath $p -Destination (Join-Path $backupDir "base-$fn") -Force -ErrorAction Stop
+                $backedBase[$fn] = $true
+            } else {
+                $backedBase[$fn] = $false
+            }
+        }
+        foreach ($fn in @('claude-switch.ps1', 'claude-bodyguard.ps1')) {
+            $rp = Join-Path $appResDir $fn
+            if (Test-Path -LiteralPath $rp -PathType Leaf) {
+                Copy-Item -LiteralPath $rp -Destination (Join-Path $backupDir "res-$fn") -Force -ErrorAction Stop
+                $backedAppRes[$fn] = $true
+            } else {
+                $backedAppRes[$fn] = $false
+            }
+        }
+
+        if ($task) { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue }
+
+        # 1) 暂存新版可执行文件 claude-envguard.exe.new 供 Rust 宿主原子替换
+        Copy-Item -LiteralPath $newExe.FullName -Destination $stagedExe -Force -ErrorAction Stop
+
+        # 2) 更新应用旁随包 resources 目录下的脚本（严格保持 UTF-8 with BOM + LF）
+        New-Item -ItemType Directory -Force -Path $appResDir -ErrorAction Stop | Out-Null
+        Write-Utf8BomLf (Join-Path $appResDir 'claude-switch.ps1') $rawNewCoreText
+        Write-Utf8BomLf (Join-Path $appResDir 'claude-bodyguard.ps1') $rawNewGuardText
+
+        # 3) 若用户目录已安装脚本/保镖，同步升级并保留 5 项头部配置
+        if ((Test-Path -LiteralPath $baseCorePath -PathType Leaf) -or $task) {
+            Write-Utf8BomLf $baseCorePath $mergedBaseCoreText
+            Write-Utf8BomLf (Join-Path $BASE 'claude-bodyguard.ps1') $rawNewGuardText
+        }
+
+        [System.IO.File]::WriteAllText((Join-Path $BASE 'version.txt'), [string]$state.latest_version, (New-Object System.Text.UTF8Encoding($false)))
+        $buildMetaJson = ([ordered]@{
+            version      = [string]$state.latest_version
+            commit       = [string]$state.latest_full_sha
+            short_commit = [string]$state.latest_commit
+            built_at     = [string]$state.built_at
+        } | ConvertTo-Json -Compress)
+        [System.IO.File]::WriteAllText((Join-Path $BASE 'build-info.json'), $buildMetaJson, (New-Object System.Text.UTF8Encoding($false)))
+
+        if ($task) { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop }
+
+        "OK:已通过 SHA-256 校验并准备就绪 v$($state.latest_version) ($($state.latest_commit))，正在热替换重启"
+    } catch {
+        $errReason = ([string]$_.Exception.Message) -replace '\r?\n', ' '
+        Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $backupDir) {
+            foreach ($fn in @('claude-switch.ps1', 'claude-bodyguard.ps1', 'version.txt', 'build-info.json')) {
+                $dst = Join-Path $BASE $fn
+                $bak = Join-Path $backupDir "base-$fn"
+                if ($backedBase[$fn] -and (Test-Path -LiteralPath $bak)) {
+                    Copy-Item -LiteralPath $bak -Destination $dst -Force -ErrorAction SilentlyContinue
+                } elseif ($backedBase.ContainsKey($fn) -and -not $backedBase[$fn]) {
+                    Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+                }
+            }
+            foreach ($fn in @('claude-switch.ps1', 'claude-bodyguard.ps1')) {
+                $dst = Join-Path $appResDir $fn
+                $bak = Join-Path $backupDir "res-$fn"
+                if ($backedAppRes[$fn] -and (Test-Path -LiteralPath $bak)) {
+                    Copy-Item -LiteralPath $bak -Destination $dst -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        if ($task) {
+            try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
+        }
+        $script:exitCode = 1
+        "FAIL:热更新失败(已安全回滚): $errReason"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ReleaseInfo {
+    $st = Get-EnvGuardUpdateState
+    if ($st.status -eq 'update_available') {
+        return @{ status = 'update_available'; current = $st.current_version; latest = "$($st.latest_version) ($($st.latest_commit))"; zip = $st.zip_url; sums = $st.sums_url; page = $st.page_url; message = $st.message }
+    } elseif ($st.status -eq 'up_to_date' -or $st.status -eq 'ahead' -or $st.status -eq 'building') {
+        return @{ status = 'latest'; current = $st.current_version; latest = "$($st.current_version) ($($st.current_commit))"; zip = ''; sums = ''; page = $st.page_url; message = $st.message }
+    } else {
+        return @{ status = 'error'; current = $st.current_version; latest = ''; zip = ''; sums = ''; page = $st.page_url; message = $st.message }
     }
 }
 
@@ -3738,6 +4127,8 @@ try {
             Invoke-ProxyDiagnostics $diagnosticArgs
         }
         'check-update' { Invoke-CheckUpdate }
+        'check-app-update' { Invoke-CheckAppUpdate }
+        'stage-app-update' { Invoke-StageAppUpdate $args[1] }
         'update-now'   { Invoke-UpdateNow }
         'rules-status' { Invoke-RulesStatus }
         'launch' {

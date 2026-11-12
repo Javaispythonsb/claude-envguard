@@ -3,14 +3,24 @@ name: windows
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   test-and-build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: PowerShell 集成测试（Windows PowerShell 5.1）
         shell: powershell
@@ -30,7 +40,7 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile
 
-      - name: 手机自检单测
+      - name: 前端与 HIG 视图模型单测
         working-directory: desktop
         run: pnpm test
 
@@ -40,13 +50,64 @@ jobs:
         with:
           workspaces: desktop/src-tauri
 
-      - name: Rust 命令桥单测
+      - name: Rust 命令桥与几何引擎单测
         working-directory: desktop/src-tauri
         run: cargo test
 
       - name: 打包桌面端（exe + NSIS + MSI）
         working-directory: desktop
         run: pnpm tauri build
+
+      - name: 组装热更新固件包与 SHA-256 校验清单
+        if: github.event_name != 'pull_request'
+        shell: powershell
+        env:
+          GH_REPO_SLUG: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = (Get-Content -LiteralPath 'VERSION' -Raw -Encoding UTF8).Trim()
+          $sha = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $shortSha = $sha.Substring(0, 7)
+          $commitUnix = [int64](git show -s --format=%ct HEAD).Trim()
+          $subject = (git show -s --format=%s HEAD).Trim()
+          $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          $outDir = 'release-assets'
+          $stageDir = 'release-stage'
+          New-Item -ItemType Directory -Force -Path $outDir, "$stageDir\resources" | Out-Null
+
+          Copy-Item -LiteralPath 'desktop\src-tauri\target\release\claude-envguard.exe' -Destination "$stageDir\claude-envguard.exe" -Force
+          Copy-Item -LiteralPath 'windows\claude-switch.ps1' -Destination "$stageDir\resources\claude-switch.ps1" -Force
+          Copy-Item -LiteralPath 'windows\claude-bodyguard.ps1' -Destination "$stageDir\resources\claude-bodyguard.ps1" -Force
+          Copy-Item -LiteralPath 'VERSION' -Destination "$stageDir\VERSION" -Force
+
+          $manifestObj = [ordered]@{
+            repo         = $env:GH_REPO_SLUG
+            version      = $ver
+            commit       = $sha
+            short_commit = $shortSha
+            commit_unix  = $commitUnix
+            built_at     = $builtAt
+            notes        = $subject
+            zip_name     = 'claude-envguard-windows-x64.zip'
+            sums_name    = 'SHA256SUMS-release.txt'
+          }
+          $manifestJson = $manifestObj | ConvertTo-Json -Depth 4
+          [System.IO.File]::WriteAllText((Join-Path $stageDir 'BUILD_INFO.json'), $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
+          [System.IO.File]::WriteAllText((Join-Path $outDir 'BUILD_INFO.json'), $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
+
+          $zipPath = Join-Path $outDir 'claude-envguard-windows-x64.zip'
+          Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
+
+          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\nsis\*-setup.exe' | Copy-Item -Destination $outDir -Force
+          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\msi\*.msi' | Copy-Item -Destination $outDir -Force
+
+          $sumLines = @()
+          foreach ($f in Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne 'SHA256SUMS-release.txt' } | Sort-Object Name) {
+            $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sumLines += "$h  $($f.Name)"
+          }
+          [System.IO.File]::WriteAllText((Join-Path $outDir 'SHA256SUMS-release.txt'), (($sumLines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 
       - uses: actions/upload-artifact@v4
         with:
@@ -56,3 +117,55 @@ jobs:
             desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
             desktop/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
+
+      - name: 自动发布 GitHub 热更新 Release
+        if: github.event_name != 'pull_request'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REF: ${{ github.ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $info = Get-Content -LiteralPath 'release-assets\BUILD_INFO.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+          $notesFile = 'release-notes.md'
+          $notes = @(
+            "### Claude 环境卫士 · EnvGuard v$($info.version) ($($info.short_commit))",
+            "",
+            "- **构建提交**: ``$($info.commit)``",
+            "- **提交说明**: $($info.notes)",
+            "- **构建时间**: ``$($info.built_at)``",
+            "",
+            "已安装用户可直接在桌面悬浮窗 **「工具 → 检查更新 → 立即热更新」** 一键完成 SHA-256 校验与无缝热替换重启。"
+          ) -join "`n"
+          [System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
+
+          $assets = @(Get-ChildItem -LiteralPath 'release-assets' -File | ForEach-Object { $_.FullName })
+
+          if ($env:GH_REF -eq 'refs/heads/main' -or $env:GH_EVENT_NAME -eq 'workflow_dispatch') {
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -f latest $env:GH_SHA
+            git push origin refs/tags/latest --force
+
+            gh release view latest 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create latest @assets --title "Claude 环境卫士 · Latest ($($info.short_commit))" --notes-file $notesFile
+            } else {
+              gh release upload latest @assets --clobber
+              gh release edit latest --title "Claude 环境卫士 · Latest ($($info.short_commit))" --notes-file $notesFile
+            }
+          }
+
+          if ($env:GH_REF.StartsWith('refs/tags/v')) {
+            $tagName = $env:GH_REF_NAME
+            gh release view $tagName 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              gh release create $tagName @assets --title "Claude 环境卫士 $tagName" --notes-file $notesFile
+            } else {
+              gh release upload $tagName @assets --clobber
+              gh release edit $tagName --title "Claude 环境卫士 $tagName" --notes-file $notesFile
+            }
+          }

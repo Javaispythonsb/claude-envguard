@@ -16,7 +16,8 @@ import {
   buildAnomalyCallouts,
   summarizeMatrixCounts,
   normalizeSafeUrl,
-  computePrimaryIslandAction
+  computePrimaryIslandAction,
+  formatUpdateCheckReport
 } from './hig-model.js';
 
 const EASE_OUT = 'cubic-bezier(0.23, 1, 0.32, 1)';
@@ -733,7 +734,7 @@ async function muteOptionalCheckImmediately(checkKey) {
 
 /* ================= BUSY & PRIMARY ACTION STATE ================= */
 function updateActionControlsForBusy(busy, label = '') {
-  for (const id of ['btnRecheck', 'btnShieldRestore', 'proxyPopupTrigger', 'btnSavePort', 'btnOpenSafe']) {
+  for (const id of ['btnRecheck', 'btnShieldRestore', 'proxyPopupTrigger', 'btnSavePort', 'btnOpenSafe', 'btnApplyHotUpdate']) {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
@@ -959,7 +960,11 @@ function renderCheckMatrix() {
 function applyUiState(data) {
   if (!data) return;
   const verEl = document.getElementById('appVersionTag');
-  if (verEl) verEl.textContent = data.version && data.version !== 'unknown' ? `EnvGuard v${data.version}` : 'EnvGuard v2.0';
+  if (verEl) {
+    const vStr = data.version && data.version !== 'unknown' ? `v${data.version}` : 'v2.0';
+    const shaStr = data.git_short_sha && data.git_short_sha !== 'unknown' ? ` · ${data.git_short_sha}` : '';
+    verEl.textContent = `EnvGuard ${vStr}${shaStr}`;
+  }
 
   if (data.proxy_mode) {
     syncProxyPopupDisplay(data.proxy_mode);
@@ -1108,8 +1113,10 @@ function closeToolDrawers() {
   activeToolId = null;
   const outBox = document.getElementById('toolOutputBox');
   const bBox = document.getElementById('inlineBrowserBox');
+  const hotBtn = document.getElementById('btnApplyHotUpdate');
   if (outBox) outBox.hidden = true;
   if (bBox) bBox.hidden = true;
+  if (hotBtn) hotBtn.hidden = true;
   document.querySelectorAll('.tool-tile').forEach((p) => p.classList.remove('active'));
   requestAnimationFrame(syncPodHeight);
 }
@@ -1569,6 +1576,8 @@ function wireDesktopEvents() {
       tile.classList.add('active');
 
       document.getElementById('inlineBrowserBox').hidden = true;
+      const hotBtn = document.getElementById('btnApplyHotUpdate');
+      if (hotBtn) hotBtn.hidden = true;
       const outBox = document.getElementById('toolOutputBox');
       const outTitle = document.getElementById('toolOutputTitle');
       const outPre = document.getElementById('consoleOut');
@@ -1588,6 +1597,90 @@ function wireDesktopEvents() {
       }
     };
   });
+
+  // GitHub Check Update & One-Click Hot Update
+  const checkUpdateTile = document.getElementById('btnCheckAppUpdate');
+  const hotUpdateBtn = document.getElementById('btnApplyHotUpdate');
+  if (checkUpdateTile) {
+    checkUpdateTile.onclick = async () => {
+      if (isBusy) return;
+      if (activeToolId === 'check-app-update' && !document.getElementById('toolOutputBox')?.hidden) {
+        closeToolDrawers();
+        return;
+      }
+      activeToolId = 'check-app-update';
+      document.querySelectorAll('.tool-tile').forEach((p) => p.classList.remove('active'));
+      checkUpdateTile.classList.add('active');
+
+      document.getElementById('inlineBrowserBox').hidden = true;
+      if (hotUpdateBtn) {
+        hotUpdateBtn.hidden = true;
+        hotUpdateBtn.textContent = '立即热更新';
+      }
+      const outBox = document.getElementById('toolOutputBox');
+      const outTitle = document.getElementById('toolOutputTitle');
+      const outPre = document.getElementById('consoleOut');
+      if (outTitle) outTitle.textContent = '检查更新';
+      outBox.hidden = false;
+      outPre.textContent = '正在连接 GitHub 检查最新版本…';
+      requestAnimationFrame(syncPodHeight);
+
+      setBusyState(true, '检查更新…');
+      setSubStatus('正在从 GitHub 获取最新构建信息…', false);
+      try {
+        const info = await invoke('check_app_update');
+        const report = formatUpdateCheckReport(info);
+        if (outTitle) outTitle.textContent = report.title;
+        outPre.textContent = report.body;
+        if (hotUpdateBtn) {
+          hotUpdateBtn.hidden = !report.canHotUpdate;
+          hotUpdateBtn.disabled = false;
+        }
+        setSubStatus(report.summary, info?.status === 'error', report.canHotUpdate ? 0 : 3500);
+      } catch (err) {
+        if (outTitle) outTitle.textContent = '检查更新 · 失败';
+        outPre.textContent = `检查更新失败: ${err}`;
+        setSubStatus(`检查更新失败: ${err}`, true, 3500);
+      } finally {
+        setBusyState(false);
+        requestAnimationFrame(syncPodHeight);
+      }
+    };
+  }
+
+  if (hotUpdateBtn) {
+    hotUpdateBtn.onclick = async () => {
+      if (isBusy) return;
+      const outTitle = document.getElementById('toolOutputTitle');
+      const outPre = document.getElementById('consoleOut');
+      hotUpdateBtn.textContent = '拉取校验中…';
+      if (outTitle) outTitle.textContent = '正在热更新…';
+      if (outPre) {
+        outPre.textContent = '正在从 GitHub Release 下载最新固件包并核验 SHA-256 签名，请勿关闭窗口…';
+      }
+      hasFocusWithin = true;
+      syncDockHold();
+      requestAnimationFrame(syncPodHeight);
+
+      const res = await handleAction('热更新', () => invoke('apply_app_update'), false);
+      if (res?.exit_code === 0) {
+        hotUpdateBtn.hidden = true;
+        if (outTitle) outTitle.textContent = '热更新完成 · 正在重启';
+        if (outPre) {
+          outPre.textContent = `${maskDisplayIp(res.output || '更新校验完成')}\n窗口将在 1 秒内自动重启至最新版本…`;
+        }
+      } else {
+        hasFocusWithin = false;
+        syncDockHold();
+        hotUpdateBtn.textContent = '重试热更新';
+        if (outTitle) outTitle.textContent = '热更新未完成';
+        if (outPre && res) {
+          outPre.textContent = maskDisplayIp(res.output || '热更新失败');
+        }
+      }
+      requestAnimationFrame(syncPodHeight);
+    };
+  }
 
   document.getElementById('btnInlineBrowserCheck').onclick = () => {
     if (activeToolId === 'inline-browser' && !document.getElementById('inlineBrowserBox')?.hidden) {
