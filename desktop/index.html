@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-runtime="web" data-dock="top" data-tucked="false" data-seam="false" data-idle="false" data-preview="none">
+<html lang="zh-CN" data-runtime="web" data-dock="top" data-standby="edge" data-orb="false" data-tucked="false" data-seam="false" data-idle="false" data-preview="none">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -20,6 +20,13 @@
     <!-- 贴边隐藏态：灵动微光边缘感应条 -->
     <div class="edge-handle" id="edgeHandle" aria-hidden="true">
       <i class="edge-bar" id="edgeStatusBar"></i>
+    </div>
+
+    <!-- 呼吸盾圆球待机态（设置中选择「盾牌圆球」时启用：支持按住拖拽、点击展开） -->
+    <div class="shield-orb" id="shieldOrb" title="点击展开 · 按住可拖动">
+      <svg class="orb-shield" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      </svg>
     </div>
 
     <div class="pod obsidian" id="podCard" data-tauri-drag-region="deep">
@@ -101,6 +108,14 @@
             <div class="port-inline" id="flclashPortWrap" hidden>
               <input class="pod-input port-in" id="flclashPortInput" aria-label="FlClash 端口" placeholder="端口 auto">
               <button type="button" class="pod-mini" id="btnSavePort">存</button>
+            </div>
+          </div>
+
+          <div class="standby-switch" role="group" aria-label="待机形态">
+            <span class="st-label">待机</span>
+            <div class="seg-mini">
+              <button type="button" class="seg-btn on" data-standby-pick="edge">贴边光条</button>
+              <button type="button" class="seg-btn" data-standby-pick="orb">盾牌圆球</button>
             </div>
           </div>
 

@@ -76,6 +76,10 @@ input:focus-visible {
   width: 540px;
   background: transparent;
 }
+:root[data-orb="true"] .pod-stage {
+  width: 72px;
+  height: 72px;
+}
 
 /* Magnetic Snap Guide Line during live drag */
 .snap-guide {
@@ -192,6 +196,68 @@ input:focus-visible {
 :root[data-dock="right"] .edge-bar {
   width: 3.5px;
   height: 36px;
+}
+
+/* ================= SHIELD ORB STANDBY (Glowing Circular Shield Floating Ball) ================= */
+.shield-orb {
+  display: none;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(48, 209, 88, 0.24), rgba(8, 22, 13, 0.94) 68%, #060908 100%);
+  box-shadow:
+    inset 0 0 0 1.5px rgba(48, 209, 88, 0.56),
+    inset 0 0 18px rgba(48, 209, 88, 0.16);
+  color: var(--green);
+  place-items: center;
+  cursor: pointer;
+  transition: transform 160ms var(--ease-out), box-shadow 200ms var(--ease-out), color 200ms var(--ease-out);
+}
+.shield-orb:hover {
+  box-shadow:
+    inset 0 0 0 1.8px rgba(48, 209, 88, 0.85),
+    inset 0 0 24px rgba(48, 209, 88, 0.26);
+}
+.shield-orb:active {
+  transform: scale(0.95);
+}
+.shield-orb.auditing {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(255, 214, 10, 0.24), rgba(22, 19, 8, 0.94) 68%, #090806 100%);
+  box-shadow:
+    inset 0 0 0 1.5px rgba(255, 214, 10, 0.58),
+    inset 0 0 18px rgba(255, 214, 10, 0.16);
+  color: var(--amber);
+}
+.shield-orb.blocked {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(255, 69, 58, 0.28), rgba(24, 9, 9, 0.95) 68%, #0a0606 100%);
+  box-shadow:
+    inset 0 0 0 1.5px rgba(255, 69, 58, 0.65),
+    inset 0 0 20px rgba(255, 69, 58, 0.2);
+  color: var(--red);
+}
+
+.orb-shield {
+  width: 28px;
+  height: 28px;
+  stroke: currentColor;
+  stroke-width: 1.85;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  pointer-events: none;
+  filter: drop-shadow(0 0 6px currentColor);
+}
+
+:root[data-orb="true"] .shield-orb {
+  display: grid;
+}
+:root[data-orb="true"] .pod,
+:root[data-orb="true"] .edge-handle,
+:root[data-orb="true"] .snap-guide {
+  display: none !important;
 }
 
 /* ================= PURE OBSIDIAN CAPSULE (NO OUTER SHADOW BOX) ================= */
@@ -575,6 +641,45 @@ input:focus-visible {
 .port-inline[hidden] { display: none; }
 .port-in { width: 92px; padding: 5px 10px; }
 .set-btns { display: flex; align-items: center; gap: 6px; }
+
+.standby-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.standby-switch .st-label {
+  font-size: 11.5px;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.seg-mini {
+  display: inline-flex;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 999px;
+  padding: 2px;
+  gap: 2px;
+}
+.seg-btn {
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-2);
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), transform 140ms var(--ease-out);
+}
+.seg-btn:hover:not(.on) { color: var(--text-1); }
+.seg-btn:active { transform: scale(0.96); }
+.seg-btn.on {
+  background: #f5f5f7;
+  color: #050507;
+  font-weight: 600;
+}
 
 .opt-tiles {
   display: grid;

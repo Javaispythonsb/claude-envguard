@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow, WindowEvent,
+};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -62,17 +64,38 @@ impl WorkRect {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StandbyMode {
+    Edge,
+    Orb,
+}
+
+impl Default for StandbyMode {
+    fn default() -> Self {
+        StandbyMode::Edge
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SavedDock {
     x: i32,
     y: i32,
     edge: DockEdge,
+    #[serde(default)]
+    standby_mode: StandbyMode,
+    #[serde(default)]
+    orb_x: Option<i32>,
+    #[serde(default)]
+    orb_y: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct DockStatePayload {
     edge: DockEdge,
+    standby_mode: StandbyMode,
     tucked: bool,
+    orb: bool,
     seam: bool,
     idle: bool,
     pinned: bool,
@@ -81,10 +104,16 @@ struct DockStatePayload {
 
 struct DockInner {
     edge: DockEdge,
+    standby_mode: StandbyMode,
     dock_x: i32,
     dock_y: i32,
+    orb_x: Option<i32>,
+    orb_y: Option<i32>,
+    pod_w_phys: i32,
+    pod_h_phys: i32,
     work_area: WorkRect,
     tucked: bool,
+    orb_collapsed: bool,
     seam_mode: bool,
     idle: bool,
     pinned: bool,
@@ -106,8 +135,13 @@ impl DockInner {
         let now = Instant::now();
         Self {
             edge: DockEdge::Top,
+            standby_mode: StandbyMode::Edge,
             dock_x: 0,
             dock_y: 0,
+            orb_x: None,
+            orb_y: None,
+            pod_w_phys: 540,
+            pod_h_phys: 122,
             work_area: WorkRect {
                 x: 0,
                 y: 0,
@@ -115,6 +149,7 @@ impl DockInner {
                 h: 1080,
             },
             tucked: false,
+            orb_collapsed: false,
             seam_mode: false,
             idle: false,
             pinned: false,
@@ -135,11 +170,24 @@ impl DockInner {
     fn payload(&self) -> DockStatePayload {
         DockStatePayload {
             edge: self.edge,
+            standby_mode: self.standby_mode,
             tucked: self.tucked,
+            orb: self.orb_collapsed,
             seam: self.seam_mode,
             idle: self.idle,
             pinned: self.pinned,
             preview: self.preview,
+        }
+    }
+
+    fn to_saved(&self) -> SavedDock {
+        SavedDock {
+            x: self.dock_x,
+            y: self.dock_y,
+            edge: self.edge,
+            standby_mode: self.standby_mode,
+            orb_x: self.orb_x,
+            orb_y: self.orb_y,
         }
     }
 }
@@ -580,6 +628,123 @@ fn is_primary_mouse_down() -> bool {
 
 const PEEK_LOGICAL_PX: f64 = 10.0;
 const SNAP_THRESHOLD_LOGICAL_PX: f64 = 48.0;
+const POD_WIDTH_LOGICAL_PX: f64 = 540.0;
+const POD_BASE_HEIGHT_LOGICAL_PX: f64 = 122.0;
+const ORB_SIZE_LOGICAL_PX: f64 = 72.0;
+
+fn compute_visible_pod_pos(
+    dock_x: i32,
+    dock_y: i32,
+    ww: i32,
+    wh: i32,
+    area: WorkRect,
+    edge: DockEdge,
+    margin: i32,
+) -> (i32, i32) {
+    let min_x = area.x + margin;
+    let max_x = (area.right() - ww - margin).max(min_x);
+    let min_y = area.y + margin;
+    let max_y = (area.bottom() - wh - margin).max(min_y);
+
+    let x = match edge {
+        DockEdge::Left => area.x,
+        DockEdge::Right => area.right() - ww,
+        DockEdge::Top | DockEdge::None => dock_x.clamp(min_x, max_x),
+    };
+    let y = match edge {
+        DockEdge::Top => area.y,
+        DockEdge::Left | DockEdge::Right | DockEdge::None => dock_y.clamp(min_y, max_y),
+    };
+    (x, y)
+}
+
+fn compute_orb_pos_from_pod(
+    dock_x: i32,
+    dock_y: i32,
+    pod_w: i32,
+    pod_h: i32,
+    orb_size: i32,
+    area: WorkRect,
+    edge: DockEdge,
+    margin: i32,
+) -> (i32, i32) {
+    let min_x = area.x + margin;
+    let max_x = (area.right() - orb_size - margin).max(min_x);
+    let min_y = area.y + margin;
+    let max_y = (area.bottom() - orb_size - margin).max(min_y);
+
+    match edge {
+        DockEdge::Top => (
+            (dock_x + (pod_w - orb_size) / 2).clamp(min_x, max_x),
+            area.y + margin,
+        ),
+        DockEdge::Left => (
+            area.x + margin,
+            (dock_y + (pod_h - orb_size) / 2).clamp(min_y, max_y),
+        ),
+        DockEdge::Right => (
+            area.right() - orb_size - margin,
+            (dock_y + (pod_h - orb_size) / 2).clamp(min_y, max_y),
+        ),
+        DockEdge::None => (
+            (dock_x + (pod_w - orb_size) / 2).clamp(min_x, max_x),
+            (dock_y + (pod_h - orb_size) / 2).clamp(min_y, max_y),
+        ),
+    }
+}
+
+fn compute_pod_pos_from_orb(
+    orb_x: i32,
+    orb_y: i32,
+    orb_size: i32,
+    pod_w: i32,
+    pod_h: i32,
+    area: WorkRect,
+    margin: i32,
+) -> (i32, i32, DockEdge) {
+    let near = margin + (24).max(orb_size / 3);
+    let d_top = orb_y - area.y;
+    let d_left = orb_x - area.x;
+    let d_right = area.right() - (orb_x + orb_size);
+
+    let min_x = area.x + margin;
+    let max_x = (area.right() - pod_w - margin).max(min_x);
+    let min_y = area.y + margin;
+    let max_y = (area.bottom() - pod_h - margin).max(min_y);
+
+    let candidates = [
+        (d_top, DockEdge::Top),
+        (d_left, DockEdge::Left),
+        (d_right, DockEdge::Right),
+    ];
+    if let Some(&(min_d, edge)) = candidates.iter().min_by_key(|c| c.0) {
+        if min_d <= near {
+            return match edge {
+                DockEdge::Top => (
+                    (orb_x + orb_size / 2 - pod_w / 2).clamp(min_x, max_x),
+                    area.y,
+                    DockEdge::Top,
+                ),
+                DockEdge::Left => (
+                    area.x,
+                    (orb_y + orb_size / 2 - pod_h / 2).clamp(min_y, max_y),
+                    DockEdge::Left,
+                ),
+                DockEdge::Right => (
+                    area.right() - pod_w,
+                    (orb_y + orb_size / 2 - pod_h / 2).clamp(min_y, max_y),
+                    DockEdge::Right,
+                ),
+                DockEdge::None => unreachable!(),
+            };
+        }
+    }
+    (
+        (orb_x + orb_size / 2 - pod_w / 2).clamp(min_x, max_x),
+        (orb_y + orb_size / 2 - pod_h / 2).clamp(min_y, max_y),
+        DockEdge::None,
+    )
+}
 
 fn detect_snap_edge(wx: i32, wy: i32, ww: i32, _wh: i32, area: WorkRect, threshold: i32) -> DockEdge {
     let d_top = wy - area.y;
@@ -808,11 +973,9 @@ fn glide_window(
 }
 
 fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persist: bool) {
-    let size = window
-        .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(540, 128));
-    let ww = size.width as i32;
-    let wh = size.height as i32;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let pod_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
+    let pod_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
     let mon = window
         .primary_monitor()
         .ok()
@@ -826,18 +989,23 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
             w: wa.size.width as i32,
             h: wa.size.height as i32,
         };
-        let x = area.x + ((area.w - ww) / 2).max(0);
+        let x = area.x + ((area.w - pod_w) / 2).max(0);
         let y = area.y;
-        let seam = has_adjacent_monitor_beyond_edge(window, x, y, ww, wh, area, DockEdge::Top);
+        let seam = has_adjacent_monitor_beyond_edge(window, x, y, pod_w, pod_h, area, DockEdge::Top);
         let now = Instant::now();
-        let payload = {
+        let (payload, saved) = {
             let mut st = dock.lock().unwrap();
             st.edge = DockEdge::Top;
             st.dock_x = x;
             st.dock_y = y;
+            st.orb_x = None;
+            st.orb_y = None;
+            st.pod_w_phys = pod_w;
+            st.pod_h_phys = pod_h;
             st.work_area = area;
             st.seam_mode = seam;
             st.tucked = false;
+            st.orb_collapsed = false;
             st.idle = false;
             st.preview = DockEdge::None;
             st.pending_user_move = false;
@@ -845,16 +1013,14 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
             st.force_untuck = false;
             st.last_hover_at = now;
             st.grace_until = now + Duration::from_millis(2800);
-            st.payload()
+            st.ignore_moves_until = now + Duration::from_millis(320);
+            (st.payload(), st.to_saved())
         };
         let _ = window.set_ignore_cursor_events(false);
+        let _ = window.set_size(PhysicalSize::new(pod_w as u32, pod_h as u32));
         set_programmatic_pos(window, dock, x, y);
         if persist {
-            persist_saved_dock(&SavedDock {
-                x,
-                y,
-                edge: DockEdge::Top,
-            });
+            persist_saved_dock(&saved);
         }
         let _ = window.emit("dock-state", payload);
     }
@@ -862,12 +1028,9 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
 
 fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
     let _ = window.set_always_on_top(true);
-    let size = window
-        .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(540, 128));
-    let ww = size.width as i32;
-    let wh = size.height as i32;
     let scale = window.scale_factor().unwrap_or(1.0);
+    let ww = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
+    let wh = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
     let margin = (8.0 * scale).round() as i32;
 
     if let Some(saved) = load_saved_dock() {
@@ -889,11 +1052,17 @@ fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
                 {
                     let mut st = dock.lock().unwrap();
                     st.edge = saved.edge;
+                    st.standby_mode = saved.standby_mode;
                     st.dock_x = x;
                     st.dock_y = y;
+                    st.orb_x = saved.orb_x;
+                    st.orb_y = saved.orb_y;
+                    st.pod_w_phys = ww;
+                    st.pod_h_phys = wh;
                     st.work_area = area;
                     st.seam_mode = seam;
                     st.tucked = false;
+                    st.orb_collapsed = false;
                     st.idle = false;
                     st.last_hover_at = now;
                     st.grace_until = now + Duration::from_millis(2600);
@@ -910,7 +1079,12 @@ fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
 
 enum WatcherAction {
     None,
-    Snap {
+    SnapPod {
+        to: (i32, i32),
+        saved: SavedDock,
+        payload: DockStatePayload,
+    },
+    SaveOrbDrag {
         to: (i32, i32),
         saved: SavedDock,
         payload: DockStatePayload,
@@ -918,7 +1092,7 @@ enum WatcherAction {
     AdjustOnScreen {
         to: (i32, i32),
     },
-    Tuck {
+    TuckEdge {
         from: (i32, i32),
         edge: DockEdge,
         dock_x: i32,
@@ -927,9 +1101,19 @@ enum WatcherAction {
         seam: bool,
         peek: i32,
     },
-    Untuck {
+    UntuckEdge {
         from: (i32, i32),
         to: (i32, i32),
+        payload: DockStatePayload,
+    },
+    EnterOrb {
+        orb_pos: (i32, i32),
+        orb_size: i32,
+    },
+    ExitOrb {
+        pod_pos: (i32, i32),
+        pod_w: i32,
+        pod_h: i32,
         payload: DockStatePayload,
     },
     EmitOnly(DockStatePayload),
@@ -966,6 +1150,9 @@ fn start_dock_watcher(
             let peek = (PEEK_LOGICAL_PX * scale).round() as i32;
             let threshold = (SNAP_THRESHOLD_LOGICAL_PX * scale).round() as i32;
             let margin = (8.0 * scale).round() as i32;
+            let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as i32;
+            let pod_default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
+            let pod_base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
             let mouse_down = is_primary_mouse_down();
             let now = Instant::now();
 
@@ -976,37 +1163,120 @@ fn start_dock_watcher(
                 if st.animating {
                     continue;
                 }
+                if !st.orb_collapsed && !st.tucked && ww >= (pod_default_w - 20) {
+                    st.pod_w_phys = ww;
+                    if wh <= pod_base_h + (24.0 * scale).round() as i32 {
+                        st.pod_h_phys = wh;
+                    }
+                }
 
-                if st.force_untuck && st.tucked {
+                if st.force_untuck && (st.tucked || st.orb_collapsed) {
                     st.force_untuck = false;
                     st.force_tuck = false;
-                    st.tucked = false;
                     st.idle = false;
                     st.last_hover_at = now;
                     st.grace_until = now + Duration::from_millis(2400);
-                    let to = (st.dock_x, st.dock_y);
-                    action = WatcherAction::Untuck {
-                        from: (wx, wy),
-                        to,
-                        payload: st.payload(),
-                    };
-                } else if st.force_tuck && !st.tucked && st.edge != DockEdge::None {
+                    if st.orb_collapsed {
+                        st.orb_collapsed = false;
+                        let pod_w = st.pod_w_phys.max(pod_default_w);
+                        let pod_h = st.pod_h_phys.max(pod_base_h);
+                        let to = compute_visible_pod_pos(
+                            st.dock_x,
+                            st.dock_y,
+                            pod_w,
+                            pod_h,
+                            st.work_area,
+                            st.edge,
+                            margin,
+                        );
+                        action = WatcherAction::ExitOrb {
+                            pod_pos: to,
+                            pod_w,
+                            pod_h,
+                            payload: st.payload(),
+                        };
+                    } else {
+                        st.tucked = false;
+                        let to = (st.dock_x, st.dock_y);
+                        action = WatcherAction::UntuckEdge {
+                            from: (wx, wy),
+                            to,
+                            payload: st.payload(),
+                        };
+                    }
+                } else if st.force_tuck && !st.tucked && !st.orb_collapsed {
                     st.force_tuck = false;
                     st.pinned = false;
                     st.ui_hold = false;
-                    action = WatcherAction::Tuck {
-                        from: (wx, wy),
-                        edge: st.edge,
-                        dock_x: st.dock_x,
-                        dock_y: st.dock_y,
-                        area: st.work_area,
-                        seam: st.seam_mode,
-                        peek,
-                    };
+                    if st.standby_mode == StandbyMode::Orb {
+                        let pod_w = st.pod_w_phys.max(pod_default_w);
+                        let pod_h = st.pod_h_phys.max(pod_base_h);
+                        let opos = match (st.orb_x, st.orb_y) {
+                            (Some(ox), Some(oy)) => (ox, oy),
+                            _ => {
+                                let p = compute_orb_pos_from_pod(
+                                    st.dock_x,
+                                    st.dock_y,
+                                    pod_w,
+                                    pod_h,
+                                    orb_size,
+                                    st.work_area,
+                                    st.edge,
+                                    margin,
+                                );
+                                st.orb_x = Some(p.0);
+                                st.orb_y = Some(p.1);
+                                p
+                            }
+                        };
+                        action = WatcherAction::EnterOrb {
+                            orb_pos: opos,
+                            orb_size,
+                        };
+                    } else if st.edge != DockEdge::None {
+                        action = WatcherAction::TuckEdge {
+                            from: (wx, wy),
+                            edge: st.edge,
+                            dock_x: st.dock_x,
+                            dock_y: st.dock_y,
+                            area: st.work_area,
+                            seam: st.seam_mode,
+                            peek,
+                        };
+                    }
                 } else if st.pending_user_move {
                     let live_area = monitor_work_rect(&window, wx + ww / 2, wy + (wh.min(160)) / 2)
                         .unwrap_or(st.work_area);
-                    if mouse_down {
+                    if st.orb_collapsed {
+                        if !mouse_down {
+                            st.pending_user_move = false;
+                            let min_ox = live_area.x + margin;
+                            let max_ox = (live_area.right() - orb_size - margin).max(min_ox);
+                            let min_oy = live_area.y + margin;
+                            let max_oy = (live_area.bottom() - orb_size - margin).max(min_oy);
+                            let ox = wx.clamp(min_ox, max_ox);
+                            let oy = wy.clamp(min_oy, max_oy);
+                            let pod_w = st.pod_w_phys.max(pod_default_w);
+                            let pod_h = st.pod_h_phys.max(pod_base_h);
+                            let (px, py, new_edge) = compute_pod_pos_from_orb(
+                                ox, oy, orb_size, pod_w, pod_h, live_area, margin,
+                            );
+                            st.orb_x = Some(ox);
+                            st.orb_y = Some(oy);
+                            st.dock_x = px;
+                            st.dock_y = py;
+                            st.edge = new_edge;
+                            st.work_area = live_area;
+                            st.seam_mode = has_adjacent_monitor_beyond_edge(
+                                &window, px, py, pod_w, pod_h, live_area, new_edge,
+                            );
+                            action = WatcherAction::SaveOrbDrag {
+                                to: (ox, oy),
+                                saved: st.to_saved(),
+                                payload: st.payload(),
+                            };
+                        }
+                    } else if mouse_down {
                         let prev = detect_snap_edge(wx, wy, ww, wh, live_area, threshold);
                         if prev != st.preview {
                             st.preview = prev;
@@ -1015,83 +1285,124 @@ fn start_dock_watcher(
                     } else {
                         st.pending_user_move = false;
                         st.preview = DockEdge::None;
+                        // Anchor using base capsule height so dragging while a drawer is open still remembers true home y!
+                        let anchor_h = st.pod_h_phys.max(pod_base_h);
                         let (sx, sy, new_edge) =
-                            snap_window_rect(wx, wy, ww, wh, live_area, threshold, margin);
+                            snap_window_rect(wx, wy, ww, anchor_h, live_area, threshold, margin);
                         let seam = has_adjacent_monitor_beyond_edge(
-                            &window, sx, sy, ww, wh, live_area, new_edge,
+                            &window, sx, sy, ww, anchor_h, live_area, new_edge,
                         );
                         st.edge = new_edge;
                         st.dock_x = sx;
                         st.dock_y = sy;
                         st.work_area = live_area;
                         st.seam_mode = seam;
+                        // Re-compute companion orb anchor whenever user explicitly repositions the pod
+                        let (ox, oy) = compute_orb_pos_from_pod(
+                            sx, sy, ww, anchor_h, orb_size, live_area, new_edge, margin,
+                        );
+                        st.orb_x = Some(ox);
+                        st.orb_y = Some(oy);
                         st.tucked = false;
+                        st.orb_collapsed = false;
                         st.idle = false;
                         st.last_hover_at = now;
                         st.grace_until = now + Duration::from_millis(1400);
-                        action = WatcherAction::Snap {
-                            to: (sx, sy),
-                            saved: SavedDock {
-                                x: sx,
-                                y: sy,
-                                edge: new_edge,
-                            },
+                        let vis_to =
+                            compute_visible_pod_pos(sx, sy, ww, wh, live_area, new_edge, margin);
+                        action = WatcherAction::SnapPod {
+                            to: vis_to,
+                            saved: st.to_saved(),
                             payload: st.payload(),
                         };
                     }
+                } else if st.orb_collapsed {
+                    // In Shield Orb standby: stay cleanly as the glowing orb until clicked (or tray woken)
                 } else {
-                    match st.edge {
-                        DockEdge::Top | DockEdge::Left | DockEdge::Right => {
-                            if st.tucked {
-                                if !mouse_down
-                                    && is_cursor_in_tucked_handle(
-                                        cx,
-                                        cy,
+                    // Pod is currently expanded — keep strictly anchored to (dock_x, dock_y),
+                    // shifting up temporarily ONLY while an open drawer exceeds the bottom work area,
+                    // and returning right back to dock_y the instant the drawer closes!
+                    let (vis_x, vis_y) = compute_visible_pod_pos(
+                        st.dock_x,
+                        st.dock_y,
+                        ww,
+                        wh,
+                        st.work_area,
+                        st.edge,
+                        margin,
+                    );
+                    if !st.tucked
+                        && ((vis_x - wx).abs() > 2 || (vis_y - wy).abs() > 2)
+                        && now >= st.ignore_moves_until
+                    {
+                        action = WatcherAction::AdjustOnScreen {
+                            to: (vis_x, vis_y),
+                        };
+                    } else if st.standby_mode == StandbyMode::Orb {
+                        let pad = (8.0 * scale).round() as i32;
+                        let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+                        if inside || st.pinned || st.ui_hold || mouse_down {
+                            st.last_hover_at = now;
+                            if st.idle {
+                                st.idle = false;
+                                action = WatcherAction::EmitOnly(st.payload());
+                            }
+                        } else if now >= st.grace_until
+                            && now.duration_since(st.last_hover_at) >= Duration::from_millis(1350)
+                        {
+                            let pod_w = st.pod_w_phys.max(pod_default_w);
+                            let pod_h = st.pod_h_phys.max(pod_base_h);
+                            let opos = match (st.orb_x, st.orb_y) {
+                                (Some(ox), Some(oy)) => (ox, oy),
+                                _ => {
+                                    let p = compute_orb_pos_from_pod(
                                         st.dock_x,
                                         st.dock_y,
-                                        ww,
-                                        wh,
+                                        pod_w,
+                                        pod_h,
+                                        orb_size,
                                         st.work_area,
-                                        scale,
                                         st.edge,
-                                    )
-                                {
-                                    st.tucked = false;
-                                    st.idle = false;
-                                    st.last_hover_at = now;
-                                    st.grace_until = now + Duration::from_millis(900);
-                                    let to = (st.dock_x, st.dock_y);
-                                    action = WatcherAction::Untuck {
-                                        from: (wx, wy),
-                                        to,
-                                        payload: st.payload(),
-                                    };
+                                        margin,
+                                    );
+                                    st.orb_x = Some(p.0);
+                                    st.orb_y = Some(p.1);
+                                    p
                                 }
-                            } else {
-                                // Keep docked edge flush and prevent tall drawers from overflowing taskbar
-                                let area = st.work_area;
-                                let mut target_x = wx;
-                                let mut target_y = wy;
-                                if st.edge == DockEdge::Right && (wx + ww - area.right()).abs() > 2
-                                {
-                                    target_x = area.right() - ww;
-                                    st.dock_x = target_x;
-                                } else if st.edge == DockEdge::Left && (wx - area.x).abs() > 2 {
-                                    target_x = area.x;
-                                    st.dock_x = target_x;
-                                } else if st.edge == DockEdge::Top && (wy - area.y).abs() > 2 {
-                                    target_y = area.y;
-                                    st.dock_y = target_y;
-                                }
-                                if st.edge != DockEdge::Top && wy + wh > area.bottom() - margin {
-                                    target_y = (area.bottom() - wh - margin).max(area.y);
-                                }
-                                if (target_x, target_y) != (wx, wy)
-                                    && now >= st.ignore_moves_until
-                                {
-                                    action = WatcherAction::AdjustOnScreen {
-                                        to: (target_x, target_y),
-                                    };
+                            };
+                            action = WatcherAction::EnterOrb {
+                                orb_pos: opos,
+                                orb_size,
+                            };
+                        }
+                    } else {
+                        match st.edge {
+                            DockEdge::Top | DockEdge::Left | DockEdge::Right => {
+                                if st.tucked {
+                                    if !mouse_down
+                                        && is_cursor_in_tucked_handle(
+                                            cx,
+                                            cy,
+                                            st.dock_x,
+                                            st.dock_y,
+                                            ww,
+                                            wh,
+                                            st.work_area,
+                                            scale,
+                                            st.edge,
+                                        )
+                                    {
+                                        st.tucked = false;
+                                        st.idle = false;
+                                        st.last_hover_at = now;
+                                        st.grace_until = now + Duration::from_millis(900);
+                                        let to = (st.dock_x, st.dock_y);
+                                        action = WatcherAction::UntuckEdge {
+                                            from: (wx, wy),
+                                            to,
+                                            payload: st.payload(),
+                                        };
+                                    }
                                 } else {
                                     let pad = (8.0 * scale).round() as i32;
                                     let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
@@ -1101,7 +1412,7 @@ fn start_dock_watcher(
                                         && now.duration_since(st.last_hover_at)
                                             >= Duration::from_millis(1200)
                                     {
-                                        action = WatcherAction::Tuck {
+                                        action = WatcherAction::TuckEdge {
                                             from: (wx, wy),
                                             edge: st.edge,
                                             dock_x: st.dock_x,
@@ -1113,23 +1424,23 @@ fn start_dock_watcher(
                                     }
                                 }
                             }
-                        }
-                        DockEdge::None => {
-                            let pad = (6.0 * scale).round() as i32;
-                            let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                            if inside || st.pinned || st.ui_hold || mouse_down {
-                                st.last_hover_at = now;
-                                if st.idle {
-                                    st.idle = false;
+                            DockEdge::None => {
+                                let pad = (6.0 * scale).round() as i32;
+                                let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+                                if inside || st.pinned || st.ui_hold || mouse_down {
+                                    st.last_hover_at = now;
+                                    if st.idle {
+                                        st.idle = false;
+                                        action = WatcherAction::EmitOnly(st.payload());
+                                    }
+                                } else if !st.idle
+                                    && now >= st.grace_until
+                                    && now.duration_since(st.last_hover_at)
+                                        >= Duration::from_millis(2200)
+                                {
+                                    st.idle = true;
                                     action = WatcherAction::EmitOnly(st.payload());
                                 }
-                            } else if !st.idle
-                                && now >= st.grace_until
-                                && now.duration_since(st.last_hover_at)
-                                    >= Duration::from_millis(2200)
-                            {
-                                st.idle = true;
-                                action = WatcherAction::EmitOnly(st.payload());
                             }
                         }
                     }
@@ -1144,7 +1455,7 @@ fn start_dock_watcher(
                 WatcherAction::AdjustOnScreen { to } => {
                     set_programmatic_pos(&window, &dock, to.0, to.1);
                 }
-                WatcherAction::Snap { to, saved, payload } => {
+                WatcherAction::SnapPod { to, saved, payload } => {
                     let _ = window.set_ignore_cursor_events(false);
                     if let Ok(cur_pos) = window.outer_position() {
                         if (cur_pos.x, cur_pos.y) != to {
@@ -1154,7 +1465,16 @@ fn start_dock_watcher(
                     persist_saved_dock(&saved);
                     let _ = window.emit("dock-state", payload);
                 }
-                WatcherAction::Tuck {
+                WatcherAction::SaveOrbDrag { to, saved, payload } => {
+                    if let Ok(cur_pos) = window.outer_position() {
+                        if (cur_pos.x, cur_pos.y) != to {
+                            set_programmatic_pos(&window, &dock, to.0, to.1);
+                        }
+                    }
+                    persist_saved_dock(&saved);
+                    let _ = window.emit("dock-state", payload);
+                }
+                WatcherAction::TuckEdge {
                     from,
                     edge,
                     dock_x,
@@ -1163,7 +1483,6 @@ fn start_dock_watcher(
                     seam,
                     peek,
                 } => {
-                    // Collapse any open drawer first so collapsed capsule dimensions are cleanly used
                     let _ = window.emit("collapse-drawers", ());
                     std::thread::sleep(Duration::from_millis(45));
                     let fresh_size = window.outer_size().unwrap_or(wsize);
@@ -1185,10 +1504,41 @@ fn start_dock_watcher(
                     let _ = window.set_ignore_cursor_events(true);
                     let _ = window.emit("dock-state", payload);
                 }
-                WatcherAction::Untuck { from, to, payload } => {
+                WatcherAction::UntuckEdge { from, to, payload } => {
                     let _ = window.set_ignore_cursor_events(false);
                     let _ = window.emit("dock-state", payload);
                     glide_window(&window, &dock, from, to, 10, 14);
+                }
+                WatcherAction::EnterOrb { orb_pos, orb_size } => {
+                    let _ = window.emit("collapse-drawers", ());
+                    let payload = {
+                        let mut st = dock.lock().unwrap();
+                        st.orb_collapsed = true;
+                        st.tucked = false;
+                        st.idle = true;
+                        st.ignore_moves_until = Instant::now() + Duration::from_millis(320);
+                        st.payload()
+                    };
+                    let _ = window.set_ignore_cursor_events(false);
+                    let _ = window.emit("dock-state", payload);
+                    std::thread::sleep(Duration::from_millis(20));
+                    let _ = window.set_size(PhysicalSize::new(orb_size as u32, orb_size as u32));
+                    set_programmatic_pos(&window, &dock, orb_pos.0, orb_pos.1);
+                }
+                WatcherAction::ExitOrb {
+                    pod_pos,
+                    pod_w,
+                    pod_h,
+                    payload,
+                } => {
+                    {
+                        let mut st = dock.lock().unwrap();
+                        st.ignore_moves_until = Instant::now() + Duration::from_millis(320);
+                    }
+                    let _ = window.set_ignore_cursor_events(false);
+                    let _ = window.set_size(PhysicalSize::new(pod_w as u32, pod_h as u32));
+                    set_programmatic_pos(&window, &dock, pod_pos.0, pod_pos.1);
+                    let _ = window.emit("dock-state", payload);
                 }
             }
         }
@@ -1211,19 +1561,19 @@ fn set_dock_hold(dock: State<'_, DockController>, hold: bool) {
 
 #[tauri::command]
 fn set_dock_pinned(app: AppHandle, dock: State<'_, DockController>, pinned: bool) -> DockStatePayload {
-    let (was_tucked, payload) = {
+    let (was_collapsed, payload) = {
         let mut st = dock.inner.lock().unwrap();
-        let prev_tucked = st.tucked;
+        let prev_collapsed = st.tucked || st.orb_collapsed;
         st.pinned = pinned;
         st.last_hover_at = Instant::now();
-        if pinned && prev_tucked {
+        if pinned && prev_collapsed {
             st.force_untuck = true;
         } else if pinned {
             st.idle = false;
         }
-        (prev_tucked, st.payload())
+        (prev_collapsed, st.payload())
     };
-    if !was_tucked {
+    if !was_collapsed {
         if let Some(window) = app.get_webview_window("main") {
             if pinned {
                 let _ = window.set_ignore_cursor_events(false);
@@ -1235,13 +1585,55 @@ fn set_dock_pinned(app: AppHandle, dock: State<'_, DockController>, pinned: bool
 }
 
 #[tauri::command]
+fn set_standby_mode(
+    app: AppHandle,
+    dock: State<'_, DockController>,
+    mode: String,
+) -> Result<DockStatePayload, String> {
+    let parsed = match mode.trim().to_ascii_lowercase().as_str() {
+        "edge" => StandbyMode::Edge,
+        "orb" => StandbyMode::Orb,
+        _ => return Err("待机模式仅支持 edge 或 orb".to_string()),
+    };
+    let (was_collapsed, saved, payload) = {
+        let mut st = dock.inner.lock().unwrap();
+        let prev_collapsed = st.tucked || st.orb_collapsed;
+        st.standby_mode = parsed;
+        let now = Instant::now();
+        st.last_hover_at = now;
+        st.grace_until = now + Duration::from_millis(2400);
+        if prev_collapsed {
+            st.force_untuck = true;
+        } else {
+            st.idle = false;
+        }
+        (prev_collapsed, st.to_saved(), st.payload())
+    };
+    persist_saved_dock(&saved);
+    if !was_collapsed {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.emit("dock-state", payload.clone());
+        }
+    }
+    Ok(payload)
+}
+
+#[tauri::command]
+fn expand_from_orb(dock: State<'_, DockController>) {
+    let mut st = dock.inner.lock().unwrap();
+    if st.orb_collapsed || st.tucked {
+        st.force_untuck = true;
+    }
+}
+
+#[tauri::command]
 fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
     let should_hide = {
         let mut st = dock.inner.lock().unwrap();
-        if st.edge != DockEdge::None {
+        if st.standby_mode == StandbyMode::Orb || st.edge != DockEdge::None {
             st.force_tuck = true;
             false
         } else {
@@ -1262,7 +1654,7 @@ fn show_main_window(app: &AppHandle) {
             let now = Instant::now();
             st.last_hover_at = now;
             st.grace_until = now + Duration::from_millis(3200);
-            if st.tucked {
+            if st.tucked || st.orb_collapsed {
                 st.force_untuck = true;
             } else {
                 st.idle = false;
@@ -1438,6 +1830,8 @@ fn main() {
             get_dock_state,
             set_dock_hold,
             set_dock_pinned,
+            set_standby_mode,
+            expand_from_orb,
             tuck_or_hide
         ])
         .run(tauri::generate_context!())
@@ -1615,5 +2009,53 @@ mod tests {
         assert!(!is_cursor_in_tucked_handle(
             2557, 200, 2020, 500, 540, 128, area, 1.0, DockEdge::Right
         ));
+    }
+
+    #[test]
+    fn drawer_expand_and_collapse_returns_to_exact_home_y() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1400,
+        };
+        let home_x = 1800;
+        let home_y = 1220;
+        // Collapsed height (122px): stays at exact home_y = 1220
+        assert_eq!(
+            compute_visible_pod_pos(home_x, home_y, 540, 122, area, DockEdge::None, 8),
+            (1800, 1220)
+        );
+        // Expanded drawer height (360px): temporarily pushed up to 1400 - 360 - 8 = 1032 so it doesn't go behind taskbar
+        assert_eq!(
+            compute_visible_pod_pos(home_x, home_y, 540, 360, area, DockEdge::None, 8),
+            (1800, 1032)
+        );
+        // Closing drawer back to 122px: returns pixel-perfectly to original home_y = 1220!
+        assert_eq!(
+            compute_visible_pod_pos(home_x, home_y, 540, 122, area, DockEdge::None, 8),
+            (1800, 1220)
+        );
+    }
+
+    #[test]
+    fn shield_orb_and_pod_anchor_roundtrip() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1400,
+        };
+        // Pod docked at Right edge (2020, 600) -> Orb parks near right edge at (2560 - 72 - 8 = 2480, 625)
+        let (ox, oy) = compute_orb_pos_from_pod(2020, 600, 540, 122, 72, area, DockEdge::Right, 8);
+        assert_eq!((ox, oy), (2480, 625));
+
+        // Dragging the Orb to right edge (2480, 800) updates pod home to Right-docked (2020, 775)
+        let (px, py, edge) = compute_pod_pos_from_orb(2480, 800, 72, 540, 122, area, 8);
+        assert_eq!((px, py, edge), (2020, 775, DockEdge::Right));
+
+        // Dragging the Orb to middle of screen (1200, 500) updates pod home to Free-floating centered on the orb
+        let (px2, py2, edge2) = compute_pod_pos_from_orb(1200, 500, 72, 540, 122, area, 8);
+        assert_eq!((px2, py2, edge2), (966, 475, DockEdge::None));
     }
 }

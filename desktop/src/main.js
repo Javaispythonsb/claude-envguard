@@ -57,6 +57,8 @@ let activeDrawer = null;
 let lastPodHeight = 0;
 let isPinned = false;
 let isTucked = false;
+let isOrb = false;
+let standbyMode = 'edge';
 let focusHoldCount = 0;
 let shieldArmed = false;
 
@@ -73,8 +75,9 @@ function setSubStatus(text, isErr = false) {
 
 function setEdgeBarTone(tone) {
   const bar = document.getElementById('edgeStatusBar');
-  if (!bar) return;
-  bar.className = tone ? `edge-bar ${tone}` : 'edge-bar';
+  if (bar) bar.className = tone ? `edge-bar ${tone}` : 'edge-bar';
+  const orb = document.getElementById('shieldOrb');
+  if (orb) orb.className = tone ? `shield-orb ${tone}` : 'shield-orb';
 }
 
 function syncDockHold() {
@@ -87,38 +90,52 @@ function applyDockPayload(payload) {
   if (!payload) return;
   const root = document.documentElement;
   const edge = payload.edge || 'none';
+  const prevOrb = isOrb;
   isTucked = Boolean(payload.tucked);
+  isOrb = Boolean(payload.orb);
+  standbyMode = payload.standby_mode || 'edge';
   const seam = Boolean(payload.seam);
   const idle = Boolean(payload.idle);
   const preview = payload.preview || 'none';
   isPinned = Boolean(payload.pinned);
 
   root.setAttribute('data-dock', edge);
+  root.setAttribute('data-standby', standbyMode);
+  root.setAttribute('data-orb', String(isOrb));
   root.setAttribute('data-tucked', String(isTucked));
   root.setAttribute('data-seam', String(seam));
   root.setAttribute('data-idle', String(idle));
   root.setAttribute('data-preview', preview);
 
+  document.querySelectorAll('[data-standby-pick]').forEach((btn) => {
+    btn.classList.toggle('on', btn.dataset.standbyPick === standbyMode);
+  });
+
   const pinBtn = document.getElementById('btnPinPod');
   if (pinBtn) {
     pinBtn.classList.toggle('pinned', isPinned);
     pinBtn.title = isPinned
-      ? '已固定展开（点击恢复贴边自动隐藏）'
-      : '自动贴边隐藏中（点击固定展开）';
+      ? '已固定展开（点击恢复自动待机）'
+      : (standbyMode === 'orb' ? '自动收缩为盾牌悬浮球（点击固定展开）' : '自动贴边隐藏中（点击固定展开）');
   }
 
   const closeBtn = document.getElementById('btnHideWin');
   if (closeBtn) {
-    closeBtn.title = edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)';
+    closeBtn.title = standbyMode === 'orb'
+      ? '收起为盾牌悬浮球 (Esc)'
+      : (edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)');
   }
 
-  if (!isTucked) {
+  if (prevOrb && !isOrb) {
+    lastPodHeight = 0;
+  }
+  if (!isTucked && !isOrb) {
     requestAnimationFrame(syncPodHeight);
   }
 }
 
 function syncPodHeight() {
-  if (!isTauri || isTucked) return;
+  if (!isTauri || isTucked || isOrb) return;
   const stage = document.getElementById('pcApp');
   if (!stage) return;
   const h = Math.max(114, Math.ceil(stage.offsetHeight));
@@ -417,6 +434,50 @@ function wireDesktopEvents() {
       .then((st) => applyDockPayload(st))
       .catch(() => {});
   };
+
+  document.querySelectorAll('[data-standby-pick]').forEach((btn) => {
+    btn.onclick = () => {
+      const mode = btn.dataset.standbyPick;
+      invoke('set_standby_mode', { mode })
+        .then((st) => {
+          applyDockPayload(st);
+          setSubStatus(mode === 'orb' ? '待机已切换为：盾牌悬浮圆球' : '待机已切换为：贴边微光条', false);
+        })
+        .catch(() => {});
+    };
+  });
+
+  // Shield Orb interaction: short click (<4px movement) expands pod; press & move (>4px) drags the orb smoothly!
+  const orbEl = document.getElementById('shieldOrb');
+  if (orbEl) {
+    let orbDown = false;
+    let startX = 0;
+    let startY = 0;
+    let dragged = false;
+    orbEl.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      orbDown = true;
+      dragged = false;
+      startX = e.screenX;
+      startY = e.screenY;
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!orbDown || dragged) return;
+      if (Math.hypot(e.screenX - startX, e.screenY - startY) > 4) {
+        dragged = true;
+        orbDown = false;
+        if (isTauri) getCurrentWindow().startDragging().catch(() => {});
+      }
+    });
+    orbEl.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return;
+      const wasClick = orbDown && !dragged;
+      orbDown = false;
+      if (wasClick && isTauri) {
+        invoke('expand_from_orb').catch(() => {});
+      }
+    });
+  }
 
   for (const id of ['safeUrlInput', 'proxyClientSelect', 'flclashPortInput']) {
     const el = document.getElementById(id);
