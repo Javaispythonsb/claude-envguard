@@ -7,7 +7,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager, State};
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -28,6 +30,7 @@ const ALLOWED_CLIENTS: &[&str] = &[
 
 struct OpGuard {
     busy: Arc<AtomicBool>,
+    quitting: AtomicBool,
 }
 
 struct BusyLease {
@@ -434,10 +437,110 @@ async fn export_diagnostics(
     Ok(outcome)
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn map_tray_menu_event(id: &str) -> Option<&'static str> {
+    match id {
+        "launch_desktop" => Some("launch-desktop"),
+        "launch_cli" => Some("launch-cli"),
+        "recheck" => Some("recheck"),
+        "shield_restore" => Some("shield-restore"),
+        _ => None,
+    }
+}
+
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let open_console = MenuItemBuilder::with_id("open_console", "打开主控制台").build(app)?;
+    let launch_desktop =
+        MenuItemBuilder::with_id("launch_desktop", "▶ 安全启动 Claude").build(app)?;
+    let launch_cli = MenuItemBuilder::with_id("launch_cli", "❯_ 安全启动 CLI").build(app)?;
+    let recheck = MenuItemBuilder::with_id("recheck", "↻ 重新检查环境").build(app)?;
+    let shield_restore =
+        MenuItemBuilder::with_id("shield_restore", "退出护盾（还原网络并停保镖）").build(app)?;
+    let quit_app =
+        MenuItemBuilder::with_id("quit_app", "退出控制台（保留后台保镖）").build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&open_console)
+        .separator()
+        .item(&launch_desktop)
+        .item(&launch_cli)
+        .item(&recheck)
+        .separator()
+        .item(&shield_restore)
+        .item(&quit_app)
+        .build()?;
+
+    let mut builder = TrayIconBuilder::with_id("envguard-tray")
+        .tooltip("Claude 环境卫士 · EnvGuard")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .on_menu_event(|app, event| {
+            let id = event.id().as_ref();
+            if id == "open_console" {
+                show_main_window(app);
+            } else if id == "quit_app" {
+                app.state::<OpGuard>()
+                    .quitting
+                    .store(true, Ordering::SeqCst);
+                app.exit(0);
+            } else if let Some(action) = map_tray_menu_event(id) {
+                show_main_window(app);
+                let _ = app.emit("tray-action", action);
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .manage(OpGuard {
             busy: Arc::new(AtomicBool::new(false)),
+            quitting: AtomicBool::new(false),
+        })
+        .setup(|app| {
+            setup_tray(app.handle())?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    let quitting = window
+                        .app_handle()
+                        .state::<OpGuard>()
+                        .quitting
+                        .load(Ordering::SeqCst);
+                    if !quitting {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_ui_state,
@@ -533,5 +636,16 @@ mod tests {
         assert!(BusyLease::try_acquire(&flag).is_err());
         drop(l1);
         assert!(BusyLease::try_acquire(&flag).is_ok());
+    }
+
+    #[test]
+    fn tray_menu_action_mapping() {
+        assert_eq!(map_tray_menu_event("launch_desktop"), Some("launch-desktop"));
+        assert_eq!(map_tray_menu_event("launch_cli"), Some("launch-cli"));
+        assert_eq!(map_tray_menu_event("recheck"), Some("recheck"));
+        assert_eq!(map_tray_menu_event("shield_restore"), Some("shield-restore"));
+        assert_eq!(map_tray_menu_event("open_console"), None);
+        assert_eq!(map_tray_menu_event("quit_app"), None);
+        assert_eq!(map_tray_menu_event("unknown"), None);
     }
 }

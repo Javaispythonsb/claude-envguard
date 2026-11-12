@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { runMobileSelfCheck } from './mobile-check.js';
 
 const CHECK_SPECS = [
@@ -387,6 +388,23 @@ function wireDesktopEvents() {
       setView('overview');
     }
   };
+
+  listen('tray-action', (event) => {
+    const action = String(event?.payload || '');
+    setDeviceMode('pc');
+    setView('overview');
+    if (action === 'recheck') {
+      refreshDesktopState(true);
+    } else if (action === 'launch-desktop') {
+      handleAction('启动 Claude', () => invoke('safe_launch', { target: 'desktop' }), false);
+    } else if (action === 'launch-cli') {
+      handleAction('启动 CLI', () => invoke('safe_launch', { target: 'cli' }), false);
+    } else if (action === 'shield-restore') {
+      if (!shieldBtn.classList.contains('armed')) {
+        shieldBtn.click();
+      }
+    }
+  }).catch(() => {});
 }
 
 function wireMobileEvents() {
