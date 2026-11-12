@@ -431,107 +431,125 @@ export function computePrimaryIslandAction({ busy, busyLabel, complete, ready, n
 }
 
 /**
- * Formats the JSON payload from `check_app_update` into structured UI drawer state.
+ * Turns a build time (Unix seconds) into a short local date such as "11月12日 17:05".
+ */
+export function formatBuildTime(unixSeconds) {
+  const n = Number(unixSeconds);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const d = new Date(n * 1000);
+  const pad = (v) => String(v).padStart(2, '0');
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/**
+ * Release notes shown to users must be plain Chinese. Older builds carried the English
+ * commit subject (for example "feat(desktop): ..."), which is replaced with a fixed line.
+ */
+export function plainReleaseNote(raw) {
+  const text = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!text || !/[\u4e00-\u9fff]/.test(text)) return '常规维护与稳定性改进';
+  return text.length > 160 ? `${text.slice(0, 160).trimEnd()}…` : text;
+}
+
+/**
+ * Formats the JSON payload from `check_app_update` for the update drawer. Users see the
+ * version, a build date when two builds share a version, and a short Chinese note. Commit
+ * hashes, commit subjects and repository links are deliberately left out.
  */
 export function formatUpdateCheckReport(info) {
   if (!info || typeof info !== 'object') {
     return {
-      title: '检查更新 · 异常',
+      title: '检查更新失败',
       canHotUpdate: false,
       summary: '未能读取更新状态',
-      body: '未收到有效的更新检查结果，请稍后重试。'
+      body: '没有收到有效的检查结果，请稍后重试。'
     };
   }
 
   const st = String(info.status || 'error');
-  const repo = info.repo || 'Javaispythonsb/claude-envguard';
-  const curVer = info.current_version || '2.0.0';
-  const curSha = info.current_commit && info.current_commit !== 'unknown' ? ` (${info.current_commit})` : '';
+  const curVer = info.current_version || '';
   const latVer = info.latest_version || curVer;
-  const latSha = info.latest_commit ? ` (${info.latest_commit})` : '';
+  const curLabel = curVer ? `v${curVer}` : '未知';
 
   if (st === 'update_available') {
-    const lines = [
-      `状态：发现可用热更新`,
-      `本机版本：v${curVer}${curSha}`,
-      `最新版本：v${latVer}${latSha}`
-    ];
-    if (info.notes) lines.push(`更新内容：${info.notes}`);
-    if (info.built_at) lines.push(`构建时间：${info.built_at}`);
-    lines.push(`开源仓库：https://github.com/${repo}`);
+    const sameVersion = info.same_version === true || (curVer && latVer === curVer);
+    const lines = [];
+    if (sameVersion) {
+      const latBuilt = formatBuildTime(info.latest_build_unix);
+      const curBuilt = formatBuildTime(info.current_build_unix);
+      lines.push(`当前版本：${curLabel}${curBuilt ? `（${curBuilt} 构建）` : ''}`);
+      lines.push(`可更新至：v${latVer} 维护更新${latBuilt ? `（${latBuilt} 构建）` : ''}`);
+    } else {
+      lines.push(`当前版本：${curLabel}`);
+      lines.push(`最新版本：v${latVer}`);
+    }
+    lines.push(`更新内容：${plainReleaseNote(info.notes)}`);
     lines.push('');
-    lines.push('点击右上角「立即热更新」将自动校验 SHA-256 签名，保留全部本机设置后无缝替换重启。');
+    lines.push('点击「立即更新」后会自动下载并校验，保留本机全部设置，完成后自动重启。');
     return {
-      title: '检查更新 · 发现新版',
+      title: sameVersion ? '有可用的维护更新' : `发现新版本 v${latVer}`,
       canHotUpdate: true,
-      summary: info.message || `发现 GitHub 新版本 v${latVer}${latSha}`,
+      summary: sameVersion ? `发现 v${latVer} 的维护更新` : `发现新版本 v${latVer}`,
       body: lines.join('\n')
     };
   }
 
-  if (st === 'up_to_date') {
-    const lines = [
-      `状态：当前已是最新版本`,
-      `本机版本：v${curVer}${curSha}`,
-      `开源仓库：https://github.com/${repo}`
-    ];
-    if (info.built_at) lines.push(`最新构建：${info.built_at}`);
-    if (info.ci_building && info.ci_head_commit) {
+  if (st === 'up_to_date' || st === 'ahead') {
+    const lines = [`当前版本：${curLabel}`, '已经是最新版本，无需更新。'];
+    if (info.ci_building) {
       lines.push('');
-      lines.push(`提示：检测到 main 分支刚推送新提交 (${info.ci_head_commit}${info.ci_head_title ? ': ' + info.ci_head_title : ''})，GitHub Actions 正在后台编译打包，约 1~2 分钟后再次检查即可拉取热更新。`);
+      lines.push('新版本正在发布，过 1 到 2 分钟再检查即可。');
     }
     return {
-      title: info.ci_building ? '检查更新 · 云端同步中' : '检查更新 · 已是最新',
+      title: info.ci_building ? '新版本发布中' : '已是最新版本',
       canHotUpdate: false,
-      summary: info.message || `当前已是最新版本 v${curVer}${curSha}`,
+      summary: `当前已是最新版本 ${curLabel}`,
       body: lines.join('\n')
     };
   }
 
   if (st === 'building') {
-    const lines = [
-      `状态：GitHub Actions 正在编译打包首个 Release`,
-      `本机版本：v${curVer}${curSha}`,
-      `最新提交：${info.latest_commit || '--'}${info.notes ? ' · ' + info.notes : ''}`,
-      `构建进度：https://github.com/${repo}/actions`,
-      '',
-      '云端编译完成后（约 1~2 分钟），再次点击「检查更新」即可一键热更新。'
-    ];
     return {
-      title: '检查更新 · 云端编译中',
+      title: '新版本发布中',
       canHotUpdate: false,
-      summary: info.message || 'GitHub Actions 正在后台编译打包中',
-      body: lines.join('\n')
+      summary: '新版本正在发布，请稍后再检查',
+      body: [`当前版本：${curLabel}`, '新版本正在发布，过 1 到 2 分钟再检查即可。'].join('\n')
     };
   }
 
-  if (st === 'ahead') {
-    const lines = [
-      `状态：本地构建新于云端 Release（防倒退保护已生效）`,
-      `本机版本：v${curVer}${curSha}`,
-      `云端构建：v${latVer}${latSha}`,
-      `开源仓库：https://github.com/${repo}`
-    ];
-    if (info.ci_building) {
-      lines.push('');
-      lines.push('GitHub Actions 正在编译最新提交，请等待云端构建完成后再检查。');
-    }
-    return {
-      title: '检查更新 · 本地超前',
-      canHotUpdate: false,
-      summary: info.message || '当前本地版本新于云端 Release',
-      body: lines.join('\n')
-    };
-  }
-
+  const lines = ['检查更新失败，请确认网络可以访问 GitHub 后重试。'];
+  if (info.error_detail) lines.push(`原因：${info.error_detail}`);
   return {
-    title: '检查更新 · 失败',
+    title: '检查更新失败',
     canHotUpdate: false,
-    summary: info.message || '无法连接 GitHub 更新源',
-    body: `${info.message || '检查更新失败'}\n开源仓库：https://github.com/${repo}`
+    summary: '检查更新失败',
+    body: lines.join('\n')
   };
 }
 
+const UPDATE_STAGE_LABELS = {
+  prepare: '准备更新',
+  download: '下载更新包',
+  verify: '校验完整性',
+  extract: '解压并检查',
+  install: '写入新版本',
+  swap: '替换主程序',
+  restart: '正在重启'
+};
+
+/**
+ * Maps a progress report from the updater to what the bar shows. The bar never moves
+ * backwards, even if reports arrive out of order.
+ */
+export function describeUpdateProgress(stage, percent, previousPercent = 0) {
+  const raw = Math.round(Number(percent));
+  const clamped = Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 0;
+  const prev = Number.isFinite(Number(previousPercent)) ? Number(previousPercent) : 0;
+  return {
+    label: UPDATE_STAGE_LABELS[stage] || '正在更新',
+    percent: Math.max(prev, clamped)
+  };
+}
 /**
  * Computes accessible label and tooltip copy for the Ceramic Shield Orb across standby & gravity play modes.
  */
@@ -544,14 +562,14 @@ export function describeOrbModeMeta({ tone = '', playMode = false } = {}) {
 
   if (playMode) {
     return {
-      ariaLabel: `${statusPrefix}，重力解压球模式运行中，单击弹跳，双击或按 Esc 退出`,
-      title: `${statusPrefix} · 重力解压模式（抓甩 / 挥鼠颠球 / 单击弹跳 · 双击退出）`
+      ariaLabel: `${statusPrefix}，重力球模式运行中，按 Esc 或点击旁边的关闭按钮退出`,
+      title: `${statusPrefix} · 重力解压模式：抓起可甩，快速划过可颠球，单击弹起。双击、右键、点右上角关闭或按 Esc 退出`
     };
   }
 
   return {
-    ariaLabel: `${statusPrefix}，鼠标悬停或按回车展开控制面板，双击进入重力解压模式`,
-    title: `${statusPrefix} · 悬停展开 · 按住拖动 · 双击进入重力解压球`
+    ariaLabel: `${statusPrefix}，鼠标悬停或按回车展开控制面板，双击进入重力球模式`,
+    title: `${statusPrefix} · 悬停展开 · 按住拖动 · 双击进入重力球`
   };
 }
 

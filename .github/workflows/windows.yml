@@ -22,6 +22,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: 版本号一致性检查
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $versions = [ordered]@{
+            'VERSION'                         = (Get-Content -LiteralPath 'VERSION' -Raw).Trim()
+            'desktop/package.json'            = (Get-Content -LiteralPath 'desktop/package.json' -Raw | ConvertFrom-Json).version
+            'desktop/src-tauri/tauri.conf.json' = (Get-Content -LiteralPath 'desktop/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+            'desktop/src-tauri/Cargo.toml'    = ([regex]::Match((Get-Content -LiteralPath 'desktop/src-tauri/Cargo.toml' -Raw), '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+          }
+          $versions.GetEnumerator() | ForEach-Object { "$($_.Key) = $($_.Value)" }
+          if (@($versions.Values | Select-Object -Unique).Count -ne 1) {
+            throw '四处版本号不一致：本地版本取自 tauri.conf.json，远端比对取自 VERSION，二者不同会让客户端误判更新状态'
+          }
+
       - name: PowerShell 集成测试（Windows PowerShell 5.1）
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-windows-tests.ps1
@@ -69,8 +84,13 @@ jobs:
           $sha = (git rev-parse HEAD).Trim().ToLowerInvariant()
           $shortSha = $sha.Substring(0, 7)
           $commitUnix = [int64](git show -s --format=%ct HEAD).Trim()
-          $subject = (git show -s --format=%s HEAD).Trim()
           $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          # 客户端只展示面向用户的中文说明；说明文件的版本号与本次构建不符时用固定文案，避免沿用旧说明
+          $notes = '常规维护与稳定性改进'
+          if (Test-Path -LiteralPath 'RELEASE_NOTES.json') {
+            $rn = Get-Content -LiteralPath 'RELEASE_NOTES.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($rn.version -eq $ver -and $rn.notes) { $notes = ([string]$rn.notes).Trim() }
+          }
 
           $outDir = 'release-assets'
           $stageDir = 'release-stage'
@@ -88,7 +108,7 @@ jobs:
             short_commit = $shortSha
             commit_unix  = $commitUnix
             built_at     = $builtAt
-            notes        = $subject
+            notes        = $notes
             zip_name     = 'claude-envguard-windows-x64.zip'
             sums_name    = 'SHA256SUMS-release.txt'
           }
@@ -136,13 +156,11 @@ jobs:
           $info = Get-Content -LiteralPath 'release-assets\BUILD_INFO.json' -Raw -Encoding UTF8 | ConvertFrom-Json
           $notesFile = 'release-notes.md'
           $notes = @(
-            "### Claude 环境卫士 · EnvGuard v$($info.version) ($($info.short_commit))",
+            "### Claude 环境卫士 v$($info.version)",
             "",
-            "- **Commit**: ``$($info.commit)``",
-            "- **Summary**: $($info.notes)",
-            "- **Built At**: ``$($info.built_at)``",
+            "$($info.notes)",
             "",
-            "已安装用户可直接在桌面悬浮窗 **「工具 → 检查更新 → 立即热更新」** 一键完成 SHA-256 校验与无缝热替换重启。"
+            "已安装的用户可在悬浮窗「工具 → 检查更新 → 立即更新」中一键更新，下载后会自动校验完整性并重启。"
           ) -join "`n"
           [System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -156,10 +174,10 @@ jobs:
 
             & gh release view latest *> $null
             if ($LASTEXITCODE -ne 0) {
-              & gh release create latest @assets --title "Claude EnvGuard · Latest ($($info.short_commit))" --notes-file $notesFile
+              & gh release create latest @assets --title "Claude EnvGuard v$($info.version)" --notes-file $notesFile
             } else {
               & gh release upload latest @assets --clobber
-              & gh release edit latest --title "Claude EnvGuard · Latest ($($info.short_commit))" --notes-file $notesFile
+              & gh release edit latest --title "Claude EnvGuard v$($info.version)" --notes-file $notesFile
             }
           }
 

@@ -12,6 +12,9 @@ import {
   normalizeSafeUrl,
   computePrimaryIslandAction,
   formatUpdateCheckReport,
+  formatBuildTime,
+  plainReleaseNote,
+  describeUpdateProgress,
   ORB_STAGE_SIZE,
   ORB_VISUAL_SIZE,
   describeOrbModeMeta,
@@ -121,42 +124,76 @@ test('computePrimaryIslandAction 遵循 Apple HIG 主操作角色切换', () => 
   assert.equal(locked.disabled, true);
 });
 
-test('formatUpdateCheckReport 准确控制立即热更新按钮显隐与云端编译提示', () => {
-  const avail = formatUpdateCheckReport({
+const HIDDEN_DEV_DETAILS = /1111111|2222222|3333333|github\.com|feat|fix:|polish|SHA/;
+
+test('formatUpdateCheckReport 只展示版本与中文说明，不暴露提交哈希、提交标题或仓库地址', () => {
+  const newer = formatUpdateCheckReport({
     status: 'update_available',
     repo: 'Javaispythonsb/claude-envguard',
     current_version: '2.0.0',
     current_commit: '1111111',
+    latest_version: '2.1.0',
+    latest_commit: '2222222',
+    same_version: false,
+    notes: '悬浮球拖动更顺滑，热更新显示进度'
+  });
+  assert.equal(newer.canHotUpdate, true);
+  assert.equal(newer.title, '发现新版本 v2.1.0');
+  assert.match(newer.body, /当前版本：v2\.0\.0/);
+  assert.match(newer.body, /最新版本：v2\.1\.0/);
+  assert.match(newer.body, /更新内容：悬浮球拖动更顺滑，热更新显示进度/);
+  assert.doesNotMatch(newer.body, HIDDEN_DEV_DETAILS);
+
+  // 同版本号的滚动构建：用构建时间区分，英文提交标题换成固定中文说明
+  const maintenance = formatUpdateCheckReport({
+    status: 'update_available',
+    current_version: '2.0.0',
+    current_commit: '1111111',
+    current_build_unix: 1794466125,
     latest_version: '2.0.0',
     latest_commit: '2222222',
-    notes: 'feat: hot update',
-    built_at: '2026-11-12T08:00:00Z'
+    latest_build_unix: 1794474325,
+    same_version: true,
+    notes: 'feat(desktop): add luminous breathing orb'
   });
-  assert.equal(avail.canHotUpdate, true);
-  assert.match(avail.body, /2222222/);
-  assert.ok(!avail.body.includes('—'));
+  assert.equal(maintenance.canHotUpdate, true);
+  assert.match(maintenance.body, /维护更新/);
+  assert.match(maintenance.body, /常规维护与稳定性改进/);
+  assert.ok(maintenance.body.includes(formatBuildTime(1794474325)));
+  assert.doesNotMatch(maintenance.body, HIDDEN_DEV_DETAILS);
 
-  const upToDatePending = formatUpdateCheckReport({
+  const pending = formatUpdateCheckReport({
     status: 'up_to_date',
-    repo: 'Javaispythonsb/claude-envguard',
     current_version: '2.0.0',
     current_commit: '2222222',
     ci_building: true,
     ci_head_commit: '3333333',
     ci_head_title: 'fix: polish'
   });
-  assert.equal(upToDatePending.canHotUpdate, false);
-  assert.match(upToDatePending.body, /3333333/);
+  assert.equal(pending.canHotUpdate, false);
+  assert.match(pending.body, /正在发布/);
+  assert.doesNotMatch(pending.body, HIDDEN_DEV_DETAILS);
 
-  const building = formatUpdateCheckReport({
-    status: 'building',
-    repo: 'Javaispythonsb/claude-envguard',
-    current_version: '2.0.0',
-    current_commit: '2222222',
-    latest_commit: '3333333'
-  });
+  const building = formatUpdateCheckReport({ status: 'building', current_version: '2.0.0', latest_commit: '3333333' });
   assert.equal(building.canHotUpdate, false);
-  assert.match(building.title, /编译中/);
+  assert.match(building.title, /发布中/);
+  assert.doesNotMatch(building.body, HIDDEN_DEV_DETAILS);
+
+  for (const r of [newer, maintenance, pending, building]) {
+    assert.ok(!r.body.includes('—') && !r.title.includes('—'));
+  }
+});
+
+test('plainReleaseNote 与 describeUpdateProgress', () => {
+  assert.equal(plainReleaseNote('feat(desktop): add orb'), '常规维护与稳定性改进');
+  assert.equal(plainReleaseNote(''), '常规维护与稳定性改进');
+  assert.equal(plainReleaseNote('  修复  拖动 '), '修复 拖动');
+  assert.equal(formatBuildTime(0), '');
+
+  assert.deepEqual(describeUpdateProgress('download', 42, 10), { label: '下载更新包', percent: 42 });
+  assert.equal(describeUpdateProgress('verify', 30, 60).percent, 60, '进度条不能倒退');
+  assert.equal(describeUpdateProgress('restart', 180, 0).percent, 100);
+  assert.equal(describeUpdateProgress('unknown-stage', 5).label, '正在更新');
 });
 
 test('悬浮球舞台几何缓冲、待机/游戏模式文案与碰撞弹性形变计算', () => {

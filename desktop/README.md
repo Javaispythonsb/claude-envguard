@@ -1,4 +1,4 @@
-# Claude 环境卫士 · EnvGuard (v2.0)
+# Claude 环境卫士 · EnvGuard (v2.1)
 
 双端一体工程（基于 Vite + Tauri v2 + PowerShell 安全引擎）：
 
@@ -7,7 +7,14 @@
   - **时区与区域格式交由开关控制**：在「护盾与设置」中开启时严格核验并随「一键修复」自动同步（收工点「退出护盾」按快照还原）；关闭时如实显示 `[SKIP]`，且「一键修复 / 重锁地区」保留本机系统时钟与日常日期数字格式不作修改。
   - 「退出护盾」需 5 秒内二次确认：先关闭 Claude 桌面版与所有 Claude Code CLI（含 npm/bun 版），任一未退出则不撤防。
 - **浏览器侧自检页（静态 Web / PWA）**：评估当前设备浏览器的 **5 项防漏信号**（出口 IP 归属、浏览器时区与 UTC 偏移、WebRTC 候选含 IPv6、IPv6 双栈暴露、经 ipleak.net 查验实际 DNS 解析器归属）与 **1 项硬件渲染摘要**（WebGL/Canvas，仅作参考不计入泄漏计数）；不替代桌面端 14 项进程与系统级审计。
-- **GitHub 一键热更新**：推送至 `main` 分支后，GitHub Actions 自动跑通三端测试并发布带 `SHA256SUMS-release.txt` 与 `BUILD_INFO.json` 的 `latest` Release；桌面端在「工具 → 检查更新」中可直接拉取最新构建、核验 SHA-256、保留本机配置后原地热替换可执行文件与脚本并自动重启。
+- **悬浮球（待机形态选「陶瓷盾球」时）**：鼠标停在球上约 0.4 秒或单击即展开为胶囊；按住可拖动，窗口本身跟随光标移动，系统关闭「拖动时显示窗口内容」时也不会出现黑色线框。双击进入重力球：可抓起甩出、快速划过颠球、单击弹起；再次双击、点右上角关闭按钮、右键或在球附近按 Esc 都会让球飞回原位，静置约 45 秒也会自动归位。单击、双击、按住与拖动由 Rust 侧轮询按键统一判定，不依赖网页的点击计数。
+- **GitHub 一键热更新**：推送至 `main` 分支后，GitHub Actions 自动跑通三端测试并发布带 `SHA256SUMS-release.txt` 与 `BUILD_INFO.json` 的 `latest` Release；桌面端在「工具 → 检查更新」中可直接拉取最新构建、核验 SHA-256、保留本机配置后原地热替换可执行文件与脚本并自动重启，更新过程显示分阶段进度条。检查结果只显示版本号与中文更新说明，不显示提交哈希、提交标题或仓库地址。
+
+### 发版约定
+
+- 面向用户的版本要同时修改四处版本号：`VERSION`、`desktop/package.json`、`desktop/src-tauri/tauri.conf.json`、`desktop/src-tauri/Cargo.toml`（CI 会检查四者一致）。本地版本取自 `tauri.conf.json`，远端比对取自 `VERSION`，两边不一致会让客户端误判更新状态。
+- 更新说明写在仓库根目录 `RELEASE_NOTES.json` 的 `notes` 字段，用中文写给用户看，`version` 必须与本次版本号相同；不相同时 CI 会改用固定文案「常规维护与稳定性改进」。
+- 不改版本号直接推送也会发布一次「维护更新」，客户端用构建时间区分新旧。
 
 ---
 
@@ -17,8 +24,8 @@
 
 ```text
 desktop\src-tauri\target\release\claude-envguard.exe                                  # 免安装，直接双击运行
-desktop\src-tauri\target\release\bundle\nsis\Claude 环境卫士_2.0.0_x64-setup.exe     # NSIS 安装包
-desktop\src-tauri\target\release\bundle\msi\Claude 环境卫士_2.0.0_x64_zh-CN.msi      # MSI 安装包
+desktop\src-tauri\target\release\bundle\nsis\Claude 环境卫士_2.1.0_x64-setup.exe     # NSIS 安装包
+desktop\src-tauri\target\release\bundle\msi\Claude 环境卫士_2.1.0_x64_zh-CN.msi      # MSI 安装包
 ```
 
 > 安全说明：发布版只执行随包的 `resources\claude-switch.ps1`（打包时直接取自仓库 `windows\`，不再另存副本）。它只读继承本机已有 `%USERPROFILE%\.claude-switcher\claude-switch.ps1` 的 5 项锁定配置，新增的客户端/地区设置写入 `envguard-config.json`，检查策略写入 `checks.json`，不会覆盖旧版脚本或触碰账号目录。只有调试构建（`pnpm tauri dev`）才会改用工作区 `windows\claude-switch.ps1` 或环境变量 `ENVGUARD_CORE_SCRIPT` 指定的脚本。
@@ -58,7 +65,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests\run-windows-tests.ps1
 # 手机自检判定逻辑（Node 自带测试运行器）
 pnpm --dir desktop test
 
-# Rust 命令桥白名单单测
+# Rust 命令桥白名单、窗口停靠几何、悬浮球手势状态机与重力物理单测
 cargo test --manifest-path desktop\src-tauri\Cargo.toml
 ```
 

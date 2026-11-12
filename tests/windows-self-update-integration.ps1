@@ -10,7 +10,7 @@ if (-not (Test-Path -LiteralPath $core)) { throw "找不到脚本: $core" }
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ('cs-selfupdate-it-' + [guid]::NewGuid().ToString('N'))
 $savedEnv = @{}
-foreach ($name in @('USERPROFILE', 'ENVGUARD_STATE_DIR', 'ENVGUARD_APP_VERSION', 'ENVGUARD_APP_COMMIT', 'ENVGUARD_APP_COMMIT_UNIX', 'ENVGUARD_GITHUB_REPO', 'TEMP', 'TMP')) {
+foreach ($name in @('USERPROFILE', 'ENVGUARD_STATE_DIR', 'ENVGUARD_APP_VERSION', 'ENVGUARD_APP_COMMIT', 'ENVGUARD_APP_COMMIT_UNIX', 'ENVGUARD_GITHUB_REPO', 'ENVGUARD_PROGRESS', 'TEMP', 'TMP')) {
     $savedEnv[$name] = [Environment]::GetEnvironmentVariable($name)
 }
 
@@ -156,6 +156,34 @@ try {
         (Get-ScriptConfigValue $updatedText 'LOCALE_TARGET') -eq 'ja-JP' -and
         (Get-ScriptConfigValue $updatedText 'PROXY_GROUP') -eq 'MyHomeISP'
     )
+    Assert '暂存结果文案只含版本号，不含提交哈希' ($okOut -match 'v2\.1\.0' -and $okOut -notmatch '2222222')
+
+    # 4. 进度输出：开启 ENVGUARD_PROGRESS 时流式下载逐步报告百分比，且进度行只走控制台、不进管道
+    $env:ENVGUARD_PROGRESS = '1'
+    $progressSink = New-Object System.IO.StringWriter
+    $savedOut = [Console]::Out
+    try {
+        [Console]::SetOut($progressSink)
+        $streamCopy = Join-Path $root 'streamed.zip'
+        $piped = @(Save-EnvGuardAsset ([Uri]$mockZip).AbsoluteUri $streamCopy 30 'download' 6 75)
+    } finally {
+        [Console]::SetOut($savedOut)
+        $env:ENVGUARD_PROGRESS = $null
+    }
+    $progressLines = @($progressSink.ToString() -split "`r?`n" | Where-Object { $_ -match '^PROGRESS:download:\d+$' })
+    $pcts = @($progressLines | ForEach-Object { [int]($_ -replace '^PROGRESS:download:', '') })
+    Assert '流式下载产物与源文件哈希一致' ((Get-FileHash -LiteralPath $streamCopy -Algorithm SHA256).Hash.ToLowerInvariant() -eq $realHash)
+    Assert '进度从下载区间起点附近递增到终点 75' ($pcts.Count -ge 2 -and $pcts[-1] -eq 75 -and $pcts[0] -ge 6) "pcts=$($pcts -join ',')"
+    $monotonic = $true
+    for ($i = 1; $i -lt $pcts.Count; $i++) { if ($pcts[$i] -lt $pcts[$i - 1]) { $monotonic = $false } }
+    Assert '进度百分比单调不减' $monotonic
+    Assert '进度行不进入函数输出管道' ($piped.Count -eq 0) "piped=$($piped -join '|')"
+
+    # 5. 发布说明：英文提交标题不展示给用户，中文说明原样保留
+    Assert '英文提交标题替换为固定中文说明' ((ConvertTo-EnvGuardReleaseNote 'feat(desktop): add orb') -eq '常规维护与稳定性改进')
+    Assert '中文发布说明原样保留' ((ConvertTo-EnvGuardReleaseNote '  修复悬浮球拖动  ') -eq '修复悬浮球拖动')
+    $cmpMsg = Compare-EnvGuardBuild $localSame $remoteB $null
+    Assert '同版本维护更新的提示不含提交哈希' ($cmpMsg.message -notmatch '2222222' -and $cmpMsg.message -match 'v2\.0\.0') "msg=$($cmpMsg.message)"
 } finally {
     foreach ($k in $savedEnv.Keys) {
         [Environment]::SetEnvironmentVariable($k, $savedEnv[$k])

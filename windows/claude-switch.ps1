@@ -108,7 +108,8 @@ function Find-ClaudeDataPath {
     if ($msix) { return $msix }
     return $legacy
 }
-$DATA = Find-ClaudeDataPath
+# 检查与暂存热更新用不到 Claude 数据目录,跳过 Get-AppxPackage 这类较慢的探测
+$DATA = if ($args.Count -gt 0 -and [string]$args[0] -in @('check-app-update', 'stage-app-update')) { Join-Path $env:APPDATA 'Claude' } else { Find-ClaudeDataPath }
 $LOG  = Join-Path $BASE "claude-switch.log"
 $CLIENT_LOG = Join-Path $BASE "logs\client.log"
 $CHECK_CONFIG = Join-Path $BASE "checks.json"
@@ -3291,54 +3292,63 @@ function Compare-EnvGuardBuild($localMeta, $remoteManifest, $atomHead = $null) {
         $ciHeadTitle = [string]$atomHead.title
     }
 
+    # 面向用户的文案只说版本号;提交哈希、提交标题和仓库地址仍留在字段里供比对与诊断
     $msg = switch ($status) {
         'update_available' {
-            "发现 GitHub 新版本 v$rVer ($rShort)，可一键校验并热更新重启"
+            if ($verCmp -gt 0) { "发现新版本 v$rVer" } else { "发现 v$rVer 的维护更新" }
         }
-        'ahead' {
-            if ($ciBuilding -and $atomHead.commit -eq $localMeta.commit) {
-                "当前已是最新提交 ($($localMeta.short_commit))，云端 Release ($rShort) 正在由 GitHub Actions 编译同步中"
-            } else {
-                "当前本地版本 v$($localMeta.version) ($($localMeta.short_commit)) 新于云端构建 v$rVer ($rShort)"
-            }
-        }
+        'ahead' { "当前已是最新版本 v$($localMeta.version)" }
         default {
             if ($ciBuilding) {
-                "当前运行 v$($localMeta.version) ($($localMeta.short_commit))；检测到 main 新提交 $ciHeadShort 正在云端打包，稍后可拉取"
+                "当前已是最新版本 v$($localMeta.version)，新版本正在发布，稍后可再检查"
             } else {
-                "当前已是 GitHub 最新版本 v$($localMeta.version) ($($localMeta.short_commit))"
+                "当前已是最新版本 v$($localMeta.version)"
             }
         }
     }
 
     return [ordered]@{
-        status           = $status
-        repo             = $ENVGUARD_REPO
-        current_version  = $localMeta.version
-        current_commit   = $localMeta.short_commit
-        latest_version   = $rVer
-        latest_commit    = $rShort
-        latest_full_sha  = $rSha
-        built_at         = $builtAt
-        notes            = $notes
-        ci_building      = $ciBuilding
-        ci_head_commit   = $ciHeadShort
-        ci_head_title    = $ciHeadTitle
-        zip_url          = $zipUrl
-        sums_url         = $sumsUrl
-        page_url         = $pageUrl
-        message          = $msg
+        status            = $status
+        repo              = $ENVGUARD_REPO
+        current_version   = $localMeta.version
+        current_commit    = $localMeta.short_commit
+        current_build_unix = [int64]$localMeta.commit_unix
+        latest_version    = $rVer
+        latest_commit     = $rShort
+        latest_full_sha   = $rSha
+        latest_build_unix = $rUnix
+        same_version      = ($verCmp -eq 0)
+        built_at          = $builtAt
+        notes             = (ConvertTo-EnvGuardReleaseNote $notes)
+        ci_building       = $ciBuilding
+        ci_head_commit    = $ciHeadShort
+        ci_head_title     = $ciHeadTitle
+        zip_url           = $zipUrl
+        sums_url          = $sumsUrl
+        page_url          = $pageUrl
+        message           = $msg
     }
 }
 
-function Get-EnvGuardUpdateState {
+# 发布说明只展示给用户看的中文描述。旧构建的 notes 是英文提交标题(如 feat(desktop): ...),
+# 不含中文时统一换成固定说明,避免把开发者文案原样推给用户。
+function ConvertTo-EnvGuardReleaseNote([string]$Raw) {
+    $text = ([string]$Raw -replace '\s+', ' ').Trim()
+    if (-not $text -or $text -notmatch '[\u4e00-\u9fff]') { return '常规维护与稳定性改进' }
+    if ($text.Length -gt 160) { $text = $text.Substring(0, 160).TrimEnd() + '…' }
+    return $text
+}
+
+function Get-EnvGuardUpdateState([switch]$SkipAtom) {
     $localMeta = Get-LocalBuildMeta
-    $atomHead = Get-EnvGuardMainAtomHead
+    # 提交订阅只用来提示「云端正在打包」;热更新暂存时用不到,省掉一次跨境请求
+    $atomHead = if ($SkipAtom) { $null } else { Get-EnvGuardMainAtomHead }
     try {
         $manifest = Get-EnvGuardRemoteManifest
         return (Compare-EnvGuardBuild $localMeta $manifest $atomHead)
     } catch {
         $rawErr = ([string]$_.Exception.Message) -replace '\r?\n', ' '
+        if ($rawErr -match '404' -and -not $atomHead -and $SkipAtom) { $atomHead = Get-EnvGuardMainAtomHead }
         if ($rawErr -match '404' -and $atomHead) {
             return [ordered]@{
                 status          = 'building'
@@ -3349,14 +3359,14 @@ function Get-EnvGuardUpdateState {
                 latest_commit   = $atomHead.short_commit
                 latest_full_sha = $atomHead.commit
                 built_at        = ''
-                notes           = $atomHead.title
+                notes           = ''
                 ci_building     = $true
                 ci_head_commit  = $atomHead.short_commit
                 ci_head_title   = $atomHead.title
                 zip_url         = ''
                 sums_url        = ''
                 page_url        = "https://github.com/$ENVGUARD_REPO/actions"
-                message         = "仓库最新提交 ($($atomHead.short_commit)) 正在由 GitHub Actions 首次打包发布，请约 1~2 分钟后再试"
+                message         = '新版本正在发布，请过 1 到 2 分钟再检查'
             }
         }
         return [ordered]@{
@@ -3375,12 +3385,14 @@ function Get-EnvGuardUpdateState {
             zip_url         = ''
             sums_url        = ''
             page_url        = "https://github.com/$ENVGUARD_REPO/releases"
-            message         = "检查 GitHub 更新失败: $rawErr"
+            message         = '检查更新失败，请确认网络可以访问 GitHub 后重试'
+            error_detail    = $rawErr
         }
     }
 }
 
 function Invoke-CheckAppUpdate {
+    $ProgressPreference = 'SilentlyContinue'
     $st = Get-EnvGuardUpdateState
     if ($st.status -eq 'error') { $script:exitCode = 1 }
     ([pscustomobject]$st) | ConvertTo-Json -Depth 4 -Compress
@@ -3389,6 +3401,59 @@ function Invoke-CheckAppUpdate {
 function Write-Utf8BomLf([string]$Path, [string]$Text) {
     $normalized = ($Text -replace "`r`n", "`n") -replace "`r", "`n"
     [System.IO.File]::WriteAllText($Path, $normalized, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+# 热更新进度:仅当宿主设置 ENVGUARD_PROGRESS=1 时,直接写控制台并立即刷新,
+# 让宿主边读边显示。只写 ASCII,且不进管道,函数自身的 OK:/FAIL: 输出不受影响。
+function Write-UpdateProgress([string]$Stage, [int]$Percent) {
+    if ($env:ENVGUARD_PROGRESS -ne '1') { return }
+    try {
+        [Console]::Out.WriteLine("PROGRESS:${Stage}:$([Math]::Max(0, [Math]::Min(100, $Percent)))")
+        [Console]::Out.Flush()
+    } catch {}
+}
+
+# 下载更新资产。需要进度时按 64 KB 分块流式读取并按字节换算百分比;否则走 Invoke-WebRequest。
+function Save-EnvGuardAsset([string]$Uri, [string]$OutFile, [int]$TimeoutSec, [string]$Stage, [int]$From, [int]$To) {
+    if ($env:ENVGUARD_PROGRESS -ne '1') {
+        Invoke-WebRequest -Uri $Uri -UserAgent 'ClaudeEnvGuard/2.0' -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+        return
+    }
+    $req = [Net.WebRequest]::Create($Uri)
+    $req.Timeout = $TimeoutSec * 1000
+    if ($req -is [Net.HttpWebRequest]) {
+        $req.UserAgent = 'ClaudeEnvGuard/2.0'
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.AllowAutoRedirect = $true
+    }
+    $resp = $req.GetResponse()
+    try {
+        $total = [int64]$resp.ContentLength
+        $src = $resp.GetResponseStream()
+        $dst = [System.IO.File]::Create($OutFile)
+        try {
+            $buffer = New-Object byte[] 65536
+            $done = [int64]0
+            $lastPct = -1
+            while (($n = $src.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $dst.Write($buffer, 0, $n)
+                $done += $n
+                if ($total -gt 0) {
+                    $pct = $From + [int][Math]::Floor(($To - $From) * $done / $total)
+                    if ($pct -ne $lastPct) {
+                        Write-UpdateProgress $Stage $pct
+                        $lastPct = $pct
+                    }
+                }
+            }
+        } finally {
+            $dst.Dispose()
+            $src.Dispose()
+        }
+    } finally {
+        $resp.Close()
+    }
+    Write-UpdateProgress $Stage $To
 }
 
 function Invoke-StageAppUpdate([string]$TargetAppDir) {
@@ -3410,7 +3475,10 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
         return
     }
 
-    $state = Get-EnvGuardUpdateState
+    # Windows PowerShell 5.1 的进度条渲染会把下载和哈希计算拖慢数倍
+    $ProgressPreference = 'SilentlyContinue'
+    Write-UpdateProgress 'prepare' 2
+    $state = Get-EnvGuardUpdateState -SkipAtom
     if ($state.status -ne 'update_available') {
         if ($state.status -eq 'error') {
             $script:exitCode = 1
@@ -3444,9 +3512,11 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
         $sumsPath = Join-Path $tmp 'SHA256SUMS-release.txt'
 
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $zipUrl -UserAgent 'ClaudeEnvGuard/2.0' -OutFile $zipPath -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
-        Invoke-WebRequest -Uri $sumsUrl -UserAgent 'ClaudeEnvGuard/2.0' -OutFile $sumsPath -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        Write-UpdateProgress 'download' 5
+        Save-EnvGuardAsset $sumsUrl $sumsPath 30 'download' 5 6
+        Save-EnvGuardAsset $zipUrl $zipPath 120 'download' 6 75
 
+        Write-UpdateProgress 'verify' 76
         $expectedHash = $null
         foreach ($line in Get-Content -LiteralPath $sumsPath -Encoding UTF8 -ErrorAction Stop) {
             if ($line -match '^([0-9A-Fa-f]{64})\s+\*?(.+?)\s*$') {
@@ -3461,8 +3531,10 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
         $actualHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
         if ($actualHash -ne $expectedHash) { throw '更新包 SHA-256 哈希校验不匹配，已拒绝安装' }
 
+        Write-UpdateProgress 'extract' 80
         $extract = Join-Path $tmp 'extract'
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $extract -Force -ErrorAction Stop
+        # 直接用 .NET 解压:Expand-Archive 要加载脚本模块并逐条渲染进度,明显更慢
+        Expand-SnapshotArchive $zipPath $extract
 
         $newExe = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-envguard.exe' -File -ErrorAction Stop | Select-Object -First 1
         $newCore = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-switch.ps1' -File -ErrorAction Stop | Select-Object -First 1
@@ -3488,6 +3560,7 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
             }
         }
 
+        Write-UpdateProgress 'install' 88
         New-Item -ItemType Directory -Force -Path $backupDir -ErrorAction Stop | Out-Null
         foreach ($fn in @('claude-switch.ps1', 'claude-bodyguard.ps1', 'version.txt', 'build-info.json')) {
             $p = Join-Path $BASE $fn
@@ -3510,8 +3583,8 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
 
         if ($task) { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue }
 
-        # 1) 暂存新版可执行文件 claude-envguard.exe.new 供 Rust 宿主原子替换
-        Copy-Item -LiteralPath $newExe.FullName -Destination $stagedExe -Force -ErrorAction Stop
+        # 1) 暂存新版可执行文件 claude-envguard.exe.new 供 Rust 宿主原子替换(从临时解压目录移动,少写一遍)
+        Move-Item -LiteralPath $newExe.FullName -Destination $stagedExe -Force -ErrorAction Stop
 
         # 2) 更新应用旁随包 resources 目录下的脚本（严格保持 UTF-8 with BOM + LF）
         New-Item -ItemType Directory -Force -Path $appResDir -ErrorAction Stop | Out-Null
@@ -3529,13 +3602,15 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
             version      = [string]$state.latest_version
             commit       = [string]$state.latest_full_sha
             short_commit = [string]$state.latest_commit
+            commit_unix  = [int64]$state.latest_build_unix
             built_at     = [string]$state.built_at
         } | ConvertTo-Json -Compress)
         [System.IO.File]::WriteAllText((Join-Path $BASE 'build-info.json'), $buildMetaJson, (New-Object System.Text.UTF8Encoding($false)))
 
         if ($task) { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop }
 
-        "OK:已通过 SHA-256 校验并准备就绪 v$($state.latest_version) ($($state.latest_commit))，正在热替换重启"
+        Write-UpdateProgress 'install' 96
+        "OK:已通过完整性校验，v$($state.latest_version) 准备就绪，正在重启"
     } catch {
         $errReason = ([string]$_.Exception.Message) -replace '\r?\n', ' '
         Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue

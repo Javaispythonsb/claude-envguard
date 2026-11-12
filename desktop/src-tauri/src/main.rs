@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -116,6 +116,39 @@ struct OrbFxPayload {
     impact_axis: Option<&'static str>,
     impact_speed: f64,
     combo: u32,
+    charge: bool,
+}
+
+impl OrbFxPayload {
+    fn reset() -> Self {
+        Self {
+            angle: 0.0,
+            impact_axis: None,
+            impact_speed: 0.0,
+            combo: 0,
+            charge: false,
+        }
+    }
+
+    fn charge(angle: f64, combo: u32) -> Self {
+        Self {
+            angle,
+            impact_axis: None,
+            impact_speed: 0.0,
+            combo,
+            charge: true,
+        }
+    }
+
+    fn impact(angle: f64, combo: u32, hit: Option<ImpactEvent>) -> Self {
+        Self {
+            angle,
+            impact_axis: hit.map(|h| h.axis),
+            impact_speed: hit.map_or(0.0, |h| h.normal_speed),
+            combo,
+            charge: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -219,8 +252,20 @@ impl Default for OrbPhysics {
     }
 }
 
+/// A primary-button press that began on the ball. The watcher thread owns the rest of the
+/// gesture: it decides between tap, double press, hold and drag by polling the button.
+#[derive(Clone, Copy, Debug)]
+struct OrbPress {
+    started: Instant,
+    press_cursor: (i32, i32),
+    grab_offset: (i32, i32),
+    moved: bool,
+}
+
 struct DockInner {
     epoch: Instant,
+    hwnd: isize,
+    scale: f64,
     edge: DockEdge,
     standby_mode: StandbyMode,
     dock_x: i32,
@@ -242,11 +287,20 @@ struct DockInner {
     last_kick_at: Instant,
     last_cursor: Option<(Instant, f64, f64)>,
     last_emitted_angle: f64,
+    orb_press: Option<OrbPress>,
+    press_consumed: bool,
+    pending_tap: Option<Instant>,
+    toggle_lock_until: Instant,
+    kick_block_until: Instant,
+    last_play_interaction: Instant,
+    play_exited_at: Option<Instant>,
+    escape_was_down: bool,
     orb_hover_armed: bool,
     orb_hover_since: Option<Instant>,
     orb_expand_suppress_until: Instant,
     pre_play_orb_pos: Option<(i32, i32)>,
     pre_play_standby: Option<StandbyMode>,
+    pre_play_work_area: Option<WorkRect>,
     pending_orb_return: Option<(i32, i32)>,
     seam_mode: bool,
     idle: bool,
@@ -269,6 +323,8 @@ impl DockInner {
         let now = Instant::now();
         Self {
             epoch: now,
+            hwnd: 0,
+            scale: 1.0,
             edge: DockEdge::Top,
             standby_mode: StandbyMode::Edge,
             dock_x: 0,
@@ -295,11 +351,20 @@ impl DockInner {
             last_kick_at: now,
             last_cursor: None,
             last_emitted_angle: 0.0,
+            orb_press: None,
+            press_consumed: false,
+            pending_tap: None,
+            toggle_lock_until: now,
+            kick_block_until: now,
+            last_play_interaction: now,
+            play_exited_at: None,
+            escape_was_down: false,
             orb_hover_armed: true,
             orb_hover_since: None,
             orb_expand_suppress_until: now,
             pre_play_orb_pos: None,
             pre_play_standby: None,
+            pre_play_work_area: None,
             pending_orb_return: None,
             seam_mode: false,
             idle: false,
@@ -346,6 +411,16 @@ impl DockInner {
 
 struct DockController {
     inner: Arc<Mutex<DockInner>>,
+    waker: Arc<OnceLock<std::thread::Thread>>,
+}
+
+impl DockController {
+    /// Wakes the watcher thread right away instead of waiting for its next poll.
+    fn wake(&self) {
+        if let Some(thread) = self.waker.get() {
+            thread.unpark();
+        }
+    }
 }
 
 struct BusyLease {
@@ -558,6 +633,99 @@ fn execute_core_blocking(
     Ok(CommandOutcome {
         output: combined,
         exit_code: out.status.code().unwrap_or(1),
+    })
+}
+
+/// Splits one line of script output into a progress report, if it is one.
+/// The script writes `PROGRESS:<stage>:<percent>` lines while it works.
+fn parse_progress_line(line: &str) -> Option<(String, u32)> {
+    let rest = line.trim().strip_prefix("PROGRESS:")?;
+    let (stage, pct) = rest.rsplit_once(':')?;
+    if stage.is_empty() || !stage.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let pct: u32 = pct.trim().parse().ok()?;
+    Some((stage.to_string(), pct.min(100)))
+}
+
+/// Like `execute_core_blocking`, but reads stdout line by line while the script runs and
+/// hands progress lines to `on_progress` instead of keeping them in the output.
+fn execute_core_streaming(
+    script: PathBuf,
+    args: Vec<String>,
+    app_version: String,
+    mut on_progress: impl FnMut(&str, u32),
+) -> Result<CommandOutcome, String> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .args(&args)
+        .env("ENVGUARD_APP_VERSION", app_version)
+        .env("ENVGUARD_APP_COMMIT", env!("ENVGUARD_GIT_SHA"))
+        .env("ENVGUARD_APP_COMMIT_UNIX", env!("ENVGUARD_GIT_COMMIT_UNIX"))
+        .env("ENVGUARD_PROGRESS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法启动 PowerShell 核心引擎: {e}"))?;
+
+    // stderr is drained on its own thread so a full stderr pipe can never stall the script
+    // while this thread is blocked reading stdout.
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let mut kept = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let mut reader = BufReader::new(out);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
+                    if let Some((stage, pct)) = parse_progress_line(&text) {
+                        on_progress(&stage, pct);
+                    } else {
+                        kept.extend_from_slice(&line);
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待核心引擎返回失败: {e}"))?;
+    let err_bytes = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    let stdout = String::from_utf8_lossy(&kept);
+    let stderr = String::from_utf8_lossy(&err_bytes);
+    let combined = if stderr.trim().is_empty() {
+        stdout.trim().to_string()
+    } else if stdout.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    Ok(CommandOutcome {
+        output: combined,
+        exit_code: status.code().unwrap_or(1),
     })
 }
 
@@ -804,18 +972,31 @@ async fn apply_app_update(
         .ok_or_else(|| "无法定位当前程序所在目录".to_string())?
         .to_path_buf();
 
-    let outcome = run_core_async(
-        &app,
-        vec![
-            "stage-app-update".to_string(),
-            exe_dir.to_string_lossy().into_owned(),
-        ],
-    )
-    .await?;
+    let script = resolve_core_script(&app)?;
+    let app_version = app.package_info().version.to_string();
+    let args = vec![
+        "stage-app-update".to_string(),
+        exe_dir.to_string_lossy().into_owned(),
+    ];
+    let progress_app = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        execute_core_streaming(script, args, app_version, |stage, pct| {
+            let _ = progress_app.emit(
+                "app-update-progress",
+                serde_json::json!({ "stage": stage, "percent": pct }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("后台任务执行异常: {e}"))??;
 
     if outcome.exit_code != 0 {
         return Ok(outcome);
     }
+    let _ = app.emit(
+        "app-update-progress",
+        serde_json::json!({ "stage": "swap", "percent": 98 }),
+    );
 
     let staged_exe = exe_dir.join("claude-envguard.exe.new");
     if !staged_exe.is_file() {
@@ -861,6 +1042,10 @@ async fn apply_app_update(
         let _ = std::fs::rename(&old_exe, &current_exe);
         return Err(format!("启动热更新重启助手失败(已回滚): {e}"));
     }
+    let _ = app.emit(
+        "app-update-progress",
+        serde_json::json!({ "stage": "restart", "percent": 100 }),
+    );
 
     let quitting_flag = Arc::clone(&guard.quitting);
     let app_for_exit = app.clone();
@@ -873,30 +1058,233 @@ async fn apply_app_update(
     Ok(outcome)
 }
 
+/// Direct Win32 reads and moves. The watcher thread ticks every few milliseconds and often
+/// holds the dock mutex, so it must not go through Tauri window getters: those round-trip
+/// to the UI thread, and the UI thread takes the same mutex in the Moved handler and in
+/// commands, which can deadlock.
 #[cfg(target_os = "windows")]
-fn is_primary_mouse_down() -> bool {
+mod native {
+    use super::WorkRect;
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        dw_flags: u32,
+    }
+
     #[link(name = "user32")]
     extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+        fn SetWindowPos(
+            hwnd: *mut c_void,
+            insert_after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
         fn GetAsyncKeyState(vkey: i32) -> i16;
         fn GetSystemMetrics(index: i32) -> i32;
+        fn GetDoubleClickTime() -> u32;
     }
+
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const MONITOR_DEFAULTTONULL: u32 = 0;
+    const MONITOR_DEFAULTTONEAREST: u32 = 2;
     const VK_LBUTTON: i32 = 0x01;
     const VK_RBUTTON: i32 = 0x02;
+    const VK_ESCAPE: i32 = 0x1B;
     const SM_SWAPBUTTON: i32 = 23;
-    // SAFETY: Stateless Win32 queries safe to call from any thread.
-    unsafe {
-        let vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
-            VK_RBUTTON
+
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        let mut p = Point::default();
+        // SAFETY: GetCursorPos only writes into the POINT we pass.
+        if unsafe { GetCursorPos(&mut p) } != 0 {
+            Some((p.x, p.y))
         } else {
-            VK_LBUTTON
-        };
-        (GetAsyncKeyState(vk) as u16 & 0x8000) != 0
+            None
+        }
+    }
+
+    pub fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+        if hwnd == 0 {
+            return None;
+        }
+        let mut r = Rect::default();
+        // SAFETY: GetWindowRect only writes into the RECT we pass; a stale handle just fails.
+        if unsafe { GetWindowRect(hwnd as *mut c_void, &mut r) } != 0 {
+            Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        } else {
+            None
+        }
+    }
+
+    pub fn is_visible(hwnd: isize) -> Option<bool> {
+        if hwnd == 0 {
+            return None;
+        }
+        // SAFETY: Stateless query on a window handle.
+        Some(unsafe { IsWindowVisible(hwnd as *mut c_void) } != 0)
+    }
+
+    pub fn work_rect_at(x: i32, y: i32) -> Option<WorkRect> {
+        // SAFETY: MonitorFromPoint and GetMonitorInfoW are thread-safe and only write into
+        // the MONITORINFO we pass, whose cbSize is set.
+        unsafe {
+            let monitor = MonitorFromPoint(Point { x, y }, MONITOR_DEFAULTTONEAREST);
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: Rect::default(),
+                rc_work: Rect::default(),
+                dw_flags: 0,
+            };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            let w = info.rc_work;
+            Some(WorkRect {
+                x: w.left,
+                y: w.top,
+                w: w.right - w.left,
+                h: w.bottom - w.top,
+            })
+        }
+    }
+
+    pub fn monitor_exists_at(x: i32, y: i32) -> bool {
+        // SAFETY: Stateless query.
+        !unsafe { MonitorFromPoint(Point { x, y }, MONITOR_DEFAULTTONULL) }.is_null()
+    }
+
+    /// Moves the window without resizing, re-ordering or activating it. Because the window
+    /// itself is moved every frame, Windows never draws its drag outline, whatever the
+    /// "show window contents while dragging" setting is.
+    pub fn set_pos(hwnd: isize, x: i32, y: i32) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        // SAFETY: SetWindowPos on our own top-level window.
+        unsafe {
+            SetWindowPos(
+                hwnd as *mut c_void,
+                std::ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        }
+    }
+
+    /// Sets position and size in one call so both land in the same frame.
+    pub fn set_rect(hwnd: isize, x: i32, y: i32, w: i32, h: i32) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        // SAFETY: SetWindowPos on our own top-level window.
+        unsafe {
+            SetWindowPos(
+                hwnd as *mut c_void,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w.max(1),
+                h.max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        }
+    }
+
+    fn key_down(vkey: i32) -> bool {
+        // SAFETY: Stateless query.
+        (unsafe { GetAsyncKeyState(vkey) } as u16 & 0x8000) != 0
+    }
+
+    pub fn primary_button_down() -> bool {
+        // SAFETY: Stateless query.
+        let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0;
+        key_down(if swapped { VK_RBUTTON } else { VK_LBUTTON })
+    }
+
+    pub fn escape_down() -> bool {
+        key_down(VK_ESCAPE)
+    }
+
+    pub fn double_click_ms() -> u32 {
+        // SAFETY: Stateless query.
+        unsafe { GetDoubleClickTime() }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+mod native {
+    use super::WorkRect;
+
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn window_rect(_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
+    pub fn is_visible(_hwnd: isize) -> Option<bool> {
+        None
+    }
+    pub fn work_rect_at(_x: i32, _y: i32) -> Option<WorkRect> {
+        None
+    }
+    pub fn monitor_exists_at(_x: i32, _y: i32) -> bool {
+        false
+    }
+    pub fn set_pos(_hwnd: isize, _x: i32, _y: i32) -> bool {
+        false
+    }
+    pub fn set_rect(_hwnd: isize, _x: i32, _y: i32, _w: i32, _h: i32) -> bool {
+        false
+    }
+    pub fn primary_button_down() -> bool {
+        false
+    }
+    pub fn escape_down() -> bool {
+        false
+    }
+    pub fn double_click_ms() -> u32 {
+        500
+    }
+}
+
 fn is_primary_mouse_down() -> bool {
-    false
+    native::primary_button_down()
 }
 
 const PEEK_LOGICAL_PX: f64 = 9.0;
@@ -906,7 +1294,93 @@ const POD_BASE_HEIGHT_LOGICAL_PX: f64 = 64.0;
 const ORB_SIZE_LOGICAL_PX: f64 = 72.0;
 const ORB_VISUAL_RADIUS_LOGICAL_PX: f64 = 28.0;
 const ORB_INSET_LOGICAL_PX: f64 = 8.0;
-const ORB_HOVER_EXPAND_MS: u64 = 260;
+
+/// Hovering has to last this long, with the cursor not sweeping through, before the ball
+/// opens into the capsule. Long enough that someone who came to press or double-click the
+/// ball normally gets there first.
+const ORB_HOVER_EXPAND_MS: u64 = 380;
+const ORB_HOVER_MAX_SPEED_LOGICAL: f64 = 520.0;
+const ORB_DRAG_SLOP_LOGICAL_PX: f64 = 5.0;
+const ORB_TAP_MAX_MS: u64 = 300;
+const ORB_TOGGLE_LOCK_MS: u64 = 350;
+const ORB_KICK_BLOCK_AFTER_PRESS_MS: u64 = 400;
+/// A dropped ball only keeps sliding after a deliberate flick, never after a normal placement.
+const ORB_COAST_MIN_SPEED_LOGICAL: f64 = 1100.0;
+/// Cursor speeds needed to kick the ball. Ordinary pointing arrives well below these, so
+/// reaching for the ball to grab or close it does not knock it away.
+const ORB_KICK_MIN_SPEED_REST_LOGICAL: f64 = 1400.0;
+const ORB_KICK_MIN_SPEED_AIR_LOGICAL: f64 = 900.0;
+const ORB_PLAY_IDLE_RETURN_SECS: u64 = 45;
+const ORB_PLAY_IDLE_AFTER_KICK_SECS: u64 = 6;
+const ORB_PRESS_MAX_IPC_LAG_MS: f64 = 350.0;
+
+/// Pixel sizes derived from the current DPI scale.
+#[derive(Clone, Copy, Debug)]
+struct DockMetrics {
+    scale: f64,
+    peek: i32,
+    threshold: i32,
+    margin: i32,
+    orb_size: i32,
+    orb_inset: i32,
+    orb_radius: f64,
+    pod_w: i32,
+    pod_h: i32,
+}
+
+impl DockMetrics {
+    fn new(scale: f64) -> Self {
+        let scale = if scale.is_finite() && scale > 0.2 {
+            scale
+        } else {
+            1.0
+        };
+        let px = |logical: f64| (logical * scale).round() as i32;
+        Self {
+            scale,
+            peek: px(PEEK_LOGICAL_PX),
+            threshold: px(SNAP_THRESHOLD_LOGICAL_PX),
+            margin: px(8.0),
+            orb_size: px(ORB_SIZE_LOGICAL_PX),
+            orb_inset: px(ORB_INSET_LOGICAL_PX),
+            orb_radius: (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0),
+            pod_w: px(POD_WIDTH_LOGICAL_PX),
+            pod_h: px(POD_BASE_HEIGHT_LOGICAL_PX),
+        }
+    }
+}
+
+/// Monitor lookups the dock logic needs. Kept behind a trait so the decision code can be
+/// unit-tested without a desktop.
+trait MonitorProbe {
+    fn work_rect_at(&self, x: i32, y: i32) -> Option<WorkRect>;
+    fn exists_at(&self, x: i32, y: i32) -> bool;
+}
+
+struct NativeMonitors;
+
+impl MonitorProbe for NativeMonitors {
+    fn work_rect_at(&self, x: i32, y: i32) -> Option<WorkRect> {
+        native::work_rect_at(x, y)
+    }
+    fn exists_at(&self, x: i32, y: i32) -> bool {
+        native::monitor_exists_at(x, y)
+    }
+}
+
+/// How long after a tap a second press still counts as a double press. Derived from the
+/// system double-click time, which is measured press to press, so a bit more than half.
+fn double_press_window() -> Duration {
+    let system_ms = native::double_click_ms() as f64;
+    Duration::from_millis((system_ms * 0.55).clamp(240.0, 330.0) as u64)
+}
+
+fn unix_millis_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
 
 fn closest_point_on_segment(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> (f64, f64) {
     let abx = bx - ax;
@@ -951,13 +1425,11 @@ fn step_orb_gravity(
     let mut best_impact: Option<ImpactEvent> = None;
     let mut consider_impact = |axis: &'static str, raw_speed_phys: f64| {
         let norm_logical = raw_speed_phys / scale;
-        if norm_logical >= 95.0 {
-            if best_impact.map_or(true, |b| norm_logical > b.normal_speed) {
-                best_impact = Some(ImpactEvent {
-                    axis,
-                    normal_speed: norm_logical,
-                });
-            }
+        if norm_logical >= 95.0 && best_impact.map_or(true, |b| norm_logical > b.normal_speed) {
+            best_impact = Some(ImpactEvent {
+                axis,
+                normal_speed: norm_logical,
+            });
         }
     };
 
@@ -1044,9 +1516,9 @@ fn apply_cursor_kick(
 
     let on_floor = phys.sleeping || (phys.py >= bounds.max_y - 2.0 && phys.vy.abs() < 45.0 * scale);
     let min_kick_speed = if on_floor {
-        600.0 * scale
+        ORB_KICK_MIN_SPEED_REST_LOGICAL * scale
     } else {
-        310.0 * scale
+        ORB_KICK_MIN_SPEED_AIR_LOGICAL * scale
     };
     if cspeed < min_kick_speed {
         return None;
@@ -1056,7 +1528,8 @@ fn apply_cursor_kick(
     let bcy = phys.py + orb_size * 0.5;
     let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
 
-    // Require outside-in cursor strike so resting or wiggling cursor inside the ball never machine-gun kicks it
+    // Only a strike that comes from outside counts, so a cursor that is already resting on
+    // the ball cannot kick it by wiggling.
     let dist_prev = (prev_cur.0 - bcx).hypot(prev_cur.1 - bcy);
     if dist_prev < r * 0.84 {
         return None;
@@ -1094,6 +1567,44 @@ fn apply_cursor_kick(
         axis: if nx.abs() > ny.abs() { "x" } else { "y" },
         normal_speed: ((cspeed * 0.72) / scale).clamp(420.0, 2200.0),
     })
+}
+
+/// A single tap pops the ball upward, leaning away from the side that was tapped.
+fn apply_tap_bounce(phys: &mut OrbPhysics, cursor_x: f64, orb_size: f64, scale: f64) -> ImpactEvent {
+    let scale = scale.max(0.5);
+    let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
+    let ball_cx = phys.px + orb_size * 0.5;
+    let lean = ((ball_cx - cursor_x) / r).clamp(-1.0, 1.0);
+    phys.vx = (lean * 460.0 * scale).clamp(-2600.0 * scale, 2600.0 * scale);
+    phys.vy = -940.0 * scale;
+    phys.omega = (phys.vx / r) * 0.9;
+    phys.sleeping = false;
+    phys.combo = phys.combo.saturating_add(1);
+    ImpactEvent {
+        axis: "y",
+        normal_speed: 920.0,
+    }
+}
+
+/// Clamps one axis into [min, max] and reflects the velocity. Returns the impact speed.
+fn bounce_axis(pos: &mut f64, vel: &mut f64, min: f64, max: f64, restitution: f64) -> Option<f64> {
+    if *pos < min {
+        *pos = min;
+        let speed = vel.abs();
+        if *vel < 0.0 {
+            *vel = -*vel * restitution;
+        }
+        Some(speed)
+    } else if *pos > max {
+        *pos = max;
+        let speed = vel.abs();
+        if *vel > 0.0 {
+            *vel = -*vel * restitution;
+        }
+        Some(speed)
+    } else {
+        None
+    }
 }
 
 fn compute_visible_pod_pos(
@@ -1318,7 +1829,7 @@ fn is_cursor_in_pod(cx: i32, cy: i32, wx: i32, wy: i32, ww: i32, wh: i32, pad: i
 }
 
 fn has_adjacent_monitor_beyond_edge(
-    window: &WebviewWindow,
+    mon: &dyn MonitorProbe,
     dock_x: i32,
     dock_y: i32,
     ww: i32,
@@ -1332,20 +1843,7 @@ fn has_adjacent_monitor_beyond_edge(
         DockEdge::Right => (area.right() + 24, dock_y + wh / 2),
         DockEdge::None => return false,
     };
-    let Ok(monitors) = window.available_monitors() else {
-        return false;
-    };
-    monitors.iter().any(|m| {
-        let p = m.position();
-        let s = m.size();
-        let rect = WorkRect {
-            x: p.x,
-            y: p.y,
-            w: s.width as i32,
-            h: s.height as i32,
-        };
-        rect.contains_point(probe.0, probe.1)
-    })
+    mon.exists_at(probe.0, probe.1)
 }
 
 fn dock_state_file_path() -> Option<PathBuf> {
@@ -1381,6 +1879,9 @@ fn persist_saved_dock(saved: &SavedDock) {
 }
 
 fn monitor_work_rect(window: &WebviewWindow, ref_x: i32, ref_y: i32) -> Option<WorkRect> {
+    if let Some(rect) = native::work_rect_at(ref_x, ref_y) {
+        return Some(rect);
+    }
     let mon = window
         .monitor_from_point(ref_x as f64, ref_y as f64)
         .ok()
@@ -1396,53 +1897,35 @@ fn monitor_work_rect(window: &WebviewWindow, ref_x: i32, ref_y: i32) -> Option<W
     })
 }
 
+fn current_cursor(window: &WebviewWindow) -> Option<(f64, f64)> {
+    if let Some((x, y)) = native::cursor_pos() {
+        return Some((x as f64, y as f64));
+    }
+    window.cursor_position().ok().map(|c| (c.x, c.y))
+}
+
+fn current_window_rect(window: &WebviewWindow, hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    if let Some(rect) = native::window_rect(hwnd) {
+        return Some(rect);
+    }
+    let pos = window.outer_position().ok()?;
+    let size = window.outer_size().ok()?;
+    Some((pos.x, pos.y, size.width as i32, size.height as i32))
+}
+
 fn set_programmatic_pos(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, x: i32, y: i32) {
     set_window_pos_fast(window, dock, x, y);
 }
 
-fn set_window_pos_fast(
-    window: &WebviewWindow,
-    dock: &Arc<Mutex<DockInner>>,
-    x: i32,
-    y: i32,
-) {
-    {
+fn set_window_pos_fast(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, x: i32, y: i32) {
+    let hwnd = {
         let mut st = dock.lock().unwrap();
         st.last_programmatic_target = Some((x, y));
         st.ignore_moves_until = Instant::now() + Duration::from_millis(220);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        #[link(name = "user32")]
-        extern "system" {
-            fn SetWindowPos(
-                hwnd: *mut std::ffi::c_void,
-                hwnd_insert_after: *mut std::ffi::c_void,
-                x: i32,
-                y: i32,
-                cx: i32,
-                cy: i32,
-                u_flags: u32,
-            ) -> i32;
-        }
-        const SWP_NOSIZE: u32 = 0x0001;
-        const SWP_NOZORDER: u32 = 0x0004;
-        const SWP_NOACTIVATE: u32 = 0x0010;
-        if let Ok(hwnd) = window.hwnd() {
-            // SAFETY: Moves HWND directly in DWM without triggering WM_SIZE or DragFullWindows=0 wireframe.
-            unsafe {
-                SetWindowPos(
-                    hwnd.0,
-                    std::ptr::null_mut(),
-                    x,
-                    y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            return;
-        }
+        st.hwnd
+    };
+    if native::set_pos(hwnd, x, y) {
+        return;
     }
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
@@ -1455,43 +1938,14 @@ fn set_window_rect_atomic(
     w: i32,
     h: i32,
 ) {
-    {
+    let hwnd = {
         let mut st = dock.lock().unwrap();
         st.last_programmatic_target = Some((x, y));
         st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        #[link(name = "user32")]
-        extern "system" {
-            fn SetWindowPos(
-                hwnd: *mut std::ffi::c_void,
-                hwnd_insert_after: *mut std::ffi::c_void,
-                x: i32,
-                y: i32,
-                cx: i32,
-                cy: i32,
-                u_flags: u32,
-            ) -> i32;
-        }
-        const SWP_NOZORDER: u32 = 0x0004;
-        const SWP_NOACTIVATE: u32 = 0x0010;
-        if let Ok(hwnd) = window.hwnd() {
-            // SAFETY: Single atomic Win32 SetWindowPos updates (x, y, w, h) in one DWM frame
-            // without altering Z-order or stealing foreground activation.
-            unsafe {
-                SetWindowPos(
-                    hwnd.0,
-                    std::ptr::null_mut(),
-                    x,
-                    y,
-                    w.max(1),
-                    h.max(1),
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            return;
-        }
+        st.hwnd
+    };
+    if native::set_rect(hwnd, x, y, w, h) {
+        return;
     }
     let _ = window.set_position(PhysicalPosition::new(x, y));
     let _ = window.set_size(PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
@@ -1528,6 +1982,45 @@ fn glide_window(
     st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
 }
 
+/// Time-based glide with an ease-in-out curve, used when the ball flies back to its parking
+/// spot. Sampling by elapsed time keeps the motion even when a frame runs late.
+fn glide_window_timed(
+    window: &WebviewWindow,
+    dock: &Arc<Mutex<DockInner>>,
+    from: (i32, i32),
+    to: (i32, i32),
+    duration_ms: u64,
+) {
+    if from == to {
+        return;
+    }
+    {
+        let mut st = dock.lock().unwrap();
+        st.animating = true;
+    }
+    let total = Duration::from_millis(duration_ms.max(1)).as_secs_f64();
+    let started = Instant::now();
+    loop {
+        let t = (started.elapsed().as_secs_f64() / total).min(1.0);
+        let eased = if t < 0.5 {
+            4.0 * t * t * t
+        } else {
+            1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+        };
+        let x = (from.0 as f64 + (to.0 - from.0) as f64 * eased).round() as i32;
+        let y = (from.1 as f64 + (to.1 - from.1) as f64 * eased).round() as i32;
+        set_programmatic_pos(window, dock, x, y);
+        if t >= 1.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let mut st = dock.lock().unwrap();
+    st.animating = false;
+    st.last_programmatic_target = Some(to);
+    st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
+}
+
 fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persist: bool) {
     let scale = window.scale_factor().unwrap_or(1.0);
     let pod_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
@@ -1547,10 +2040,24 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
         };
         let x = area.x + ((area.w - pod_w) / 2).max(0);
         let y = area.y;
-        let seam = has_adjacent_monitor_beyond_edge(window, x, y, pod_w, pod_h, area, DockEdge::Top);
+        let seam = has_adjacent_monitor_beyond_edge(
+            &NativeMonitors,
+            x,
+            y,
+            pod_w,
+            pod_h,
+            area,
+            DockEdge::Top,
+        );
         let now = Instant::now();
         let (payload, saved) = {
             let mut st = dock.lock().unwrap();
+            // Leave play mode and any gesture first: this restores the standby form and
+            // work area that play mode borrowed, before the new placement overwrites them.
+            release_play_state(&mut st);
+            st.custom_dragging = false;
+            st.pending_orb_return = None;
+            st.scale = scale;
             st.edge = DockEdge::Top;
             st.dock_x = x;
             st.dock_y = y;
@@ -1562,11 +2069,6 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
             st.seam_mode = seam;
             st.tucked = false;
             st.orb_collapsed = false;
-            st.play_mode = false;
-            st.orb_coasting = false;
-            st.custom_dragging = false;
-            st.pending_orb_return = None;
-            st.physics = OrbPhysics::default();
             st.idle = false;
             st.preview = DockEdge::None;
             st.pending_user_move = false;
@@ -1607,11 +2109,19 @@ fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
                     DockEdge::Right => (area.right() - ww, saved.y.clamp(min_y, max_y)),
                     DockEdge::None => (saved.x.clamp(min_x, max_x), saved.y.clamp(min_y, max_y)),
                 };
-                let seam =
-                    has_adjacent_monitor_beyond_edge(window, x, y, ww, wh, area, saved.edge);
+                let seam = has_adjacent_monitor_beyond_edge(
+                    &NativeMonitors,
+                    x,
+                    y,
+                    ww,
+                    wh,
+                    area,
+                    saved.edge,
+                );
                 let now = Instant::now();
                 {
                     let mut st = dock.lock().unwrap();
+                    st.scale = scale;
                     st.edge = saved.edge;
                     st.standby_mode = saved.standby_mode;
                     st.dock_x = x;
@@ -1649,7 +2159,6 @@ enum WatcherAction {
         from: (i32, i32),
         to: (i32, i32),
         payload: DockStatePayload,
-        fx: OrbFxPayload,
     },
     SnapPod {
         to: (i32, i32),
@@ -1687,895 +2196,1309 @@ enum WatcherAction {
         pod_w: i32,
         pod_h: i32,
         payload: DockStatePayload,
+        guard_clicks: bool,
     },
     EmitOnly(DockStatePayload),
     EmitOrbFx(OrbFxPayload),
 }
 
-fn start_dock_watcher(
-    window: WebviewWindow,
-    dock: Arc<Mutex<DockInner>>,
-    quitting: Arc<AtomicBool>,
+/// Everything one watcher tick reads from the outside world.
+struct TickEnv {
+    now: Instant,
+    cur: (f64, f64),
+    win: (i32, i32, i32, i32),
+    mouse_down: bool,
+    escape_down: bool,
+    double_press: Duration,
+}
+
+impl TickEnv {
+    fn cursor_px(&self) -> (i32, i32) {
+        (self.cur.0.round() as i32, self.cur.1.round() as i32)
+    }
+}
+
+fn orb_home(st: &mut DockInner, m: &DockMetrics) -> (i32, i32) {
+    match (st.orb_x, st.orb_y) {
+        (Some(ox), Some(oy)) => (ox, oy),
+        _ => {
+            let pod_w = st.pod_w_phys.max(m.pod_w);
+            let pod_h = st.pod_h_phys.max(m.pod_h);
+            let p = compute_orb_pos_from_pod(
+                st.dock_x,
+                st.dock_y,
+                pod_w,
+                pod_h,
+                m.orb_size,
+                st.work_area,
+                st.edge,
+                m.margin,
+            );
+            st.orb_x = Some(p.0);
+            st.orb_y = Some(p.1);
+            p
+        }
+    }
+}
+
+/// Drops all play-mode and gesture bookkeeping without moving any window.
+fn release_play_state(st: &mut DockInner) {
+    if let Some(prev) = st.pre_play_standby.take() {
+        st.standby_mode = prev;
+    }
+    if let Some(area) = st.pre_play_work_area.take() {
+        st.work_area = area;
+    }
+    st.pre_play_orb_pos = None;
+    st.play_mode = false;
+    st.orb_coasting = false;
+    st.orb_press = None;
+    st.pending_tap = None;
+    st.physics = OrbPhysics::default();
+    st.last_emitted_angle = 0.0;
+    st.vel_tracker.clear();
+}
+
+/// The single way out of play mode. Every exit (double press, close badge, right click,
+/// Escape, idle timeout) goes through here, so none of them can leave a half-reset state.
+fn request_exit_play(st: &mut DockInner, now: Instant, m: &DockMetrics) {
+    if !st.play_mode {
+        return;
+    }
+    let was_collapsed = st.orb_collapsed;
+    let prev_standby = st.pre_play_standby.unwrap_or(st.standby_mode);
+    let home = st.pre_play_orb_pos;
+    release_play_state(st);
+    st.custom_dragging = false;
+    st.play_exited_at = Some(now);
+    st.toggle_lock_until = now + Duration::from_millis(ORB_TOGGLE_LOCK_MS);
+
+    if !was_collapsed {
+        // Still morphing from the capsule into the ball: cancel that collapse.
+        st.force_tuck = false;
+        return;
+    }
+    if prev_standby == StandbyMode::Orb {
+        let home = home.unwrap_or_else(|| orb_home(st, m));
+        st.orb_x = Some(home.0);
+        st.orb_y = Some(home.1);
+        st.pending_orb_return = Some(home);
+    } else {
+        st.force_untuck = true;
+    }
+}
+
+fn start_play_physics(st: &mut DockInner, now: Instant, start: (i32, i32), m: &DockMetrics) {
+    st.play_mode = true;
+    st.orb_coasting = false;
+    st.orb_press = None;
+    st.pending_tap = None;
+    st.orb_hover_since = None;
+    st.orb_hover_armed = false;
+    st.physics = OrbPhysics {
+        px: start.0 as f64,
+        py: start.1 as f64,
+        vx: 165.0 * m.scale,
+        vy: -430.0 * m.scale,
+        omega: 4.2,
+        angle_deg: 0.0,
+        sleeping: false,
+        combo: 0,
+    };
+    st.last_emitted_angle = 0.0;
+    st.last_physics_tick = now;
+    st.last_play_interaction = now;
+    st.last_kick_at = now;
+    st.kick_block_until = now + Duration::from_millis(300);
+    st.toggle_lock_until = now + Duration::from_millis(ORB_TOGGLE_LOCK_MS);
+}
+
+fn enter_play_from_orb(st: &mut DockInner, now: Instant, start: (i32, i32), m: &DockMetrics) {
+    st.pre_play_orb_pos = Some((st.orb_x.unwrap_or(start.0), st.orb_y.unwrap_or(start.1)));
+    st.pre_play_standby = None;
+    st.pre_play_work_area = Some(st.work_area);
+    start_play_physics(st, now, start, m);
+}
+
+fn enter_play_from_pod(
+    st: &mut DockInner,
+    now: Instant,
+    cursor: Option<(i32, i32)>,
+    m: &DockMetrics,
 ) {
-    std::thread::spawn(move || {
-        while !quitting.load(Ordering::SeqCst) {
-            let sleep_ms = {
-                let st = dock.lock().unwrap();
-                if st.custom_dragging
-                    || st.orb_coasting
-                    || (st.play_mode && st.orb_collapsed && !st.physics.sleeping)
-                {
-                    8
-                } else if st.play_mode && st.orb_collapsed {
-                    16
-                } else {
-                    30
-                }
-            };
-            std::thread::sleep(Duration::from_millis(sleep_ms));
-            if quitting.load(Ordering::SeqCst) {
-                break;
+    let home = orb_home(st, m);
+    st.pre_play_orb_pos = Some(home);
+    st.pre_play_standby = Some(st.standby_mode);
+    st.pre_play_work_area = Some(st.work_area);
+    st.force_tuck = true;
+    let start = match cursor {
+        Some((cx, cy)) => {
+            let area = st.work_area;
+            let min_x = area.x + m.margin;
+            let max_x = (area.right() - m.orb_size - m.margin).max(min_x);
+            let min_y = area.y + m.margin;
+            let max_y = (area.bottom() - m.orb_size - m.margin).max(min_y);
+            (
+                (cx - m.orb_size / 2).clamp(min_x, max_x),
+                (cy - m.orb_size / 2).clamp(min_y, max_y),
+            )
+        }
+        None => home,
+    };
+    start_play_physics(st, now, start, m);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PressOutcome {
+    Ignored,
+    Pressed,
+    EnteredPlay,
+    ExitedPlay,
+}
+
+/// Handles the primary button going down on the ball. A second press that arrives while a
+/// tap is still waiting toggles play mode at once; anything else starts a press that the
+/// watcher follows until the button comes back up.
+fn orb_press_begin(
+    st: &mut DockInner,
+    now: Instant,
+    cursor: (i32, i32),
+    win_pos: (i32, i32),
+    grab_logical: (f64, f64),
+    m: &DockMetrics,
+) -> PressOutcome {
+    if !st.orb_collapsed
+        || st.animating
+        || st.pending_orb_return.is_some()
+        || st.press_consumed
+        || now < st.toggle_lock_until
+    {
+        return PressOutcome::Ignored;
+    }
+    if let Some(prev) = st.orb_press.take() {
+        // A new press can only follow a release, so the watcher simply has not seen that
+        // release yet. Count the earlier press as the tap it was.
+        if !prev.moved
+            && now.duration_since(prev.started) <= Duration::from_millis(ORB_TAP_MAX_MS + 330)
+        {
+            st.pending_tap = Some(now);
+        }
+    }
+    let grab = (
+        ((grab_logical.0 * m.scale).round() as i32).clamp(0, m.orb_size),
+        ((grab_logical.1 * m.scale).round() as i32).clamp(0, m.orb_size),
+    );
+    // The window should still be under the grab point. If it is far off, this command is
+    // stale (the press it describes is over) and must not teleport the ball.
+    let expected = (cursor.0 - grab.0, cursor.1 - grab.1);
+    let drift = ((expected.0 - win_pos.0) as f64).hypot((expected.1 - win_pos.1) as f64);
+    if drift > 160.0 * m.scale {
+        return PressOutcome::Ignored;
+    }
+
+    st.orb_hover_since = None;
+    st.orb_expand_suppress_until = now + Duration::from_millis(620);
+    st.kick_block_until = now + Duration::from_millis(ORB_KICK_BLOCK_AFTER_PRESS_MS);
+    st.last_play_interaction = now;
+    st.last_hover_at = now;
+
+    if st.pending_tap.take().is_some() {
+        st.press_consumed = true;
+        if st.play_mode {
+            request_exit_play(st, now, m);
+            return PressOutcome::ExitedPlay;
+        }
+        enter_play_from_orb(st, now, win_pos, m);
+        return PressOutcome::EnteredPlay;
+    }
+
+    st.orb_coasting = false;
+    st.vel_tracker.clear();
+    if st.play_mode {
+        // Caught: the ball stops where it is and stays under the cursor.
+        st.physics.vx = 0.0;
+        st.physics.vy = 0.0;
+        st.physics.omega = 0.0;
+    }
+    st.orb_press = Some(OrbPress {
+        started: now,
+        press_cursor: cursor,
+        grab_offset: grab,
+        moved: false,
+    });
+    PressOutcome::Pressed
+}
+
+/// Collapse request from Escape or the hide button. Returns true when the window should
+/// be hidden to the tray instead.
+fn request_tuck(st: &mut DockInner, now: Instant, m: &DockMetrics) -> bool {
+    if st.play_mode {
+        request_exit_play(st, now, m);
+        return false;
+    }
+    // The same Escape press that just ended play mode must not also collapse the capsule.
+    if st
+        .play_exited_at
+        .map_or(false, |t| now.duration_since(t) < Duration::from_millis(450))
+    {
+        return false;
+    }
+    if st.tucked || st.orb_collapsed {
+        return false;
+    }
+    if st.standby_mode == StandbyMode::Orb || st.edge != DockEdge::None {
+        st.force_tuck = true;
+        return false;
+    }
+    true
+}
+
+fn park_orb_at(
+    st: &mut DockInner,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+    area: WorkRect,
+    pos: (i32, i32),
+) -> WatcherAction {
+    let min_ox = area.x + m.margin;
+    let max_ox = (area.right() - m.orb_size - m.margin).max(min_ox);
+    let min_oy = area.y + m.margin;
+    let max_oy = (area.bottom() - m.orb_size - m.margin).max(min_oy);
+    let ox = pos.0.clamp(min_ox, max_ox);
+    let oy = pos.1.clamp(min_oy, max_oy);
+    let pod_w = st.pod_w_phys.max(m.pod_w);
+    let pod_h = st.pod_h_phys.max(m.pod_h);
+    let (px, py, new_edge) =
+        compute_pod_pos_from_orb(ox, oy, m.orb_size, pod_w, pod_h, area, m.margin);
+    st.orb_x = Some(ox);
+    st.orb_y = Some(oy);
+    st.dock_x = px;
+    st.dock_y = py;
+    st.edge = new_edge;
+    st.work_area = area;
+    st.seam_mode = has_adjacent_monitor_beyond_edge(mon, px, py, pod_w, pod_h, area, new_edge);
+    WatcherAction::SaveOrbDrag {
+        to: (ox, oy),
+        saved: st.to_saved(),
+        payload: st.payload(),
+    }
+}
+
+fn snap_pod_at(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+    area: WorkRect,
+    pos: (i32, i32),
+) -> WatcherAction {
+    let now = env.now;
+    let (_, _, ww, wh) = env.win;
+    st.preview = DockEdge::None;
+    // Anchor on the base capsule height so dragging with a drawer open still remembers the true home y.
+    let anchor_h = st.pod_h_phys.max(m.pod_h);
+    let (sx, sy, new_edge) =
+        snap_window_rect(pos.0, pos.1, ww, anchor_h, area, m.threshold, m.margin);
+    let seam = has_adjacent_monitor_beyond_edge(mon, sx, sy, ww, anchor_h, area, new_edge);
+    st.edge = new_edge;
+    st.dock_x = sx;
+    st.dock_y = sy;
+    st.work_area = area;
+    st.seam_mode = seam;
+    // Re-derive the companion ball anchor whenever the user repositions the capsule.
+    let (ox, oy) = compute_orb_pos_from_pod(
+        sx, sy, ww, anchor_h, m.orb_size, area, new_edge, m.margin,
+    );
+    st.orb_x = Some(ox);
+    st.orb_y = Some(oy);
+    st.tucked = false;
+    st.orb_collapsed = false;
+    st.idle = false;
+    st.last_hover_at = now;
+    st.grace_until = now + Duration::from_millis(1400);
+    let vis_to = compute_visible_pod_pos(sx, sy, ww, wh, area, new_edge, m.margin);
+    WatcherAction::SnapPod {
+        to: vis_to,
+        saved: st.to_saved(),
+        payload: st.payload(),
+    }
+}
+
+fn expand_orb_to_pod(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    guard_clicks: bool,
+) -> WatcherAction {
+    let now = env.now;
+    st.orb_hover_since = None;
+    st.orb_collapsed = false;
+    st.idle = false;
+    st.last_hover_at = now;
+    st.grace_until = now + Duration::from_millis(1200);
+    let pod_w = st.pod_w_phys.max(m.pod_w);
+    let pod_h = st.pod_h_phys.max(m.pod_h);
+    let to = compute_visible_pod_pos(
+        st.dock_x,
+        st.dock_y,
+        pod_w,
+        pod_h,
+        st.work_area,
+        st.edge,
+        m.margin,
+    );
+    WatcherAction::ExitOrb {
+        pod_pos: to,
+        pod_w,
+        pod_h,
+        payload: st.payload(),
+        guard_clicks,
+    }
+}
+
+/// One step of the dock state machine. Reads nothing but its arguments, so it can run
+/// under the dock mutex without touching the UI thread, and can be unit-tested.
+fn decide_tick(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, ww, wh) = env.win;
+
+    let prev_cursor = st.last_cursor;
+    st.last_cursor = Some((now, env.cur.0, env.cur.1));
+    let escape_edge = env.escape_down && !st.escape_was_down;
+    st.escape_was_down = env.escape_down;
+    if st.press_consumed && !env.mouse_down {
+        st.press_consumed = false;
+    }
+
+    if !st.orb_collapsed && !st.tucked && ww >= (m.pod_w - 20) {
+        st.pod_w_phys = ww;
+        if wh <= m.pod_h + (24.0 * m.scale).round() as i32 {
+            st.pod_h_phys = wh;
+        }
+    }
+
+    // 0. The ball flies back to its parking spot after play mode ends.
+    if let Some(return_to) = st.pending_orb_return.take() {
+        st.orb_press = None;
+        st.pending_tap = None;
+        st.play_mode = false;
+        st.orb_coasting = false;
+        st.custom_dragging = false;
+        st.pending_user_move = false;
+        st.physics = OrbPhysics::default();
+        st.last_emitted_angle = 0.0;
+        st.orb_hover_since = None;
+        st.orb_hover_armed = false;
+        st.orb_expand_suppress_until = now + Duration::from_millis(520);
+        if !st.orb_collapsed {
+            return WatcherAction::EmitOnly(st.payload());
+        }
+        return WatcherAction::GlideOrbReturn {
+            from: (wx, wy),
+            to: return_to,
+            payload: st.payload(),
+        };
+    }
+
+    // 1. The capsule is being dragged.
+    if st.custom_dragging {
+        if st.orb_collapsed || st.tucked {
+            st.custom_dragging = false;
+        } else {
+            return decide_pod_drag(st, env, m, mon);
+        }
+    }
+
+    // 2. Something asked for the capsule to be shown.
+    if st.force_untuck {
+        st.force_untuck = false;
+        if st.tucked || st.orb_collapsed {
+            st.force_tuck = false;
+            release_play_state(st);
+            st.idle = false;
+            st.last_hover_at = now;
+            st.grace_until = now + Duration::from_millis(2400);
+            if st.orb_collapsed {
+                st.orb_collapsed = false;
+                st.orb_hover_since = None;
+                let pod_w = st.pod_w_phys.max(m.pod_w);
+                let pod_h = st.pod_h_phys.max(m.pod_h);
+                let to = compute_visible_pod_pos(
+                    st.dock_x,
+                    st.dock_y,
+                    pod_w,
+                    pod_h,
+                    st.work_area,
+                    st.edge,
+                    m.margin,
+                );
+                return WatcherAction::ExitOrb {
+                    pod_pos: to,
+                    pod_w,
+                    pod_h,
+                    payload: st.payload(),
+                    guard_clicks: false,
+                };
             }
-            if !window.is_visible().unwrap_or(false) {
-                continue;
-            }
-            let (Ok(cur), Ok(wpos), Ok(wsize)) = (
-                window.cursor_position(),
-                window.outer_position(),
-                window.outer_size(),
-            ) else {
-                continue;
+            st.tucked = false;
+            return WatcherAction::UntuckEdge {
+                from: (wx, wy),
+                to: (st.dock_x, st.dock_y),
+                payload: st.payload(),
             };
-            let cx = cur.x.round() as i32;
-            let cy = cur.y.round() as i32;
-            let wx = wpos.x;
-            let wy = wpos.y;
-            let ww = wsize.width as i32;
-            let wh = wsize.height as i32;
-            let scale = window.scale_factor().unwrap_or(1.0);
-            let peek = (PEEK_LOGICAL_PX * scale).round() as i32;
-            let threshold = (SNAP_THRESHOLD_LOGICAL_PX * scale).round() as i32;
-            let margin = (8.0 * scale).round() as i32;
-            let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as i32;
-            let orb_inset = (ORB_INSET_LOGICAL_PX * scale).round() as i32;
-            let pod_default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
-            let pod_base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
-            let mouse_down = is_primary_mouse_down();
-            let now = Instant::now();
+        }
+    }
 
-            let mut action = WatcherAction::None;
-
-            {
-                let mut st = dock.lock().unwrap();
-                if st.animating {
-                    continue;
-                }
-                let prev_cursor = st.last_cursor;
-                st.last_cursor = Some((now, cur.x, cur.y));
-
-                if !st.orb_collapsed && !st.tucked && ww >= (pod_default_w - 20) {
-                    st.pod_w_phys = ww;
-                    if wh <= pod_base_h + (24.0 * scale).round() as i32 {
-                        st.pod_h_phys = wh;
-                    }
-                }
-
-                // 0. Smooth return glide after exiting Gravity Play Mode back to parked Orb spot
-                if let Some(return_to) = st.pending_orb_return.take() {
-                    st.play_mode = false;
-                    st.orb_coasting = false;
-                    st.custom_dragging = false;
-                    st.physics = OrbPhysics::default();
-                    st.last_emitted_angle = 0.0;
-                    st.orb_hover_since = None;
-                    st.orb_hover_armed = false;
-                    st.orb_expand_suppress_until = now + Duration::from_millis(520);
-                    action = WatcherAction::GlideOrbReturn {
-                        from: (wx, wy),
-                        to: return_to,
-                        payload: st.payload(),
-                        fx: OrbFxPayload {
-                            angle: 0.0,
-                            impact_axis: None,
-                            impact_speed: 0.0,
-                            combo: 0,
-                        },
-                    };
-                }
-                // 1. Live 120Hz Custom Dragging (eliminates Win32 DragFullWindows=0 hollow black box!)
-                else if st.custom_dragging {
-                    let target_x = cx - st.drag_offset.0;
-                    let target_y = cy - st.drag_offset.1;
-                    let t_sec = now.duration_since(st.epoch).as_secs_f64();
-                    let live_area = monitor_work_rect(
-                        &window,
-                        target_x + ww / 2,
-                        target_y + (wh.min(160)) / 2,
-                    )
-                    .unwrap_or(st.work_area);
-                    st.work_area = live_area;
-                    st.last_hover_at = now;
-                    st.orb_hover_since = None;
-
-                    if mouse_down {
-                        st.vel_tracker.push(t_sec, target_x as f64, target_y as f64);
-                        if st.orb_collapsed {
-                            let bounds =
-                                OrbPhysicsBounds::from_work_area(live_area, orb_size, orb_inset);
-                            let clamped_x =
-                                (target_x as f64).clamp(bounds.min_x, bounds.max_x).round() as i32;
-                            let clamped_y =
-                                (target_y as f64).clamp(bounds.min_y, bounds.max_y).round() as i32;
-                            st.physics.px = clamped_x as f64;
-                            st.physics.py = clamped_y as f64;
-                            action = WatcherAction::MoveFast {
-                                to: (clamped_x, clamped_y),
-                                payload: None,
-                                fx: None,
-                            };
-                        } else {
-                            let prev =
-                                detect_snap_edge(target_x, target_y, ww, wh, live_area, threshold);
-                            let mut emit_payload = None;
-                            if prev != st.preview {
-                                st.preview = prev;
-                                emit_payload = Some(st.payload());
-                            }
-                            action = WatcherAction::MoveFast {
-                                to: (target_x, target_y),
-                                payload: emit_payload,
-                                fx: None,
-                            };
-                        }
-                    } else {
-                        // Mouse button released -> finish custom drag with velocity handoff!
-                        st.custom_dragging = false;
-                        st.pending_user_move = false;
-                        let (vx, vy) = st.vel_tracker.velocity(4300.0 * scale);
-                        st.vel_tracker.clear();
-
-                        if st.orb_collapsed {
-                            let bounds =
-                                OrbPhysicsBounds::from_work_area(live_area, orb_size, orb_inset);
-                            let ox = (wx as f64).clamp(bounds.min_x, bounds.max_x);
-                            let oy = (wy as f64).clamp(bounds.min_y, bounds.max_y);
-
-                            if st.play_mode {
-                                // Throw / fling directly into 2D gravity physics!
-                                let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
-                                st.physics.px = ox;
-                                st.physics.py = oy;
-                                st.physics.vx = vx;
-                                st.physics.vy = vy;
-                                st.physics.omega = (vx / r) * 0.65;
-                                st.physics.sleeping = false;
-                                st.last_physics_tick = now;
-                            } else if vx.hypot(vy) >= 240.0 * scale {
-                                // Playful damped glide & bounce in normal Orb standby before parking!
-                                st.orb_coasting = true;
-                                st.physics.px = ox;
-                                st.physics.py = oy;
-                                st.physics.vx = vx * 0.62;
-                                st.physics.vy = vy * 0.62;
-                                st.physics.sleeping = false;
-                                st.last_physics_tick = now;
-                                st.orb_hover_armed = false;
-                            } else {
-                                let min_ox = live_area.x + margin;
-                                let max_ox = (live_area.right() - orb_size - margin).max(min_ox);
-                                let min_oy = live_area.y + margin;
-                                let max_oy = (live_area.bottom() - orb_size - margin).max(min_oy);
-                                let parked_x = (ox.round() as i32).clamp(min_ox, max_ox);
-                                let parked_y = (oy.round() as i32).clamp(min_oy, max_oy);
-                                let pod_w = st.pod_w_phys.max(pod_default_w);
-                                let pod_h = st.pod_h_phys.max(pod_base_h);
-                                let (px, py, new_edge) = compute_pod_pos_from_orb(
-                                    parked_x, parked_y, orb_size, pod_w, pod_h, live_area, margin,
-                                );
-                                st.orb_x = Some(parked_x);
-                                st.orb_y = Some(parked_y);
-                                st.dock_x = px;
-                                st.dock_y = py;
-                                st.edge = new_edge;
-                                st.seam_mode = has_adjacent_monitor_beyond_edge(
-                                    &window, px, py, pod_w, pod_h, live_area, new_edge,
-                                );
-                                st.orb_hover_armed = false;
-                                st.orb_expand_suppress_until = now + Duration::from_millis(450);
-                                action = WatcherAction::SaveOrbDrag {
-                                    to: (parked_x, parked_y),
-                                    saved: st.to_saved(),
-                                    payload: st.payload(),
-                                };
-                            }
-                        } else {
-                            st.preview = DockEdge::None;
-                            let anchor_h = st.pod_h_phys.max(pod_base_h);
-                            let proj_x = wx + (vx * 0.055).round() as i32;
-                            let proj_y = wy + (vy * 0.055).round() as i32;
-                            let (sx, sy, new_edge) = snap_window_rect(
-                                proj_x, proj_y, ww, anchor_h, live_area, threshold, margin,
-                            );
-                            let seam = has_adjacent_monitor_beyond_edge(
-                                &window, sx, sy, ww, anchor_h, live_area, new_edge,
-                            );
-                            st.edge = new_edge;
-                            st.dock_x = sx;
-                            st.dock_y = sy;
-                            st.seam_mode = seam;
-                            let (ox, oy) = compute_orb_pos_from_pod(
-                                sx, sy, ww, anchor_h, orb_size, live_area, new_edge, margin,
-                            );
-                            st.orb_x = Some(ox);
-                            st.orb_y = Some(oy);
-                            st.tucked = false;
-                            st.orb_collapsed = false;
-                            st.idle = false;
-                            st.last_hover_at = now;
-                            st.grace_until = now + Duration::from_millis(1400);
-                            let vis_to = compute_visible_pod_pos(
-                                sx, sy, ww, wh, live_area, new_edge, margin,
-                            );
-                            action = WatcherAction::SnapPod {
-                                to: vis_to,
-                                saved: st.to_saved(),
-                                payload: st.payload(),
-                            };
-                        }
-                    }
-                } else if st.force_untuck && (st.tucked || st.orb_collapsed) {
-                    st.force_untuck = false;
-                    st.force_tuck = false;
-                    st.play_mode = false;
-                    st.orb_coasting = false;
-                    st.physics = OrbPhysics::default();
-                    st.idle = false;
-                    st.last_hover_at = now;
-                    st.grace_until = now + Duration::from_millis(2400);
-                    if let Some(prev_standby) = st.pre_play_standby.take() {
-                        st.standby_mode = prev_standby;
-                    }
-                    st.pre_play_orb_pos = None;
-                    if st.orb_collapsed {
-                        st.orb_collapsed = false;
-                        st.orb_hover_since = None;
-                        let pod_w = st.pod_w_phys.max(pod_default_w);
-                        let pod_h = st.pod_h_phys.max(pod_base_h);
-                        let to = compute_visible_pod_pos(
-                            st.dock_x,
-                            st.dock_y,
-                            pod_w,
-                            pod_h,
-                            st.work_area,
-                            st.edge,
-                            margin,
-                        );
-                        action = WatcherAction::ExitOrb {
-                            pod_pos: to,
-                            pod_w,
-                            pod_h,
-                            payload: st.payload(),
-                        };
-                    } else {
-                        st.tucked = false;
-                        let to = (st.dock_x, st.dock_y);
-                        action = WatcherAction::UntuckEdge {
-                            from: (wx, wy),
-                            to,
-                            payload: st.payload(),
-                        };
-                    }
-                } else if st.force_tuck && !st.tucked && !st.orb_collapsed {
-                    st.force_tuck = false;
-                    st.pinned = false;
-                    st.ui_hold = false;
-                    if st.standby_mode == StandbyMode::Orb || st.play_mode {
-                        let pod_w = st.pod_w_phys.max(pod_default_w);
-                        let pod_h = st.pod_h_phys.max(pod_base_h);
-                        let opos = if st.play_mode {
-                            (st.physics.px.round() as i32, st.physics.py.round() as i32)
-                        } else {
-                            match (st.orb_x, st.orb_y) {
-                                (Some(ox), Some(oy)) => (ox, oy),
-                                _ => {
-                                    let p = compute_orb_pos_from_pod(
-                                        st.dock_x,
-                                        st.dock_y,
-                                        pod_w,
-                                        pod_h,
-                                        orb_size,
-                                        st.work_area,
-                                        st.edge,
-                                        margin,
-                                    );
-                                    st.orb_x = Some(p.0);
-                                    st.orb_y = Some(p.1);
-                                    p
-                                }
-                            }
-                        };
-                        st.last_physics_tick = now;
-                        action = WatcherAction::EnterOrb {
-                            orb_pos: opos,
-                            orb_size,
-                            play: st.play_mode,
-                        };
-                    } else if st.edge != DockEdge::None {
-                        action = WatcherAction::TuckEdge {
-                            edge: st.edge,
-                            dock_x: st.dock_x,
-                            dock_y: st.dock_y,
-                            area: st.work_area,
-                            seam: st.seam_mode,
-                            peek,
-                        };
-                    }
-                } else if st.pending_user_move {
-                    let live_area = monitor_work_rect(&window, wx + ww / 2, wy + (wh.min(160)) / 2)
-                        .unwrap_or(st.work_area);
-                    if st.orb_collapsed {
-                        if !mouse_down {
-                            st.pending_user_move = false;
-                            let min_ox = live_area.x + margin;
-                            let max_ox = (live_area.right() - orb_size - margin).max(min_ox);
-                            let min_oy = live_area.y + margin;
-                            let max_oy = (live_area.bottom() - orb_size - margin).max(min_oy);
-                            let ox = wx.clamp(min_ox, max_ox);
-                            let oy = wy.clamp(min_oy, max_oy);
-                            let pod_w = st.pod_w_phys.max(pod_default_w);
-                            let pod_h = st.pod_h_phys.max(pod_base_h);
-                            let (px, py, new_edge) = compute_pod_pos_from_orb(
-                                ox, oy, orb_size, pod_w, pod_h, live_area, margin,
-                            );
-                            st.orb_x = Some(ox);
-                            st.orb_y = Some(oy);
-                            st.dock_x = px;
-                            st.dock_y = py;
-                            st.edge = new_edge;
-                            st.work_area = live_area;
-                            st.seam_mode = has_adjacent_monitor_beyond_edge(
-                                &window, px, py, pod_w, pod_h, live_area, new_edge,
-                            );
-                            action = WatcherAction::SaveOrbDrag {
-                                to: (ox, oy),
-                                saved: st.to_saved(),
-                                payload: st.payload(),
-                            };
-                        }
-                    } else if mouse_down {
-                        let prev = detect_snap_edge(wx, wy, ww, wh, live_area, threshold);
-                        if prev != st.preview {
-                            st.preview = prev;
-                            action = WatcherAction::EmitOnly(st.payload());
-                        }
-                    } else {
-                        st.pending_user_move = false;
-                        st.preview = DockEdge::None;
-                        let anchor_h = st.pod_h_phys.max(pod_base_h);
-                        let (sx, sy, new_edge) =
-                            snap_window_rect(wx, wy, ww, anchor_h, live_area, threshold, margin);
-                        let seam = has_adjacent_monitor_beyond_edge(
-                            &window, sx, sy, ww, anchor_h, live_area, new_edge,
-                        );
-                        st.edge = new_edge;
-                        st.dock_x = sx;
-                        st.dock_y = sy;
-                        st.work_area = live_area;
-                        st.seam_mode = seam;
-                        let (ox, oy) = compute_orb_pos_from_pod(
-                            sx, sy, ww, anchor_h, orb_size, live_area, new_edge, margin,
-                        );
-                        st.orb_x = Some(ox);
-                        st.orb_y = Some(oy);
-                        st.tucked = false;
-                        st.orb_collapsed = false;
-                        st.idle = false;
-                        st.last_hover_at = now;
-                        st.grace_until = now + Duration::from_millis(1400);
-                        let vis_to =
-                            compute_visible_pod_pos(sx, sy, ww, wh, live_area, new_edge, margin);
-                        action = WatcherAction::SnapPod {
-                            to: vis_to,
-                            saved: st.to_saved(),
-                            payload: st.payload(),
-                        };
-                    }
-                } else if st.orb_collapsed {
-                    if st.play_mode {
-                        // 2A. Stress-Relief 2D Gravity Ball Mode!
-                        let bounds =
-                            OrbPhysicsBounds::from_work_area(st.work_area, orb_size, orb_inset);
-                        let dt = now
-                            .duration_since(st.last_physics_tick)
-                            .as_secs_f64()
-                            .clamp(0.001, 0.032);
-                        st.last_physics_tick = now;
-
-                        let mut impact = None;
-                        if !mouse_down
-                            && now.duration_since(st.last_kick_at) >= Duration::from_millis(105)
-                        {
-                            if let Some((prev_t, prev_cx, prev_cy)) = prev_cursor {
-                                let c_dt = now.duration_since(prev_t).as_secs_f64();
-                                if let Some(kick_hit) = apply_cursor_kick(
-                                    &mut st.physics,
-                                    (prev_cx, prev_cy),
-                                    (cur.x, cur.y),
-                                    c_dt,
-                                    orb_size as f64,
-                                    bounds,
-                                    scale,
-                                ) {
-                                    st.last_kick_at = now;
-                                    impact = Some(kick_hit);
-                                }
-                            }
-                        }
-
-                        if let Some(step_hit) =
-                            step_orb_gravity(&mut st.physics, dt, bounds, scale)
-                        {
-                            if impact.map_or(true, |k| step_hit.normal_speed > k.normal_speed) {
-                                impact = Some(step_hit);
-                            }
-                        }
-
-                        let nx = st.physics.px.round() as i32;
-                        let ny = st.physics.py.round() as i32;
-                        let pos_changed = nx != wx || ny != wy;
-                        let angle_delta = (st.physics.angle_deg - st.last_emitted_angle).abs();
-                        let fx = if impact.is_some() || angle_delta >= 2.2 {
-                            st.last_emitted_angle = st.physics.angle_deg;
-                            Some(OrbFxPayload {
-                                angle: st.physics.angle_deg,
-                                impact_axis: impact.map(|i| i.axis),
-                                impact_speed: impact.map_or(0.0, |i| i.normal_speed),
-                                combo: st.physics.combo,
-                            })
-                        } else {
-                            None
-                        };
-
-                        if pos_changed {
-                            action = WatcherAction::MoveFast {
-                                to: (nx, ny),
-                                payload: None,
-                                fx,
-                            };
-                        } else if let Some(fx_only) = fx {
-                            action = WatcherAction::EmitOrbFx(fx_only);
-                        }
-                    } else if st.orb_coasting {
-                        // 2B. Inertial damped glide when flicked in normal Orb standby
-                        let dt = now
-                            .duration_since(st.last_physics_tick)
-                            .as_secs_f64()
-                            .clamp(0.001, 0.032);
-                        st.last_physics_tick = now;
-                        let min_ox = (st.work_area.x + margin) as f64;
-                        let max_ox =
-                            ((st.work_area.right() - orb_size - margin) as f64).max(min_ox);
-                        let min_oy = (st.work_area.y + margin) as f64;
-                        let max_oy =
-                            ((st.work_area.bottom() - orb_size - margin) as f64).max(min_oy);
-
-                        let decay = (-7.5 * dt).exp();
-                        st.physics.vx *= decay;
-                        st.physics.vy *= decay;
-                        st.physics.px += st.physics.vx * dt;
-                        st.physics.py += st.physics.vy * dt;
-
-                        let mut impact: Option<ImpactEvent> = None;
-                        if st.physics.px < min_ox {
-                            st.physics.px = min_ox;
-                            let s = st.physics.vx.abs() / scale;
-                            st.physics.vx = -st.physics.vx * 0.62;
-                            if s > 120.0 {
-                                impact = Some(ImpactEvent {
-                                    axis: "x",
-                                    normal_speed: s,
-                                });
-                            }
-                        } else if st.physics.px > max_ox {
-                            st.physics.px = max_ox;
-                            let s = st.physics.vx.abs() / scale;
-                            st.physics.vx = -st.physics.vx * 0.62;
-                            if s > 120.0 {
-                                impact = Some(ImpactEvent {
-                                    axis: "x",
-                                    normal_speed: s,
-                                });
-                            }
-                        }
-                        if st.physics.py < min_oy {
-                            st.physics.py = min_oy;
-                            let s = st.physics.vy.abs() / scale;
-                            st.physics.vy = -st.physics.vy * 0.62;
-                            if s > 120.0 {
-                                impact = Some(ImpactEvent {
-                                    axis: "y",
-                                    normal_speed: s,
-                                });
-                            }
-                        } else if st.physics.py > max_oy {
-                            st.physics.py = max_oy;
-                            let s = st.physics.vy.abs() / scale;
-                            st.physics.vy = -st.physics.vy * 0.62;
-                            if s > 120.0 {
-                                impact = Some(ImpactEvent {
-                                    axis: "y",
-                                    normal_speed: s,
-                                });
-                            }
-                        }
-
-                        let nx = st.physics.px.round() as i32;
-                        let ny = st.physics.py.round() as i32;
-                        if st.physics.vx.hypot(st.physics.vy) < 28.0 * scale {
-                            st.orb_coasting = false;
-                            let pod_w = st.pod_w_phys.max(pod_default_w);
-                            let pod_h = st.pod_h_phys.max(pod_base_h);
-                            let (px, py, new_edge) = compute_pod_pos_from_orb(
-                                nx, ny, orb_size, pod_w, pod_h, st.work_area, margin,
-                            );
-                            st.orb_x = Some(nx);
-                            st.orb_y = Some(ny);
-                            st.dock_x = px;
-                            st.dock_y = py;
-                            st.edge = new_edge;
-                            st.seam_mode = has_adjacent_monitor_beyond_edge(
-                                &window, px, py, pod_w, pod_h, st.work_area, new_edge,
-                            );
-                            st.orb_expand_suppress_until = now + Duration::from_millis(380);
-                            action = WatcherAction::SaveOrbDrag {
-                                to: (nx, ny),
-                                saved: st.to_saved(),
-                                payload: st.payload(),
-                            };
-                        } else {
-                            let fx = impact.map(|i| OrbFxPayload {
-                                angle: 0.0,
-                                impact_axis: Some(i.axis),
-                                impact_speed: i.normal_speed,
-                                combo: 0,
-                            });
-                            action = WatcherAction::MoveFast {
-                                to: (nx, ny),
-                                payload: None,
-                                fx,
-                            };
-                        }
-                    } else {
-                        // 2C. Hover-to-Expand with 260ms Intent Gate (cancels cleanly on mousedown / drag / dblclick!)
-                        let orb_cx = wx as f64 + orb_size as f64 * 0.5;
-                        let orb_cy = wy as f64 + orb_size as f64 * 0.5;
-                        let hover_r = (ORB_VISUAL_RADIUS_LOGICAL_PX + 2.0) * scale;
-                        let dist = (cur.x - orb_cx).hypot(cur.y - orb_cy);
-                        let in_sphere = dist <= hover_r;
-
-                        if !in_sphere {
-                            st.orb_hover_since = None;
-                            if dist > hover_r + 10.0 * scale {
-                                st.orb_hover_armed = true;
-                            }
-                        } else if mouse_down {
-                            // Pressing mouse cancels hover-expand so drag & double-click work 100% reliably!
-                            st.orb_hover_since = None;
-                            st.orb_expand_suppress_until = now + Duration::from_millis(620);
-                        } else if st.orb_hover_armed && now >= st.orb_expand_suppress_until {
-                            match st.orb_hover_since {
-                                None => {
-                                    st.orb_hover_since = Some(now);
-                                }
-                                Some(since) => {
-                                    if now.duration_since(since)
-                                        >= Duration::from_millis(ORB_HOVER_EXPAND_MS)
-                                    {
-                                        st.orb_hover_since = None;
-                                        st.orb_collapsed = false;
-                                        st.idle = false;
-                                        st.last_hover_at = now;
-                                        st.grace_until = now + Duration::from_millis(1200);
-                                        let pod_w = st.pod_w_phys.max(pod_default_w);
-                                        let pod_h = st.pod_h_phys.max(pod_base_h);
-                                        let to = compute_visible_pod_pos(
-                                            st.dock_x,
-                                            st.dock_y,
-                                            pod_w,
-                                            pod_h,
-                                            st.work_area,
-                                            st.edge,
-                                            margin,
-                                        );
-                                        action = WatcherAction::ExitOrb {
-                                            pod_pos: to,
-                                            pod_w,
-                                            pod_h,
-                                            payload: st.payload(),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
+    // 3. Something asked for the capsule to be put away.
+    if st.force_tuck {
+        st.force_tuck = false;
+        if !st.tucked && !st.orb_collapsed {
+            st.pinned = false;
+            st.ui_hold = false;
+            if st.standby_mode == StandbyMode::Orb || st.play_mode {
+                let orb_pos = if st.play_mode {
+                    (st.physics.px.round() as i32, st.physics.py.round() as i32)
                 } else {
-                    // Pod is currently expanded — keep strictly anchored to (dock_x, dock_y),
-                    // shifting up temporarily ONLY while an open drawer exceeds the bottom work area,
-                    // and returning right back to dock_y the instant the drawer closes!
-                    let (vis_x, vis_y) = compute_visible_pod_pos(
+                    orb_home(st, m)
+                };
+                st.last_physics_tick = now;
+                return WatcherAction::EnterOrb {
+                    orb_pos,
+                    orb_size: m.orb_size,
+                    play: st.play_mode,
+                };
+            } else if st.edge != DockEdge::None {
+                return WatcherAction::TuckEdge {
+                    edge: st.edge,
+                    dock_x: st.dock_x,
+                    dock_y: st.dock_y,
+                    area: st.work_area,
+                    seam: st.seam_mode,
+                    peek: m.peek,
+                };
+            }
+        }
+    }
+
+    // 4. The window was moved by the system rather than by us.
+    if st.pending_user_move {
+        if st.orb_press.is_some() || st.pending_tap.is_some() || st.play_mode || st.orb_coasting {
+            st.pending_user_move = false;
+        } else {
+            return decide_os_move(st, env, m, mon);
+        }
+    }
+
+    if st.orb_collapsed {
+        return decide_orb(st, env, m, mon, prev_cursor, escape_edge);
+    }
+    decide_pod_visible(st, env, m)
+}
+
+fn decide_pod_drag(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, ww, wh) = env.win;
+    let (cx, cy) = env.cursor_px();
+    let target = (cx - st.drag_offset.0, cy - st.drag_offset.1);
+    let live_area = mon
+        .work_rect_at(target.0 + ww / 2, target.1 + wh.min(160) / 2)
+        .unwrap_or(st.work_area);
+    st.last_hover_at = now;
+
+    if env.mouse_down {
+        let t = now.duration_since(st.epoch).as_secs_f64();
+        st.vel_tracker.push(t, target.0 as f64, target.1 as f64);
+        let prev = detect_snap_edge(target.0, target.1, ww, wh, live_area, m.threshold);
+        let payload = if prev != st.preview {
+            st.preview = prev;
+            Some(st.payload())
+        } else {
+            None
+        };
+        if target == (wx, wy) && payload.is_none() {
+            return WatcherAction::None;
+        }
+        return WatcherAction::MoveFast {
+            to: target,
+            payload,
+            fx: None,
+        };
+    }
+
+    st.custom_dragging = false;
+    st.pending_user_move = false;
+    let (vx, vy) = st.vel_tracker.velocity(4300.0 * m.scale);
+    st.vel_tracker.clear();
+    let projected = (
+        wx + (vx * 0.055).round() as i32,
+        wy + (vy * 0.055).round() as i32,
+    );
+    snap_pod_at(st, env, m, mon, live_area, projected)
+}
+
+fn decide_os_move(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+) -> WatcherAction {
+    let (wx, wy, ww, wh) = env.win;
+    let live_area = mon
+        .work_rect_at(wx + ww / 2, wy + wh.min(160) / 2)
+        .unwrap_or(st.work_area);
+    if st.orb_collapsed {
+        if env.mouse_down {
+            return WatcherAction::None;
+        }
+        st.pending_user_move = false;
+        return park_orb_at(st, m, mon, live_area, (wx, wy));
+    }
+    if env.mouse_down {
+        let prev = detect_snap_edge(wx, wy, ww, wh, live_area, m.threshold);
+        if prev != st.preview {
+            st.preview = prev;
+            return WatcherAction::EmitOnly(st.payload());
+        }
+        return WatcherAction::None;
+    }
+    st.pending_user_move = false;
+    snap_pod_at(st, env, m, mon, live_area, (wx, wy))
+}
+
+fn decide_orb(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+    prev_cursor: Option<(Instant, f64, f64)>,
+    escape_edge: bool,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, _, _) = env.win;
+    let (cx, cy) = env.cursor_px();
+    let half = m.orb_size as f64 * 0.5;
+
+    // Escape leaves play mode even when the ball window has no keyboard focus, as long as
+    // the cursor is near the ball. Polled, so it works in every sub-state below.
+    if st.play_mode && escape_edge {
+        let dist = (env.cur.0 - (wx as f64 + half)).hypot(env.cur.1 - (wy as f64 + half));
+        if dist <= m.orb_radius + 56.0 * m.scale {
+            request_exit_play(st, now, m);
+            return WatcherAction::None;
+        }
+    }
+
+    // A. A press that began on the ball.
+    if let Some(mut press) = st.orb_press {
+        st.orb_hover_since = None;
+        st.last_hover_at = now;
+
+        if env.mouse_down {
+            if !press.moved {
+                let travel = ((cx - press.press_cursor.0) as f64)
+                    .hypot((cy - press.press_cursor.1) as f64);
+                if travel > ORB_DRAG_SLOP_LOGICAL_PX * m.scale {
+                    press.moved = true;
+                    st.orb_press = Some(press);
+                }
+            }
+            // Outside play mode the ball stays put until the press turns into a drag.
+            // In play mode it is held under the cursor from the first moment.
+            if !(st.play_mode || press.moved) {
+                return WatcherAction::None;
+            }
+            let raw = (cx - press.grab_offset.0, cy - press.grab_offset.1);
+            let area = mon
+                .work_rect_at(raw.0 + m.orb_size / 2, raw.1 + m.orb_size / 2)
+                .unwrap_or(st.work_area);
+            st.work_area = area;
+            let bounds = OrbPhysicsBounds::from_work_area(area, m.orb_size, m.orb_inset);
+            let nx = (raw.0 as f64).clamp(bounds.min_x, bounds.max_x).round() as i32;
+            let ny = (raw.1 as f64).clamp(bounds.min_y, bounds.max_y).round() as i32;
+            let t = now.duration_since(st.epoch).as_secs_f64();
+            st.vel_tracker.push(t, nx as f64, ny as f64);
+            st.physics.px = nx as f64;
+            st.physics.py = ny as f64;
+            st.physics.vx = 0.0;
+            st.physics.vy = 0.0;
+            st.physics.omega = 0.0;
+            st.last_physics_tick = now;
+            if (nx, ny) == (wx, wy) {
+                return WatcherAction::None;
+            }
+            return WatcherAction::MoveFast {
+                to: (nx, ny),
+                payload: None,
+                fx: None,
+            };
+        }
+
+        // The button came up.
+        st.orb_press = None;
+        st.last_play_interaction = now;
+        st.kick_block_until = now + Duration::from_millis(ORB_KICK_BLOCK_AFTER_PRESS_MS);
+        if press.moved {
+            return release_orb_drag(st, env, m, mon);
+        }
+        if now.duration_since(press.started) <= Duration::from_millis(ORB_TAP_MAX_MS) {
+            // A tap. Wait briefly for a second press before acting on it; in play mode the
+            // ball holds still meanwhile so that second press can land.
+            st.pending_tap = Some(now + env.double_press);
+            if st.play_mode {
+                return WatcherAction::EmitOrbFx(OrbFxPayload::charge(
+                    st.physics.angle_deg,
+                    st.physics.combo,
+                ));
+            }
+            return WatcherAction::None;
+        }
+        // Held still and let go: in play mode the ball simply drops.
+        if st.play_mode {
+            st.physics.sleeping = false;
+            st.last_physics_tick = now;
+        }
+        return WatcherAction::None;
+    }
+
+    // B. A single tap waiting to see whether a second press follows.
+    if let Some(deadline) = st.pending_tap {
+        st.orb_hover_since = None;
+        st.last_hover_at = now;
+        if now < deadline {
+            return WatcherAction::None;
+        }
+        st.pending_tap = None;
+        if st.play_mode {
+            let hit = apply_tap_bounce(&mut st.physics, env.cur.0, m.orb_size as f64, m.scale);
+            st.last_physics_tick = now;
+            st.last_emitted_angle = st.physics.angle_deg;
+            return WatcherAction::EmitOrbFx(OrbFxPayload::impact(
+                st.physics.angle_deg,
+                st.physics.combo,
+                Some(hit),
+            ));
+        }
+        return expand_orb_to_pod(st, env, m, true);
+    }
+
+    if st.play_mode {
+        return decide_play(st, env, m, prev_cursor);
+    }
+    if st.orb_coasting {
+        return decide_coast(st, env, m, mon);
+    }
+    decide_hover(st, env, m, prev_cursor)
+}
+
+fn release_orb_drag(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, _, _) = env.win;
+    let area = st.work_area;
+    let (vx, vy) = st.vel_tracker.velocity(4300.0 * m.scale);
+    st.vel_tracker.clear();
+    let bounds = OrbPhysicsBounds::from_work_area(area, m.orb_size, m.orb_inset);
+    let ox = (wx as f64).clamp(bounds.min_x, bounds.max_x);
+    let oy = (wy as f64).clamp(bounds.min_y, bounds.max_y);
+
+    if st.play_mode {
+        // Thrown: the release velocity carries straight into the physics.
+        st.physics.px = ox;
+        st.physics.py = oy;
+        st.physics.vx = vx;
+        st.physics.vy = vy;
+        st.physics.omega = (vx / m.orb_radius) * 0.65;
+        st.physics.sleeping = false;
+        st.last_physics_tick = now;
+        return WatcherAction::None;
+    }
+
+    st.orb_hover_armed = false;
+    if vx.hypot(vy) >= ORB_COAST_MIN_SPEED_LOGICAL * m.scale {
+        st.orb_coasting = true;
+        st.physics.px = ox;
+        st.physics.py = oy;
+        st.physics.vx = vx * 0.62;
+        st.physics.vy = vy * 0.62;
+        st.physics.sleeping = false;
+        st.last_physics_tick = now;
+        return WatcherAction::None;
+    }
+    st.orb_expand_suppress_until = now + Duration::from_millis(450);
+    park_orb_at(st, m, mon, area, (ox.round() as i32, oy.round() as i32))
+}
+
+fn cursor_speed(env: &TickEnv, prev_cursor: Option<(Instant, f64, f64)>) -> f64 {
+    prev_cursor.map_or(0.0, |(t, x, y)| {
+        let dt = env.now.duration_since(t).as_secs_f64();
+        if dt > 0.0005 {
+            (env.cur.0 - x).hypot(env.cur.1 - y) / dt
+        } else {
+            0.0
+        }
+    })
+}
+
+fn decide_play(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    prev_cursor: Option<(Instant, f64, f64)>,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, _, _) = env.win;
+    let bounds = OrbPhysicsBounds::from_work_area(st.work_area, m.orb_size, m.orb_inset);
+    let dt = now
+        .duration_since(st.last_physics_tick)
+        .as_secs_f64()
+        .clamp(0.001, 0.032);
+    st.last_physics_tick = now;
+
+    // Nobody has played for a while and the ball is at rest: go back on duty.
+    if st.physics.sleeping
+        && now.duration_since(st.last_play_interaction)
+            >= Duration::from_secs(ORB_PLAY_IDLE_RETURN_SECS)
+        && now.duration_since(st.last_kick_at) >= Duration::from_secs(ORB_PLAY_IDLE_AFTER_KICK_SECS)
+    {
+        request_exit_play(st, now, m);
+        return WatcherAction::None;
+    }
+
+    let half = m.orb_size as f64 * 0.5;
+    let ball = (st.physics.px + half, st.physics.py + half);
+    let cursor_dist = (env.cur.0 - ball.0).hypot(env.cur.1 - ball.1);
+    let speed = cursor_speed(env, prev_cursor);
+
+    let mut impact: Option<ImpactEvent> = None;
+    let kicks_allowed = !env.mouse_down
+        && now >= st.kick_block_until
+        && now.duration_since(st.last_kick_at) >= Duration::from_millis(105);
+    if kicks_allowed {
+        if let Some((prev_t, prev_x, prev_y)) = prev_cursor {
+            let c_dt = now.duration_since(prev_t).as_secs_f64();
+            if let Some(hit) = apply_cursor_kick(
+                &mut st.physics,
+                (prev_x, prev_y),
+                env.cur,
+                c_dt,
+                m.orb_size as f64,
+                bounds,
+                m.scale,
+            ) {
+                st.last_kick_at = now;
+                impact = Some(hit);
+            }
+        }
+    }
+
+    // A slow cursor resting on a ball that is only rolling settles it, so it can be
+    // pressed or closed without chasing it.
+    if !st.physics.sleeping
+        && st.physics.py >= bounds.max_y - 1.0
+        && st.physics.vy.abs() < 60.0 * m.scale
+        && st.physics.vx.abs() < 320.0 * m.scale
+        && cursor_dist <= m.orb_radius + 6.0 * m.scale
+        && speed < 250.0 * m.scale
+    {
+        st.physics.vx = 0.0;
+    }
+
+    if let Some(hit) = step_orb_gravity(&mut st.physics, dt, bounds, m.scale) {
+        if impact.map_or(true, |k| hit.normal_speed > k.normal_speed) {
+            impact = Some(hit);
+        }
+    }
+
+    let nx = st.physics.px.round() as i32;
+    let ny = st.physics.py.round() as i32;
+    let angle_delta = (st.physics.angle_deg - st.last_emitted_angle).abs();
+    let fx = if impact.is_some() || angle_delta >= 2.2 {
+        st.last_emitted_angle = st.physics.angle_deg;
+        Some(OrbFxPayload::impact(
+            st.physics.angle_deg,
+            st.physics.combo,
+            impact,
+        ))
+    } else {
+        None
+    };
+
+    if (nx, ny) != (wx, wy) {
+        WatcherAction::MoveFast {
+            to: (nx, ny),
+            payload: None,
+            fx,
+        }
+    } else if let Some(fx_only) = fx {
+        WatcherAction::EmitOrbFx(fx_only)
+    } else {
+        WatcherAction::None
+    }
+}
+
+fn decide_coast(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    mon: &dyn MonitorProbe,
+) -> WatcherAction {
+    let now = env.now;
+    let dt = now
+        .duration_since(st.last_physics_tick)
+        .as_secs_f64()
+        .clamp(0.001, 0.032);
+    st.last_physics_tick = now;
+    let area = st.work_area;
+    let min_ox = (area.x + m.margin) as f64;
+    let max_ox = ((area.right() - m.orb_size - m.margin) as f64).max(min_ox);
+    let min_oy = (area.y + m.margin) as f64;
+    let max_oy = ((area.bottom() - m.orb_size - m.margin) as f64).max(min_oy);
+
+    let decay = (-7.5 * dt).exp();
+    st.physics.vx *= decay;
+    st.physics.vy *= decay;
+    st.physics.px += st.physics.vx * dt;
+    st.physics.py += st.physics.vy * dt;
+
+    let mut impact: Option<ImpactEvent> = None;
+    if let Some(speed) = bounce_axis(&mut st.physics.px, &mut st.physics.vx, min_ox, max_ox, 0.62) {
+        if speed / m.scale > 120.0 {
+            impact = Some(ImpactEvent {
+                axis: "x",
+                normal_speed: speed / m.scale,
+            });
+        }
+    }
+    if let Some(speed) = bounce_axis(&mut st.physics.py, &mut st.physics.vy, min_oy, max_oy, 0.62) {
+        if speed / m.scale > 120.0 {
+            impact = Some(ImpactEvent {
+                axis: "y",
+                normal_speed: speed / m.scale,
+            });
+        }
+    }
+
+    let nx = st.physics.px.round() as i32;
+    let ny = st.physics.py.round() as i32;
+    if st.physics.vx.hypot(st.physics.vy) < 28.0 * m.scale {
+        st.orb_coasting = false;
+        st.physics = OrbPhysics::default();
+        st.orb_expand_suppress_until = now + Duration::from_millis(380);
+        return park_orb_at(st, m, mon, area, (nx, ny));
+    }
+    WatcherAction::MoveFast {
+        to: (nx, ny),
+        payload: None,
+        fx: impact.map(|hit| OrbFxPayload::impact(0.0, 0, Some(hit))),
+    }
+}
+
+/// Hover intent: the ball opens into the capsule only after the cursor has stayed on it
+/// for the dwell time without a button held and without sweeping through.
+fn decide_hover(
+    st: &mut DockInner,
+    env: &TickEnv,
+    m: &DockMetrics,
+    prev_cursor: Option<(Instant, f64, f64)>,
+) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, _, _) = env.win;
+    let half = m.orb_size as f64 * 0.5;
+    let hover_r = (ORB_VISUAL_RADIUS_LOGICAL_PX + 2.0) * m.scale;
+    let dist = (env.cur.0 - (wx as f64 + half)).hypot(env.cur.1 - (wy as f64 + half));
+
+    if dist > hover_r {
+        st.orb_hover_since = None;
+        if dist > hover_r + 10.0 * m.scale {
+            st.orb_hover_armed = true;
+        }
+        return WatcherAction::None;
+    }
+    if env.mouse_down {
+        // Never change shape under a held button: it is either a press on the ball or
+        // something being dragged across it.
+        st.orb_hover_since = None;
+        let hold_off = now + Duration::from_millis(300);
+        if hold_off > st.orb_expand_suppress_until {
+            st.orb_expand_suppress_until = hold_off;
+        }
+        return WatcherAction::None;
+    }
+    if !st.orb_hover_armed || now < st.orb_expand_suppress_until {
+        st.orb_hover_since = None;
+        return WatcherAction::None;
+    }
+    if cursor_speed(env, prev_cursor) > ORB_HOVER_MAX_SPEED_LOGICAL * m.scale {
+        st.orb_hover_since = Some(now);
+        return WatcherAction::None;
+    }
+    match st.orb_hover_since {
+        None => {
+            st.orb_hover_since = Some(now);
+            WatcherAction::None
+        }
+        Some(since) if now.duration_since(since) >= Duration::from_millis(ORB_HOVER_EXPAND_MS) => {
+            expand_orb_to_pod(st, env, m, true)
+        }
+        Some(_) => WatcherAction::None,
+    }
+}
+
+fn decide_pod_visible(st: &mut DockInner, env: &TickEnv, m: &DockMetrics) -> WatcherAction {
+    let now = env.now;
+    let (wx, wy, ww, wh) = env.win;
+    let (cx, cy) = env.cursor_px();
+
+    // The capsule stays anchored to (dock_x, dock_y). It shifts up only while an open
+    // drawer would run past the bottom of the work area, and returns once the drawer closes.
+    let (vis_x, vis_y) = compute_visible_pod_pos(
+        st.dock_x,
+        st.dock_y,
+        ww,
+        wh,
+        st.work_area,
+        st.edge,
+        m.margin,
+    );
+    if !st.tucked
+        && ((vis_x - wx).abs() > 2 || (vis_y - wy).abs() > 2)
+        && now >= st.ignore_moves_until
+    {
+        return WatcherAction::AdjustOnScreen {
+            to: (vis_x, vis_y),
+        };
+    }
+
+    if st.standby_mode == StandbyMode::Orb {
+        let pad = (8.0 * m.scale).round() as i32;
+        let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+        if inside || st.pinned || st.ui_hold || env.mouse_down {
+            st.last_hover_at = now;
+            if st.idle {
+                st.idle = false;
+                return WatcherAction::EmitOnly(st.payload());
+            }
+            return WatcherAction::None;
+        }
+        if now >= st.grace_until
+            && now.duration_since(st.last_hover_at) >= Duration::from_millis(1350)
+        {
+            let orb_pos = orb_home(st, m);
+            return WatcherAction::EnterOrb {
+                orb_pos,
+                orb_size: m.orb_size,
+                play: false,
+            };
+        }
+        return WatcherAction::None;
+    }
+
+    match st.edge {
+        DockEdge::Top | DockEdge::Left | DockEdge::Right => {
+            if st.tucked {
+                if !env.mouse_down
+                    && is_cursor_in_tucked_handle(
+                        cx,
+                        cy,
                         st.dock_x,
                         st.dock_y,
                         ww,
                         wh,
                         st.work_area,
+                        m.scale,
                         st.edge,
-                        margin,
-                    );
-                    if !st.tucked
-                        && ((vis_x - wx).abs() > 2 || (vis_y - wy).abs() > 2)
-                        && now >= st.ignore_moves_until
-                    {
-                        action = WatcherAction::AdjustOnScreen {
-                            to: (vis_x, vis_y),
-                        };
-                    } else if st.standby_mode == StandbyMode::Orb {
-                        let pad = (8.0 * scale).round() as i32;
-                        let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                        if inside || st.pinned || st.ui_hold || mouse_down {
-                            st.last_hover_at = now;
-                            if st.idle {
-                                st.idle = false;
-                                action = WatcherAction::EmitOnly(st.payload());
-                            }
-                        } else if now >= st.grace_until
-                            && now.duration_since(st.last_hover_at) >= Duration::from_millis(1350)
-                        {
-                            let pod_w = st.pod_w_phys.max(pod_default_w);
-                            let pod_h = st.pod_h_phys.max(pod_base_h);
-                            let opos = match (st.orb_x, st.orb_y) {
-                                (Some(ox), Some(oy)) => (ox, oy),
-                                _ => {
-                                    let p = compute_orb_pos_from_pod(
-                                        st.dock_x,
-                                        st.dock_y,
-                                        pod_w,
-                                        pod_h,
-                                        orb_size,
-                                        st.work_area,
-                                        st.edge,
-                                        margin,
-                                    );
-                                    st.orb_x = Some(p.0);
-                                    st.orb_y = Some(p.1);
-                                    p
-                                }
-                            };
-                            action = WatcherAction::EnterOrb {
-                                orb_pos: opos,
-                                orb_size,
-                                play: false,
-                            };
-                        }
-                    } else {
-                        match st.edge {
-                            DockEdge::Top | DockEdge::Left | DockEdge::Right => {
-                                if st.tucked {
-                                    if !mouse_down
-                                        && is_cursor_in_tucked_handle(
-                                            cx,
-                                            cy,
-                                            st.dock_x,
-                                            st.dock_y,
-                                            ww,
-                                            wh,
-                                            st.work_area,
-                                            scale,
-                                            st.edge,
-                                        )
-                                    {
-                                        st.tucked = false;
-                                        st.idle = false;
-                                        st.last_hover_at = now;
-                                        st.grace_until = now + Duration::from_millis(900);
-                                        let to = (st.dock_x, st.dock_y);
-                                        action = WatcherAction::UntuckEdge {
-                                            from: (wx, wy),
-                                            to,
-                                            payload: st.payload(),
-                                        };
-                                    }
-                                } else {
-                                    let pad = (8.0 * scale).round() as i32;
-                                    let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                                    if inside || st.pinned || st.ui_hold || mouse_down {
-                                        st.last_hover_at = now;
-                                    } else if now >= st.grace_until
-                                        && now.duration_since(st.last_hover_at)
-                                            >= Duration::from_millis(1200)
-                                    {
-                                        action = WatcherAction::TuckEdge {
-                                            edge: st.edge,
-                                            dock_x: st.dock_x,
-                                            dock_y: st.dock_y,
-                                            area: st.work_area,
-                                            seam: st.seam_mode,
-                                            peek,
-                                        };
-                                    }
-                                }
-                            }
-                            DockEdge::None => {
-                                let pad = (6.0 * scale).round() as i32;
-                                let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                                if inside || st.pinned || st.ui_hold || mouse_down {
-                                    st.last_hover_at = now;
-                                    if st.idle {
-                                        st.idle = false;
-                                        action = WatcherAction::EmitOnly(st.payload());
-                                    }
-                                } else if !st.idle
-                                    && now >= st.grace_until
-                                    && now.duration_since(st.last_hover_at)
-                                        >= Duration::from_millis(2200)
-                                {
-                                    st.idle = true;
-                                    action = WatcherAction::EmitOnly(st.payload());
-                                }
-                            }
-                        }
-                    }
+                    )
+                {
+                    st.tucked = false;
+                    st.idle = false;
+                    st.last_hover_at = now;
+                    st.grace_until = now + Duration::from_millis(900);
+                    return WatcherAction::UntuckEdge {
+                        from: (wx, wy),
+                        to: (st.dock_x, st.dock_y),
+                        payload: st.payload(),
+                    };
                 }
+                return WatcherAction::None;
             }
+            let pad = (8.0 * m.scale).round() as i32;
+            let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+            if inside || st.pinned || st.ui_hold || env.mouse_down {
+                st.last_hover_at = now;
+                return WatcherAction::None;
+            }
+            if now >= st.grace_until
+                && now.duration_since(st.last_hover_at) >= Duration::from_millis(1200)
+            {
+                return WatcherAction::TuckEdge {
+                    edge: st.edge,
+                    dock_x: st.dock_x,
+                    dock_y: st.dock_y,
+                    area: st.work_area,
+                    seam: st.seam_mode,
+                    peek: m.peek,
+                };
+            }
+            WatcherAction::None
+        }
+        DockEdge::None => {
+            let pad = (6.0 * m.scale).round() as i32;
+            let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+            if inside || st.pinned || st.ui_hold || env.mouse_down {
+                st.last_hover_at = now;
+                if st.idle {
+                    st.idle = false;
+                    return WatcherAction::EmitOnly(st.payload());
+                }
+                return WatcherAction::None;
+            }
+            if !st.idle
+                && now >= st.grace_until
+                && now.duration_since(st.last_hover_at) >= Duration::from_millis(2200)
+            {
+                st.idle = true;
+                return WatcherAction::EmitOnly(st.payload());
+            }
+            WatcherAction::None
+        }
+    }
+}
 
-            match action {
-                WatcherAction::None => {}
-                WatcherAction::MoveFast { to, payload, fx } => {
-                    set_window_pos_fast(&window, &dock, to.0, to.1);
-                    if let Some(p) = payload {
-                        let _ = window.emit("dock-state", p);
-                    }
-                    if let Some(f) = fx {
-                        let _ = window.emit("orb-fx", f);
-                    }
-                }
-                WatcherAction::GlideOrbReturn {
-                    from,
-                    to,
-                    payload,
-                    fx,
-                } => {
-                    let _ = window.emit("dock-state", payload);
-                    let _ = window.emit("orb-fx", fx);
-                    glide_window(&window, &dock, from, to, 10, 12);
-                }
-                WatcherAction::EmitOnly(payload) => {
-                    let _ = window.emit("dock-state", payload);
-                }
-                WatcherAction::EmitOrbFx(fx) => {
-                    let _ = window.emit("orb-fx", fx);
-                }
-                WatcherAction::AdjustOnScreen { to } => {
-                    set_programmatic_pos(&window, &dock, to.0, to.1);
-                }
-                WatcherAction::SnapPod { to, saved, payload } => {
-                    let _ = window.set_ignore_cursor_events(false);
-                    if let Ok(cur_pos) = window.outer_position() {
-                        if (cur_pos.x, cur_pos.y) != to {
-                            glide_window(&window, &dock, (cur_pos.x, cur_pos.y), to, 6, 14);
-                        }
-                    }
-                    persist_saved_dock(&saved);
-                    let _ = window.emit("dock-state", payload);
-                }
-                WatcherAction::SaveOrbDrag { to, saved, payload } => {
-                    if let Ok(cur_pos) = window.outer_position() {
-                        if (cur_pos.x, cur_pos.y) != to {
-                            set_programmatic_pos(&window, &dock, to.0, to.1);
-                        }
-                    }
-                    persist_saved_dock(&saved);
-                    let _ = window.emit("dock-state", payload);
-                }
-                WatcherAction::TuckEdge {
-                    edge,
-                    dock_x,
-                    dock_y,
-                    area,
-                    seam,
-                    peek,
-                } => {
-                    let _ = window.emit(
-                        "collapse-drawers",
-                        serde_json::json!({ "immediate": true }),
-                    );
-                    let f_ww = pod_default_w;
-                    let f_wh = pod_base_h;
-                    set_window_rect_atomic(&window, &dock, dock_x, dock_y, f_ww, f_wh);
-                    let target =
-                        tucked_window_pos(dock_x, dock_y, f_ww, f_wh, area, peek, edge, seam);
-                    glide_window(&window, &dock, (dock_x, dock_y), target, 10, 14);
-                    let payload = {
-                        let mut st = dock.lock().unwrap();
-                        st.pod_h_phys = pod_base_h;
-                        st.tucked = true;
-                        st.idle = true;
-                        st.payload()
-                    };
-                    let _ = window.set_ignore_cursor_events(true);
-                    let _ = window.emit("dock-state", payload);
-                }
-                WatcherAction::UntuckEdge { from, to, payload } => {
-                    let _ = window.set_ignore_cursor_events(false);
-                    let _ = window.emit("dock-state", payload);
-                    glide_window(&window, &dock, from, to, 10, 14);
-                }
-                WatcherAction::EnterOrb {
-                    orb_pos,
-                    orb_size,
-                    play,
-                } => {
-                    let _ = window.emit(
-                        "collapse-drawers",
-                        serde_json::json!({ "immediate": true }),
-                    );
-                    let payload = {
-                        let mut st = dock.lock().unwrap();
-                        st.pod_h_phys = pod_base_h;
-                        st.orb_collapsed = true;
-                        st.play_mode = play;
-                        st.tucked = false;
-                        st.idle = true;
-                        st.orb_hover_since = None;
-                        st.orb_hover_armed = false;
-                        st.orb_expand_suppress_until = Instant::now() + Duration::from_millis(480);
-                        st.ignore_moves_until = Instant::now() + Duration::from_millis(320);
-                        st.payload()
-                    };
-                    let _ = window.set_ignore_cursor_events(false);
-                    let _ = window.emit("dock-state", payload);
-                    if !play {
-                        let _ = window.emit(
-                            "orb-fx",
-                            OrbFxPayload {
-                                angle: 0.0,
-                                impact_axis: None,
-                                impact_speed: 0.0,
-                                combo: 0,
-                            },
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(16));
-                    set_window_rect_atomic(
-                        &window,
-                        &dock,
-                        orb_pos.0,
-                        orb_pos.1,
-                        orb_size,
-                        orb_size,
-                    );
-                }
-                WatcherAction::ExitOrb {
-                    pod_pos,
-                    pod_w,
-                    pod_h,
-                    payload,
-                } => {
-                    let _ = window.set_ignore_cursor_events(false);
-                    let _ = window.emit(
-                        "orb-fx",
-                        OrbFxPayload {
-                            angle: 0.0,
-                            impact_axis: None,
-                            impact_speed: 0.0,
-                            combo: 0,
-                        },
-                    );
-                    set_window_rect_atomic(&window, &dock, pod_pos.0, pod_pos.1, pod_w, pod_h);
-                    let _ = window.emit("dock-state", payload);
-                }
+fn tick_interval_ms(st: &DockInner) -> u64 {
+    if st.custom_dragging
+        || st.orb_press.is_some()
+        || st.pending_tap.is_some()
+        || st.pending_orb_return.is_some()
+        || st.orb_coasting
+        || st.force_tuck
+        || st.force_untuck
+        || (st.play_mode && st.orb_collapsed && !st.physics.sleeping)
+    {
+        8
+    } else if st.play_mode && st.orb_collapsed {
+        16
+    } else if st.orb_collapsed {
+        24
+    } else {
+        30
+    }
+}
+
+fn apply_watcher_action(
+    window: &WebviewWindow,
+    dock: &Arc<Mutex<DockInner>>,
+    m: &DockMetrics,
+    action: WatcherAction,
+) {
+    match action {
+        WatcherAction::None => {}
+        WatcherAction::MoveFast { to, payload, fx } => {
+            set_window_pos_fast(window, dock, to.0, to.1);
+            if let Some(p) = payload {
+                let _ = window.emit("dock-state", p);
+            }
+            if let Some(f) = fx {
+                let _ = window.emit("orb-fx", f);
             }
         }
+        WatcherAction::GlideOrbReturn { from, to, payload } => {
+            let _ = window.emit("dock-state", payload);
+            let _ = window.emit("orb-fx", OrbFxPayload::reset());
+            let distance = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64) / m.scale;
+            let duration_ms = (160.0 + 0.25 * distance).clamp(180.0, 420.0) as u64;
+            glide_window_timed(window, dock, from, to, duration_ms);
+        }
+        WatcherAction::EmitOnly(payload) => {
+            let _ = window.emit("dock-state", payload);
+        }
+        WatcherAction::EmitOrbFx(fx) => {
+            let _ = window.emit("orb-fx", fx);
+        }
+        WatcherAction::AdjustOnScreen { to } => {
+            set_programmatic_pos(window, dock, to.0, to.1);
+        }
+        WatcherAction::SnapPod { to, saved, payload } => {
+            let _ = window.set_ignore_cursor_events(false);
+            let hwnd = dock.lock().unwrap().hwnd;
+            if let Some((cur_x, cur_y, _, _)) = current_window_rect(window, hwnd) {
+                if (cur_x, cur_y) != to {
+                    glide_window(window, dock, (cur_x, cur_y), to, 6, 14);
+                }
+            }
+            persist_saved_dock(&saved);
+            let _ = window.emit("dock-state", payload);
+        }
+        WatcherAction::SaveOrbDrag { to, saved, payload } => {
+            let hwnd = dock.lock().unwrap().hwnd;
+            if let Some((cur_x, cur_y, _, _)) = current_window_rect(window, hwnd) {
+                if (cur_x, cur_y) != to {
+                    set_programmatic_pos(window, dock, to.0, to.1);
+                }
+            }
+            persist_saved_dock(&saved);
+            let _ = window.emit("dock-state", payload);
+        }
+        WatcherAction::TuckEdge {
+            edge,
+            dock_x,
+            dock_y,
+            area,
+            seam,
+            peek,
+        } => {
+            let _ = window.emit(
+                "collapse-drawers",
+                serde_json::json!({ "immediate": true }),
+            );
+            set_window_rect_atomic(window, dock, dock_x, dock_y, m.pod_w, m.pod_h);
+            let target = tucked_window_pos(dock_x, dock_y, m.pod_w, m.pod_h, area, peek, edge, seam);
+            glide_window(window, dock, (dock_x, dock_y), target, 10, 14);
+            let payload = {
+                let mut st = dock.lock().unwrap();
+                st.pod_h_phys = m.pod_h;
+                st.tucked = true;
+                st.idle = true;
+                st.payload()
+            };
+            let _ = window.set_ignore_cursor_events(true);
+            let _ = window.emit("dock-state", payload);
+        }
+        WatcherAction::UntuckEdge { from, to, payload } => {
+            let _ = window.set_ignore_cursor_events(false);
+            let _ = window.emit("dock-state", payload);
+            glide_window(window, dock, from, to, 10, 14);
+        }
+        WatcherAction::EnterOrb {
+            orb_pos,
+            orb_size,
+            play,
+        } => {
+            let payload = {
+                let mut st = dock.lock().unwrap();
+                if play && !st.play_mode {
+                    // Play mode was cancelled while the capsule was still collapsing.
+                    None
+                } else {
+                    let now = Instant::now();
+                    st.pod_h_phys = m.pod_h;
+                    st.orb_collapsed = true;
+                    st.tucked = false;
+                    st.idle = true;
+                    st.orb_hover_since = None;
+                    st.orb_hover_armed = false;
+                    st.orb_expand_suppress_until = now + Duration::from_millis(480);
+                    st.ignore_moves_until = now + Duration::from_millis(320);
+                    Some(st.payload())
+                }
+            };
+            let Some(payload) = payload else {
+                return;
+            };
+            let _ = window.emit(
+                "collapse-drawers",
+                serde_json::json!({ "immediate": true }),
+            );
+            let _ = window.set_ignore_cursor_events(false);
+            let _ = window.emit("dock-state", payload);
+            if !play {
+                let _ = window.emit("orb-fx", OrbFxPayload::reset());
+            }
+            std::thread::sleep(Duration::from_millis(16));
+            set_window_rect_atomic(window, dock, orb_pos.0, orb_pos.1, orb_size, orb_size);
+        }
+        WatcherAction::ExitOrb {
+            pod_pos,
+            pod_w,
+            pod_h,
+            payload,
+            guard_clicks,
+        } => {
+            let _ = window.set_ignore_cursor_events(false);
+            let _ = window.emit("orb-fx", OrbFxPayload::reset());
+            set_window_rect_atomic(window, dock, pod_pos.0, pod_pos.1, pod_w, pod_h);
+            let _ = window.emit("dock-state", payload);
+            if guard_clicks {
+                // The capsule just appeared under a cursor that was aiming at the ball.
+                let _ = window.emit("pod-click-guard", ());
+            }
+        }
+    }
+}
+
+fn start_dock_watcher(
+    window: WebviewWindow,
+    dock: Arc<Mutex<DockInner>>,
+    waker: Arc<OnceLock<std::thread::Thread>>,
+    quitting: Arc<AtomicBool>,
+) {
+    #[cfg(target_os = "windows")]
+    let hwnd: isize = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    #[cfg(not(target_os = "windows"))]
+    let hwnd: isize = 0;
+    {
+        let mut st = dock.lock().unwrap();
+        st.hwnd = hwnd;
+        st.scale = window.scale_factor().unwrap_or(1.0);
+    }
+
+    let handle = std::thread::spawn(move || {
+        let mon = NativeMonitors;
+        let double_press = double_press_window();
+        while !quitting.load(Ordering::SeqCst) {
+            let (interval_ms, scale) = {
+                let st = dock.lock().unwrap();
+                (tick_interval_ms(&st), st.scale)
+            };
+            // Parked rather than asleep, so a command can wake this thread at once.
+            std::thread::park_timeout(Duration::from_millis(interval_ms));
+            if quitting.load(Ordering::SeqCst) {
+                break;
+            }
+            let visible = native::is_visible(hwnd)
+                .unwrap_or_else(|| window.is_visible().unwrap_or(false));
+            if !visible {
+                continue;
+            }
+            let Some(cur) = current_cursor(&window) else {
+                continue;
+            };
+            let Some(win) = current_window_rect(&window, hwnd) else {
+                continue;
+            };
+            let m = DockMetrics::new(scale);
+            let env = TickEnv {
+                now: Instant::now(),
+                cur,
+                win,
+                mouse_down: native::primary_button_down(),
+                escape_down: native::escape_down(),
+                double_press,
+            };
+            let action = {
+                let mut st = dock.lock().unwrap();
+                if st.animating {
+                    continue;
+                }
+                decide_tick(&mut st, &env, &m, &mon)
+            };
+            apply_watcher_action(&window, &dock, &m, action);
+        }
     });
+    let _ = waker.set(handle.thread().clone());
 }
 
 #[tauri::command]
@@ -2599,32 +3522,36 @@ fn set_pod_envelope(
     logical_h: f64,
     collapsed: bool,
 ) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let clamped_logical = logical_h.clamp(POD_BASE_HEIGHT_LOGICAL_PX, 960.0);
-    let new_h = (clamped_logical * scale).round() as i32;
-    let base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
-    let default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
-    let margin = (8.0 * scale).round() as i32;
+    let hwnd = dock.inner.lock().unwrap().hwnd;
+    let live_rect = current_window_rect(&window, hwnd);
 
     let rect_opt = {
         let mut st = dock.inner.lock().unwrap();
+        let m = DockMetrics::new(st.scale);
+        let clamped_logical = logical_h.clamp(POD_BASE_HEIGHT_LOGICAL_PX, 960.0);
+        let new_h = (clamped_logical * m.scale).round() as i32;
         if st.tucked || st.orb_collapsed {
             None
         } else {
-            let pod_w = st.pod_w_phys.max(default_w);
+            let pod_w = st.pod_w_phys.max(m.pod_w);
             if collapsed {
-                st.pod_h_phys = base_h;
+                st.pod_h_phys = m.pod_h;
             }
-            let (vis_x, vis_y) = compute_visible_pod_pos(
-                st.dock_x,
-                st.dock_y,
-                pod_w,
-                new_h,
-                st.work_area,
-                st.edge,
-                margin,
-            );
-            Some((vis_x, vis_y, pod_w, new_h))
+            if st.custom_dragging {
+                // Mid-drag: resize in place, never snap back to the docked position.
+                live_rect.map(|(x, y, _, _)| (x, y, pod_w, new_h))
+            } else {
+                let (vis_x, vis_y) = compute_visible_pod_pos(
+                    st.dock_x,
+                    st.dock_y,
+                    pod_w,
+                    new_h,
+                    st.work_area,
+                    st.edge,
+                    m.margin,
+                );
+                Some((vis_x, vis_y, pod_w, new_h))
+            }
         }
     };
 
@@ -2647,6 +3574,7 @@ fn set_dock_pinned(app: AppHandle, dock: State<'_, DockController>, pinned: bool
         }
         (prev_collapsed, st.payload())
     };
+    dock.wake();
     if !was_collapsed {
         if let Some(window) = app.get_webview_window("main") {
             if pinned {
@@ -2673,6 +3601,8 @@ fn set_standby_mode(
         let mut st = dock.inner.lock().unwrap();
         let prev_collapsed = st.tucked || st.orb_collapsed;
         st.standby_mode = parsed;
+        // A deliberate choice of standby form replaces whatever play mode would restore.
+        st.pre_play_standby = None;
         let now = Instant::now();
         st.last_hover_at = now;
         st.grace_until = now + Duration::from_millis(2400);
@@ -2683,6 +3613,7 @@ fn set_standby_mode(
         }
         (prev_collapsed, st.to_saved(), st.payload())
     };
+    dock.wake();
     persist_saved_dock(&saved);
     if !was_collapsed {
         if let Some(window) = app.get_webview_window("main") {
@@ -2694,213 +3625,152 @@ fn set_standby_mode(
 
 #[tauri::command]
 fn expand_from_orb(dock: State<'_, DockController>) {
-    let mut st = dock.inner.lock().unwrap();
-    if st.orb_collapsed || st.tucked {
-        st.play_mode = false;
-        st.orb_coasting = false;
-        st.force_untuck = true;
+    {
+        let mut st = dock.inner.lock().unwrap();
+        if st.orb_collapsed || st.tucked {
+            st.force_untuck = true;
+        }
     }
+    dock.wake();
 }
 
+/// Starts dragging the capsule. `off_x`/`off_y` are where the press landed inside the
+/// window, in logical pixels, so the grab point stays exactly under the cursor.
 #[tauri::command]
-fn begin_window_drag(window: WebviewWindow, dock: State<'_, DockController>) {
-    let (Ok(cur), Ok(wpos), Ok(wsize)) = (
-        window.cursor_position(),
-        window.outer_position(),
-        window.outer_size(),
-    ) else {
+fn begin_window_drag(
+    window: WebviewWindow,
+    dock: State<'_, DockController>,
+    off_x: f64,
+    off_y: f64,
+) {
+    if !is_primary_mouse_down() || !off_x.is_finite() || !off_y.is_finite() {
+        return;
+    }
+    let hwnd = dock.inner.lock().unwrap().hwnd;
+    let Some((wx, wy, ww, wh)) = current_window_rect(&window, hwnd) else {
         return;
     };
-    let cx = cur.x.round() as i32;
-    let cy = cur.y.round() as i32;
-    let ww = (wsize.width as i32).max(1);
-    let wh = (wsize.height as i32).max(1);
-    let off_x = (cx - wpos.x).clamp(0, ww);
-    let off_y = (cy - wpos.y).clamp(0, wh);
     let now = Instant::now();
-
-    let mut st = dock.inner.lock().unwrap();
-    let t_sec = now.duration_since(st.epoch).as_secs_f64();
-    st.custom_dragging = true;
-    st.orb_coasting = false;
-    st.drag_offset = (off_x, off_y);
-    st.vel_tracker.clear();
-    st.vel_tracker.push(t_sec, wpos.x as f64, wpos.y as f64);
-    st.physics.vx = 0.0;
-    st.physics.vy = 0.0;
-    st.physics.omega = 0.0;
-    st.physics.sleeping = true;
-    st.orb_hover_since = None;
-    st.orb_hover_armed = false;
-    st.orb_expand_suppress_until = now + Duration::from_millis(650);
-    st.last_hover_at = now;
+    {
+        let mut st = dock.inner.lock().unwrap();
+        if st.orb_collapsed || st.tucked || st.animating {
+            return;
+        }
+        let grab = (
+            ((off_x * st.scale).round() as i32).clamp(0, ww.max(1)),
+            ((off_y * st.scale).round() as i32).clamp(0, wh.max(1)),
+        );
+        let t = now.duration_since(st.epoch).as_secs_f64();
+        st.custom_dragging = true;
+        st.drag_offset = grab;
+        st.vel_tracker.clear();
+        st.vel_tracker.push(t, wx as f64, wy as f64);
+        st.last_hover_at = now;
+    }
+    dock.wake();
 }
 
+/// The primary button went down on the ball. `off_x`/`off_y` are the press position inside
+/// the window in logical pixels; `sent_at` is the page's wall-clock time in milliseconds,
+/// used to drop a command that arrives after the press it describes is long over.
+#[tauri::command]
+fn orb_pointer_down(
+    window: WebviewWindow,
+    dock: State<'_, DockController>,
+    off_x: f64,
+    off_y: f64,
+    sent_at: f64,
+) {
+    let lag = unix_millis_now() - sent_at;
+    if !lag.is_finite() || !(-2000.0..=ORB_PRESS_MAX_IPC_LAG_MS).contains(&lag) {
+        return;
+    }
+    if !off_x.is_finite() || !off_y.is_finite() {
+        return;
+    }
+    let Some(cur) = current_cursor(&window) else {
+        return;
+    };
+    let hwnd = dock.inner.lock().unwrap().hwnd;
+    let Some((wx, wy, _, _)) = current_window_rect(&window, hwnd) else {
+        return;
+    };
+    let now = Instant::now();
+    let entered_payload = {
+        let mut st = dock.inner.lock().unwrap();
+        let m = DockMetrics::new(st.scale);
+        let outcome = orb_press_begin(
+            &mut st,
+            now,
+            (cur.0.round() as i32, cur.1.round() as i32),
+            (wx, wy),
+            (off_x, off_y),
+            &m,
+        );
+        if outcome == PressOutcome::EnteredPlay {
+            Some(st.payload())
+        } else {
+            None
+        }
+    };
+    if let Some(payload) = entered_payload {
+        let _ = window.emit("dock-state", payload);
+    }
+    dock.wake();
+}
+
+/// The button came up. The watcher notices this on its own by polling; this only wakes it
+/// so the release is handled without waiting for the next tick.
+#[tauri::command]
+fn orb_pointer_up(dock: State<'_, DockController>) {
+    dock.wake();
+}
+
+/// Leaves play mode. Used by the close badge, right click and Escape.
+#[tauri::command]
+fn exit_orb_play(dock: State<'_, DockController>) {
+    {
+        let mut st = dock.inner.lock().unwrap();
+        let m = DockMetrics::new(st.scale);
+        request_exit_play(&mut st, Instant::now(), &m);
+    }
+    dock.wake();
+}
+
+/// Enters play mode from the capsule (double click on its ring), or toggles it when the
+/// ball is already showing.
 #[tauri::command]
 fn toggle_orb_play_mode(
     window: WebviewWindow,
     dock: State<'_, DockController>,
 ) -> DockStatePayload {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as i32;
-    let margin = (8.0 * scale).round() as i32;
-    let pod_default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
-    let pod_base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
-    let cur_pos = window.outer_position().ok().map(|p| (p.x, p.y));
-    let cur_cursor = window.cursor_position().ok().map(|c| (c.x.round() as i32, c.y.round() as i32));
+    let cursor = current_cursor(&window).map(|c| (c.0.round() as i32, c.1.round() as i32));
+    let hwnd = dock.inner.lock().unwrap().hwnd;
+    let win_pos = current_window_rect(&window, hwnd).map(|(x, y, _, _)| (x, y));
     let now = Instant::now();
 
-    let mut emit_now = false;
-    let payload = {
+    let (payload, emit_now) = {
         let mut st = dock.inner.lock().unwrap();
-        st.custom_dragging = false;
-        st.orb_coasting = false;
-        st.orb_hover_since = None;
-        st.orb_hover_armed = false;
-        st.orb_expand_suppress_until = now + Duration::from_millis(650);
-
-        if st.play_mode {
-            // Exit Gravity Play Mode
-            st.play_mode = false;
-            let prev_standby = st.pre_play_standby.take().unwrap_or(st.standby_mode);
-            st.standby_mode = prev_standby;
-            let home_orb = st.pre_play_orb_pos.take().unwrap_or_else(|| {
-                let pod_w = st.pod_w_phys.max(pod_default_w);
-                let pod_h = st.pod_h_phys.max(pod_base_h);
-                compute_orb_pos_from_pod(
-                    st.dock_x,
-                    st.dock_y,
-                    pod_w,
-                    pod_h,
-                    orb_size,
-                    st.work_area,
-                    st.edge,
-                    margin,
-                )
-            });
-
-            if prev_standby == StandbyMode::Orb && st.orb_collapsed {
-                st.orb_x = Some(home_orb.0);
-                st.orb_y = Some(home_orb.1);
-                st.pending_orb_return = Some(home_orb);
-            } else {
-                st.physics = OrbPhysics::default();
-                st.force_untuck = true;
-            }
-        } else {
-            // Enter Gravity Play Mode!
-            let start_pos = if st.orb_collapsed {
-                let p = cur_pos.unwrap_or_else(|| {
-                    (
-                        st.orb_x.unwrap_or(st.work_area.x + margin),
-                        st.orb_y.unwrap_or(st.work_area.y + margin),
-                    )
-                });
-                st.pre_play_orb_pos = Some((st.orb_x.unwrap_or(p.0), st.orb_y.unwrap_or(p.1)));
-                st.pre_play_standby = None;
-                emit_now = true;
-                p
-            } else {
-                let pod_w = st.pod_w_phys.max(pod_default_w);
-                let pod_h = st.pod_h_phys.max(pod_base_h);
-                let home = compute_orb_pos_from_pod(
-                    st.dock_x,
-                    st.dock_y,
-                    pod_w,
-                    pod_h,
-                    orb_size,
-                    st.work_area,
-                    st.edge,
-                    margin,
-                );
-                st.pre_play_orb_pos = Some(home);
-                st.pre_play_standby = Some(st.standby_mode);
-                st.force_tuck = true;
-                if let Some((cx, cy)) = cur_cursor {
-                    let min_x = st.work_area.x + margin;
-                    let max_x = (st.work_area.right() - orb_size - margin).max(min_x);
-                    let min_y = st.work_area.y + margin;
-                    let max_y = (st.work_area.bottom() - orb_size - margin).max(min_y);
-                    (
-                        (cx - orb_size / 2).clamp(min_x, max_x),
-                        (cy - orb_size / 2).clamp(min_y, max_y),
-                    )
-                } else {
-                    home
-                }
-            };
-
-            let live_area = monitor_work_rect(&window, start_pos.0 + orb_size / 2, start_pos.1 + orb_size / 2)
-                .unwrap_or(st.work_area);
-            st.work_area = live_area;
-            st.play_mode = true;
-            st.physics = OrbPhysics {
-                px: start_pos.0 as f64,
-                py: start_pos.1 as f64,
-                vx: 165.0 * scale,
-                vy: -430.0 * scale,
-                omega: 4.2,
-                angle_deg: 0.0,
-                sleeping: false,
-                combo: 0,
-            };
-            st.last_physics_tick = now;
+        let m = DockMetrics::new(st.scale);
+        let mut emit_now = false;
+        if st.animating || now < st.toggle_lock_until {
+            // Ignore repeats that arrive while a toggle is still settling.
+        } else if st.play_mode {
+            request_exit_play(&mut st, now, &m);
+        } else if st.orb_collapsed {
+            let start = win_pos.unwrap_or_else(|| orb_home(&mut st, &m));
+            enter_play_from_orb(&mut st, now, start, &m);
+            emit_now = true;
+        } else if !st.tucked {
+            enter_play_from_pod(&mut st, now, cursor, &m);
         }
-        st.payload()
+        (st.payload(), emit_now)
     };
-
     if emit_now {
         let _ = window.emit("dock-state", payload.clone());
     }
+    dock.wake();
     payload
-}
-
-#[tauri::command]
-fn orb_tap_impulse(window: WebviewWindow, dock: State<'_, DockController>) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as f64;
-    let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
-    let cur_opt = window.cursor_position().ok();
-    let now = Instant::now();
-
-    let fx_opt = {
-        let mut st = dock.inner.lock().unwrap();
-        if !st.orb_collapsed || !st.play_mode {
-            None
-        } else {
-            let lateral = if let Some(cur) = cur_opt {
-                let bcx = st.physics.px + orb_size * 0.5;
-                let norm = ((bcx - cur.x) / r).clamp(-1.0, 1.0);
-                norm * 460.0 * scale
-            } else {
-                0.0
-            };
-            st.physics.vx = (st.physics.vx * 0.45 + lateral).clamp(-2600.0 * scale, 2600.0 * scale);
-            st.physics.vy = (-940.0 * scale).min(st.physics.vy - 520.0 * scale);
-            st.physics.omega = (st.physics.vx / r) * 0.9;
-            st.physics.sleeping = false;
-            st.physics.combo = st.physics.combo.saturating_add(1);
-            st.last_physics_tick = now;
-            Some(OrbFxPayload {
-                angle: st.physics.angle_deg,
-                impact_axis: Some("y"),
-                impact_speed: 920.0,
-                combo: st.physics.combo,
-            })
-        }
-    };
-
-    if let Some(fx) = fx_opt {
-        let _ = window.emit("orb-fx", fx);
-    }
-}
-
-#[tauri::command]
-fn suppress_orb_hover(dock: State<'_, DockController>, ms: u64) {
-    let mut st = dock.inner.lock().unwrap();
-    let clamped = ms.clamp(80, 2000);
-    st.orb_hover_since = None;
-    st.orb_expand_suppress_until = Instant::now() + Duration::from_millis(clamped);
 }
 
 #[tauri::command]
@@ -2910,32 +3780,10 @@ fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
     };
     let should_hide = {
         let mut st = dock.inner.lock().unwrap();
-        if st.orb_collapsed && st.play_mode {
-            // Pressing Escape while in Gravity Play Mode exits play mode back to parked Orb / Pod!
-            let prev_standby = st.pre_play_standby.take().unwrap_or(st.standby_mode);
-            st.standby_mode = prev_standby;
-            if prev_standby == StandbyMode::Orb {
-                if let Some(home) = st.pre_play_orb_pos.take() {
-                    st.orb_x = Some(home.0);
-                    st.orb_y = Some(home.1);
-                    st.pending_orb_return = Some(home);
-                } else {
-                    st.play_mode = false;
-                    st.physics = OrbPhysics::default();
-                }
-            } else {
-                st.play_mode = false;
-                st.physics = OrbPhysics::default();
-                st.force_untuck = true;
-            }
-            false
-        } else if st.standby_mode == StandbyMode::Orb || st.edge != DockEdge::None {
-            st.force_tuck = true;
-            false
-        } else {
-            true
-        }
+        let m = DockMetrics::new(st.scale);
+        request_tuck(&mut st, Instant::now(), &m)
     };
+    dock.wake();
     if should_hide {
         let _ = window.hide();
     }
@@ -2944,8 +3792,8 @@ fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let mut immediate_payload: Option<DockStatePayload> = None;
+        let dock = app.state::<DockController>();
         {
-            let dock = app.state::<DockController>();
             let mut st = dock.inner.lock().unwrap();
             let now = Instant::now();
             st.last_hover_at = now;
@@ -2957,6 +3805,7 @@ fn show_main_window(app: &AppHandle) {
                 immediate_payload = Some(st.payload());
             }
         }
+        dock.wake();
         let _ = window.set_ignore_cursor_events(false);
         let _ = window.show();
         let _ = window.unminimize();
@@ -3049,6 +3898,7 @@ fn main() {
     cleanup_stale_old_exe();
     let quitting = Arc::new(AtomicBool::new(false));
     let dock_inner = Arc::new(Mutex::new(DockInner::new()));
+    let dock_waker: Arc<OnceLock<std::thread::Thread>> = Arc::new(OnceLock::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -3060,15 +3910,17 @@ fn main() {
         })
         .manage(DockController {
             inner: Arc::clone(&dock_inner),
+            waker: Arc::clone(&dock_waker),
         })
         .setup({
             let quitting = Arc::clone(&quitting);
             let dock_inner = Arc::clone(&dock_inner);
+            let dock_waker = Arc::clone(&dock_waker);
             move |app| {
                 setup_tray(app.handle())?;
                 if let Some(win) = app.get_webview_window("main") {
                     init_window_dock(&win, &dock_inner);
-                    start_dock_watcher(win, dock_inner, quitting);
+                    start_dock_watcher(win, dock_inner, dock_waker, quitting);
                 }
                 Ok(())
             }
@@ -3076,15 +3928,26 @@ fn main() {
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 match event {
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        let dock = window.app_handle().state::<DockController>();
+                        dock.inner.lock().unwrap().scale = *scale_factor;
+                    }
                     WindowEvent::Moved(pos) => {
                         let dock = window.app_handle().state::<DockController>();
                         let now = Instant::now();
                         let mut untuck = false;
                         {
                             let mut st = dock.inner.lock().unwrap();
+                            // Every move we make ourselves is announced first. While a drag,
+                            // a press on the ball or play mode is running, all moves are ours.
                             let is_prog = st.animating
                                 || now < st.ignore_moves_until
-                                || st.last_programmatic_target == Some((pos.x, pos.y));
+                                || st.last_programmatic_target == Some((pos.x, pos.y))
+                                || st.custom_dragging
+                                || st.orb_press.is_some()
+                                || st.pending_tap.is_some()
+                                || st.play_mode
+                                || st.orb_coasting;
                             if !is_prog {
                                 st.pending_user_move = true;
                                 st.last_move_at = now;
@@ -3133,9 +3996,10 @@ fn main() {
             set_standby_mode,
             expand_from_orb,
             begin_window_drag,
+            orb_pointer_down,
+            orb_pointer_up,
+            exit_orb_play,
             toggle_orb_play_mode,
-            orb_tap_impulse,
-            suppress_orb_hover,
             tuck_or_hide
         ])
         .run(tauri::generate_context!())
@@ -3211,6 +4075,22 @@ mod tests {
         assert!(tool_args("open-safe", None).is_err());
         assert!(tool_args("update-now", None).is_err());
         assert!(tool_args("export-diagnostics", None).is_err());
+    }
+
+    #[test]
+    fn progress_lines_are_recognised_and_other_output_is_not() {
+        assert_eq!(
+            parse_progress_line("PROGRESS:download:42\r\n"),
+            Some(("download".to_string(), 42))
+        );
+        assert_eq!(
+            parse_progress_line("PROGRESS:install:250"),
+            Some(("install".to_string(), 100))
+        );
+        assert_eq!(parse_progress_line("OK:已通过完整性校验"), None);
+        assert_eq!(parse_progress_line("PROGRESS:download:"), None);
+        assert_eq!(parse_progress_line("PROGRESS:bad stage:5"), None);
+        assert_eq!(parse_progress_line("  INFO: PROGRESS:download:5"), None);
     }
 
     #[test]
@@ -3470,5 +4350,575 @@ mod tests {
         vt.push(0.010, 900.0, 0.0);
         let (cvx, _) = vt.velocity(3000.0);
         assert!((cvx - 3000.0).abs() < 1e-3);
+    }
+
+    // ---- Ball gesture state machine, driven tick by tick without a desktop ----
+
+    struct FakeMonitors(WorkRect);
+
+    impl MonitorProbe for FakeMonitors {
+        fn work_rect_at(&self, _x: i32, _y: i32) -> Option<WorkRect> {
+            Some(self.0)
+        }
+        fn exists_at(&self, _x: i32, _y: i32) -> bool {
+            false
+        }
+    }
+
+    const TEST_AREA: WorkRect = WorkRect {
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1040,
+    };
+    const ORB_HOME: (i32, i32) = (800, 400);
+    const ORB_WIN: (i32, i32, i32, i32) = (800, 400, 72, 72);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A dock parked as the ball at ORB_HOME in "orb" standby. The returned instant is late
+    /// enough that every startup grace period is already over.
+    fn parked_orb() -> (DockInner, Instant) {
+        let mut st = DockInner::new();
+        st.work_area = TEST_AREA;
+        st.standby_mode = StandbyMode::Orb;
+        st.edge = DockEdge::None;
+        st.dock_x = 596;
+        st.dock_y = 404;
+        st.orb_x = Some(ORB_HOME.0);
+        st.orb_y = Some(ORB_HOME.1);
+        st.orb_collapsed = true;
+        (st, Instant::now() + ms(5000))
+    }
+
+    fn tick_env(
+        now: Instant,
+        cur: (f64, f64),
+        win: (i32, i32, i32, i32),
+        mouse_down: bool,
+    ) -> TickEnv {
+        TickEnv {
+            now,
+            cur,
+            win,
+            mouse_down,
+            escape_down: false,
+            double_press: ms(275),
+        }
+    }
+
+    /// Applies the part of an action that moves or reshapes the window, as the watcher would.
+    fn follow(st: &mut DockInner, win: &mut (i32, i32, i32, i32), action: &WatcherAction) {
+        match action {
+            WatcherAction::MoveFast { to, .. }
+            | WatcherAction::SaveOrbDrag { to, .. }
+            | WatcherAction::GlideOrbReturn { to, .. } => {
+                win.0 = to.0;
+                win.1 = to.1;
+            }
+            WatcherAction::EnterOrb {
+                orb_pos, orb_size, ..
+            } => {
+                st.orb_collapsed = true;
+                *win = (orb_pos.0, orb_pos.1, *orb_size, *orb_size);
+            }
+            WatcherAction::ExitOrb {
+                pod_pos,
+                pod_w,
+                pod_h,
+                ..
+            } => {
+                *win = (pod_pos.0, pod_pos.1, *pod_w, *pod_h);
+            }
+            _ => {}
+        }
+    }
+
+    fn center_of(win: (i32, i32, i32, i32)) -> (f64, f64) {
+        (
+            win.0 as f64 + win.2 as f64 / 2.0,
+            win.1 as f64 + win.3 as f64 / 2.0,
+        )
+    }
+
+    fn press_center(
+        st: &mut DockInner,
+        m: &DockMetrics,
+        at: Instant,
+        win: (i32, i32, i32, i32),
+    ) -> PressOutcome {
+        let c = center_of(win);
+        orb_press_begin(
+            st,
+            at,
+            (c.0 as i32, c.1 as i32),
+            (win.0, win.1),
+            (36.0, 36.0),
+            m,
+        )
+    }
+
+    /// Presses and releases on the middle of the ball. Returns the time of the release tick.
+    fn tap(
+        st: &mut DockInner,
+        m: &DockMetrics,
+        mon: &FakeMonitors,
+        at: Instant,
+        win: &mut (i32, i32, i32, i32),
+    ) -> Instant {
+        assert_eq!(press_center(st, m, at, *win), PressOutcome::Pressed);
+        let c = center_of(*win);
+        let held = decide_tick(st, &tick_env(at + ms(16), c, *win, true), m, mon);
+        follow(st, win, &held);
+        let released_at = at + ms(70);
+        let released = decide_tick(st, &tick_env(released_at, c, *win, false), m, mon);
+        follow(st, win, &released);
+        released_at
+    }
+
+    /// Runs physics ticks with the cursor parked far away until the ball comes to rest.
+    fn settle(
+        st: &mut DockInner,
+        m: &DockMetrics,
+        mon: &FakeMonitors,
+        from: Instant,
+        win: &mut (i32, i32, i32, i32),
+    ) -> Instant {
+        let mut t = from;
+        for _ in 0..2500 {
+            t += ms(8);
+            let action = decide_tick(st, &tick_env(t, (10.0, 10.0), *win, false), m, mon);
+            follow(st, win, &action);
+            if st.physics.sleeping {
+                break;
+            }
+        }
+        t
+    }
+
+    fn resting_play_ball(
+        m: &DockMetrics,
+        mon: &FakeMonitors,
+    ) -> (DockInner, Instant, (i32, i32, i32, i32)) {
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+        enter_play_from_orb(&mut st, t0, (win.0, win.1), m);
+        let rested = settle(&mut st, m, mon, t0, &mut win);
+        assert!(st.play_mode && st.physics.sleeping);
+        assert_eq!(win.1, 1040 - 72 + 8, "the ball rests on the bottom of the work area");
+        (st, rested + ms(600), win)
+    }
+
+    #[test]
+    fn single_tap_on_parked_ball_opens_capsule_after_double_press_window() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+        let c = center_of(win);
+
+        let released = tap(&mut st, &m, &mon, t0, &mut win);
+        assert!(st.pending_tap.is_some());
+        assert!(st.orb_collapsed, "a tap must wait for a possible second press");
+
+        let waiting = decide_tick(&mut st, &tick_env(released + ms(150), c, win, false), &m, &mon);
+        assert!(matches!(waiting, WatcherAction::None));
+        assert!(st.orb_collapsed);
+
+        let opened = decide_tick(&mut st, &tick_env(released + ms(280), c, win, false), &m, &mon);
+        match opened {
+            WatcherAction::ExitOrb { guard_clicks, .. } => assert!(guard_clicks),
+            _ => panic!("a single tap should open the capsule"),
+        }
+        assert!(!st.orb_collapsed);
+        assert!(!st.play_mode);
+    }
+
+    #[test]
+    fn double_press_enters_play_and_a_second_double_press_flies_the_ball_home() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+
+        let released = tap(&mut st, &m, &mon, t0, &mut win);
+        assert_eq!(
+            press_center(&mut st, &m, released + ms(110), win),
+            PressOutcome::EnteredPlay
+        );
+        assert!(st.play_mode && st.orb_collapsed);
+        assert!(st.pending_tap.is_none());
+        assert_eq!(st.pre_play_orb_pos, Some(ORB_HOME));
+
+        // A third click right behind the double click must not toggle straight back.
+        assert_eq!(
+            press_center(&mut st, &m, released + ms(260), win),
+            PressOutcome::Ignored
+        );
+        assert!(st.play_mode);
+
+        let rested = settle(&mut st, &m, &mon, released + ms(300), &mut win);
+        assert!(st.physics.sleeping && st.play_mode);
+        assert_eq!(win.1, 1040 - 72 + 8);
+
+        // Double press on the resting ball: the first press holds it still so the second lands.
+        let before = (win.0, win.1);
+        let released2 = tap(&mut st, &m, &mon, rested + ms(500), &mut win);
+        let c = center_of(win);
+        let frozen = decide_tick(&mut st, &tick_env(released2 + ms(100), c, win, false), &m, &mon);
+        assert!(matches!(frozen, WatcherAction::None));
+        assert_eq!((win.0, win.1), before, "the ball holds still between the two presses");
+
+        assert_eq!(
+            press_center(&mut st, &m, released2 + ms(140), win),
+            PressOutcome::ExitedPlay
+        );
+        assert!(!st.play_mode);
+
+        let fly = decide_tick(&mut st, &tick_env(released2 + ms(148), c, win, true), &m, &mon);
+        match fly {
+            WatcherAction::GlideOrbReturn { to, payload, .. } => {
+                assert_eq!(to, ORB_HOME);
+                assert!(payload.orb && !payload.play);
+            }
+            _ => panic!("leaving play mode should fly the ball home"),
+        }
+        assert!(st.pending_orb_return.is_none());
+        assert_eq!(st.work_area, TEST_AREA);
+    }
+
+    #[test]
+    fn single_tap_in_play_holds_the_ball_then_pops_it_upward() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t, mut win) = resting_play_ball(&m, &mon);
+        let before = (win.0, win.1);
+
+        let released = tap(&mut st, &m, &mon, t, &mut win);
+        assert!(st.pending_tap.is_some());
+        let c = center_of(win);
+
+        // While it waits, neither gravity nor a cursor racing past moves the ball.
+        let sweep = decide_tick(
+            &mut st,
+            &tick_env(released + ms(60), (c.0 + 400.0, c.1), win, false),
+            &m,
+            &mon,
+        );
+        assert!(matches!(sweep, WatcherAction::None));
+        assert_eq!((win.0, win.1), before);
+
+        let pop = decide_tick(&mut st, &tick_env(released + ms(280), c, win, false), &m, &mon);
+        assert!(matches!(pop, WatcherAction::EmitOrbFx(_)));
+        assert!(st.physics.vy < -500.0 && !st.physics.sleeping);
+        assert!(st.play_mode);
+    }
+
+    #[test]
+    fn pressing_a_flying_ball_catches_it_and_it_follows_the_cursor() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+        enter_play_from_orb(&mut st, t0, (win.0, win.1), &m);
+
+        let mut t = t0;
+        for _ in 0..50 {
+            t += ms(8);
+            let action = decide_tick(&mut st, &tick_env(t, (10.0, 10.0), win, false), &m, &mon);
+            follow(&mut st, &mut win, &action);
+        }
+        assert!(!st.physics.sleeping, "the ball should still be in the air");
+
+        let c = center_of(win);
+        assert_eq!(press_center(&mut st, &m, t, win), PressOutcome::Pressed);
+        assert_eq!((st.physics.vx, st.physics.vy), (0.0, 0.0));
+
+        // Held with a still cursor: no gravity, the ball stays under the cursor.
+        let held_pos = (win.0, win.1);
+        for i in 1..=10 {
+            let action = decide_tick(&mut st, &tick_env(t + ms(8 * i), c, win, true), &m, &mon);
+            follow(&mut st, &mut win, &action);
+        }
+        assert_eq!((win.0, win.1), held_pos);
+
+        // Moving the cursor carries the ball, keeping the grab point under it.
+        let moved = (c.0 + 120.0, c.1 - 80.0);
+        let action = decide_tick(&mut st, &tick_env(t + ms(96), moved, win, true), &m, &mon);
+        follow(&mut st, &mut win, &action);
+        assert_eq!((win.0, win.1), (held_pos.0 + 120, held_pos.1 - 80));
+    }
+
+    #[test]
+    fn hover_opens_the_capsule_only_after_a_calm_dwell() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t0) = parked_orb();
+        let win = ORB_WIN;
+        let c = center_of(win);
+
+        let away = decide_tick(&mut st, &tick_env(t0, (c.0 + 200.0, c.1), win, false), &m, &mon);
+        assert!(matches!(away, WatcherAction::None));
+        assert!(st.orb_hover_armed);
+
+        // A fast sweep across the ball never counts as hovering.
+        for (i, dx) in [-60.0, 0.0, 60.0].iter().enumerate() {
+            let at = t0 + ms(24 * (i as u64 + 1));
+            let action = decide_tick(&mut st, &tick_env(at, (c.0 + dx, c.1), win, false), &m, &mon);
+            assert!(matches!(action, WatcherAction::None));
+        }
+
+        // Resting on the ball: nothing happens before the dwell time is over.
+        let arrive = t0 + ms(200);
+        for i in 0..=15u64 {
+            let action = decide_tick(&mut st, &tick_env(arrive + ms(24 * i), c, win, false), &m, &mon);
+            assert!(matches!(action, WatcherAction::None), "opened too early at step {i}");
+        }
+        assert!(st.orb_collapsed);
+
+        let opened = decide_tick(&mut st, &tick_env(arrive + ms(24 * 16), c, win, false), &m, &mon);
+        match opened {
+            WatcherAction::ExitOrb { guard_clicks, .. } => assert!(guard_clicks),
+            _ => panic!("hover should open the capsule after the dwell"),
+        }
+    }
+
+    #[test]
+    fn hover_never_opens_the_capsule_under_a_held_button() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t0) = parked_orb();
+        let win = ORB_WIN;
+        let c = center_of(win);
+        let _ = decide_tick(&mut st, &tick_env(t0, (c.0 + 200.0, c.1), win, false), &m, &mon);
+
+        // The button is held on the ball well past the dwell time.
+        for i in 1..=30u64 {
+            let action = decide_tick(&mut st, &tick_env(t0 + ms(24 * i), c, win, true), &m, &mon);
+            assert!(matches!(action, WatcherAction::None));
+        }
+        assert!(st.orb_collapsed);
+
+        // Right after release it still holds off for a moment.
+        let released = t0 + ms(24 * 31);
+        let soon = decide_tick(&mut st, &tick_env(released + ms(200), c, win, false), &m, &mon);
+        assert!(matches!(soon, WatcherAction::None));
+        assert!(st.orb_collapsed);
+    }
+
+    #[test]
+    fn dropping_the_ball_parks_it_where_released_and_only_a_flick_makes_it_glide() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+
+        // A normal placement at about 500 px/s.
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+        let c = center_of(win);
+        assert_eq!(press_center(&mut st, &m, t0, win), PressOutcome::Pressed);
+        let nudge = decide_tick(&mut st, &tick_env(t0 + ms(8), (c.0 + 3.0, c.1), win, true), &m, &mon);
+        assert!(matches!(nudge, WatcherAction::None), "movement inside the slop is not a drag");
+
+        let mut t = t0 + ms(8);
+        let mut cur = c;
+        for _ in 0..75 {
+            t += ms(8);
+            cur.0 += 4.0;
+            let action = decide_tick(&mut st, &tick_env(t, cur, win, true), &m, &mon);
+            follow(&mut st, &mut win, &action);
+        }
+        assert_eq!(win.0, ORB_HOME.0 + 300);
+
+        let drop = decide_tick(&mut st, &tick_env(t + ms(8), cur, win, false), &m, &mon);
+        match drop {
+            WatcherAction::SaveOrbDrag { to, .. } => assert_eq!(to, (ORB_HOME.0 + 300, ORB_HOME.1)),
+            _ => panic!("a slow drop should park the ball right where it was released"),
+        }
+        assert!(!st.orb_coasting && st.orb_press.is_none());
+        assert_eq!(st.orb_x, Some(ORB_HOME.0 + 300));
+
+        // A deliberate flick at about 2500 px/s.
+        let (mut st, t0) = parked_orb();
+        let mut win = ORB_WIN;
+        assert_eq!(press_center(&mut st, &m, t0, win), PressOutcome::Pressed);
+        let mut t = t0;
+        let mut cur = center_of(win);
+        for _ in 0..12 {
+            t += ms(8);
+            cur.0 += 20.0;
+            let action = decide_tick(&mut st, &tick_env(t, cur, win, true), &m, &mon);
+            follow(&mut st, &mut win, &action);
+        }
+        let flick = decide_tick(&mut st, &tick_env(t + ms(8), cur, win, false), &m, &mon);
+        assert!(matches!(flick, WatcherAction::None));
+        assert!(st.orb_coasting, "a flick should let the ball glide on");
+    }
+
+    #[test]
+    fn reaching_for_a_resting_ball_does_not_kick_it_but_a_fast_swipe_does() {
+        let bounds = OrbPhysicsBounds::from_work_area(TEST_AREA, 72, 8);
+        let mut phys = OrbPhysics {
+            px: 600.0,
+            py: bounds.max_y,
+            vx: 0.0,
+            vy: 0.0,
+            omega: 0.0,
+            angle_deg: 0.0,
+            sleeping: true,
+            combo: 0,
+        };
+        let ball = (636.0, bounds.max_y + 36.0);
+
+        // Ordinary pointing speed, about 800 px/s, arriving on the ball.
+        let calm = apply_cursor_kick(
+            &mut phys,
+            (ball.0 - 40.0, ball.1),
+            (ball.0 - 27.0, ball.1),
+            0.016,
+            72.0,
+            bounds,
+            1.0,
+        );
+        assert!(calm.is_none());
+        assert!(phys.sleeping);
+
+        // A deliberate swipe, about 2500 px/s.
+        let swipe = apply_cursor_kick(
+            &mut phys,
+            (ball.0 - 50.0, ball.1 + 10.0),
+            (ball.0 - 10.0, ball.1 + 10.0),
+            0.016,
+            72.0,
+            bounds,
+            1.0,
+        );
+        assert!(swipe.is_some());
+        assert!(!phys.sleeping && phys.vy < 0.0);
+    }
+
+    #[test]
+    fn escape_leaves_play_mode_once_and_never_latches_a_collapse() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t, _win) = resting_play_ball(&m, &mon);
+
+        // Escape arriving through the collapse command ends play mode instead of collapsing.
+        assert!(!request_tuck(&mut st, t, &m));
+        assert!(!st.play_mode);
+        assert_eq!(st.pending_orb_return, Some(ORB_HOME));
+        assert!(!st.force_tuck);
+
+        // The same key press arriving a second time does nothing.
+        assert!(!request_tuck(&mut st, t + ms(40), &m));
+        assert!(!st.force_tuck);
+
+        // A collapse request while already collapsed must not stay latched for later.
+        let (mut parked, t0) = parked_orb();
+        assert!(!request_tuck(&mut parked, t0, &m));
+        assert!(!parked.force_tuck);
+    }
+
+    #[test]
+    fn polled_escape_exits_play_only_when_the_cursor_is_near_the_ball() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t, mut win) = resting_play_ball(&m, &mon);
+        let c = center_of(win);
+
+        let mut typed_elsewhere = tick_env(t, (c.0 - 600.0, c.1 - 500.0), win, false);
+        typed_elsewhere.escape_down = true;
+        let action = decide_tick(&mut st, &typed_elsewhere, &m, &mon);
+        follow(&mut st, &mut win, &action);
+        assert!(st.play_mode, "Escape typed elsewhere must not end play mode");
+
+        // Key released, cursor strolls over to the ball, key pressed again.
+        let action = decide_tick(&mut st, &tick_env(t + ms(2000), c, win, false), &m, &mon);
+        follow(&mut st, &mut win, &action);
+        let mut near = tick_env(t + ms(2016), c, win, false);
+        near.escape_down = true;
+        let _ = decide_tick(&mut st, &near, &m, &mon);
+        assert!(!st.play_mode);
+        assert_eq!(st.pending_orb_return, Some(ORB_HOME));
+    }
+
+    #[test]
+    fn a_resting_ball_goes_home_by_itself_after_the_idle_timeout() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let (mut st, t, win) = resting_play_ball(&m, &mon);
+
+        let _ = decide_tick(
+            &mut st,
+            &tick_env(t + Duration::from_secs(20), (10.0, 10.0), win, false),
+            &m,
+            &mon,
+        );
+        assert!(st.play_mode);
+
+        let _ = decide_tick(
+            &mut st,
+            &tick_env(t + Duration::from_secs(60), (10.0, 10.0), win, false),
+            &m,
+            &mon,
+        );
+        assert!(!st.play_mode);
+        assert_eq!(st.pending_orb_return, Some(ORB_HOME));
+    }
+
+    #[test]
+    fn play_started_from_the_capsule_restores_the_capsule_and_its_standby_form() {
+        let m = DockMetrics::new(1.0);
+        let mon = FakeMonitors(TEST_AREA);
+        let capsule = || {
+            let mut st = DockInner::new();
+            st.work_area = TEST_AREA;
+            st.standby_mode = StandbyMode::Edge;
+            st.edge = DockEdge::Top;
+            st.dock_x = 720;
+            st.dock_y = 0;
+            st
+        };
+        let t0 = Instant::now() + ms(5000);
+
+        // Cancelled before the capsule even collapsed: it simply stays a capsule.
+        let mut st = capsule();
+        enter_play_from_pod(&mut st, t0, Some((900, 30)), &m);
+        assert!(st.play_mode && st.force_tuck);
+        request_exit_play(&mut st, t0 + ms(4), &m);
+        assert!(!st.play_mode && !st.force_tuck && !st.force_untuck);
+        assert_eq!(st.standby_mode, StandbyMode::Edge);
+
+        // Played, then left: the capsule comes back, still in edge standby.
+        let mut st = capsule();
+        let mut win = (720, 0, 480, 64);
+        enter_play_from_pod(&mut st, t0, Some((900, 30)), &m);
+        let collapse = decide_tick(&mut st, &tick_env(t0 + ms(8), (900.0, 30.0), win, false), &m, &mon);
+        assert!(matches!(collapse, WatcherAction::EnterOrb { play: true, .. }));
+        follow(&mut st, &mut win, &collapse);
+
+        request_exit_play(&mut st, t0 + ms(900), &m);
+        assert!(!st.play_mode);
+        assert_eq!(st.standby_mode, StandbyMode::Edge);
+        let reopen = decide_tick(&mut st, &tick_env(t0 + ms(908), (900.0, 30.0), win, false), &m, &mon);
+        assert!(matches!(
+            reopen,
+            WatcherAction::ExitOrb {
+                guard_clicks: false,
+                ..
+            }
+        ));
+        assert!(!st.orb_collapsed);
+    }
+
+    #[test]
+    fn a_stale_press_far_from_the_ball_is_ignored() {
+        let m = DockMetrics::new(1.0);
+        let (mut st, t0) = parked_orb();
+        // The cursor is 500px from where this press claims to have landed.
+        let outcome = orb_press_begin(&mut st, t0, (1336, 436), ORB_HOME, (36.0, 36.0), &m);
+        assert_eq!(outcome, PressOutcome::Ignored);
+        assert!(st.orb_press.is_none());
     }
 }
