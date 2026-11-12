@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal capability for the main EnvGuard window (IPC invoke only, no direct shell access).",
+  "description": "Minimal capability for the main EnvGuard Spotlight pod window (IPC invoke + frameless drag/resize/hide, no direct shell access).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-center"
+  ]
 }
