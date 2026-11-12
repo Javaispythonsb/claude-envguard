@@ -1443,6 +1443,7 @@ function Write-ClashScriptRules {
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
             "  const pinnedRules = $json;`r`n" +
             "  config.rules = pinnedRules.concat((config.rules||[]).filter(r=>!pinnedRules.includes(r)));`r`n" +
+            "  if (config.tun && typeof config.tun === 'object') { config.tun['strict-route'] = true; }`r`n" +
             "// <<< claude-switcher managed rules <<<"
 
         if (-not $existed) {
