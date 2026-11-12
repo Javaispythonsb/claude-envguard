@@ -336,8 +336,24 @@ if (-not (Test-Path -LiteralPath $ipv6StateFile)) {
     }
 }
 Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled } | Disable-NetAdapterBinding -Confirm:$false
+$smhnrStateFile = Join-Path $BASE 'smhnr-state.json'
+$smhnrKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient'
+if (-not (Test-Path -LiteralPath $smhnrStateFile)) {
+    $smExisted = $false; $smVal = 0
+    try {
+        $smProp = Get-ItemProperty -LiteralPath $smhnrKey -Name 'DisableSmartNameResolution' -ErrorAction Stop
+        $smExisted = $true; $smVal = [int]$smProp.DisableSmartNameResolution
+    } catch {}
+    if (-not ($smExisted -and $smVal -eq 1)) {
+        $smPayload = ([pscustomobject]@{ version = 1; existed = [bool]$smExisted; value = [int]$smVal }) | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($smhnrStateFile, $smPayload, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+if (-not (Test-Path -LiteralPath $smhnrKey)) { New-Item -Path $smhnrKey -Force | Out-Null }
+Set-ItemProperty -Path $smhnrKey -Name 'DisableSmartNameResolution' -Value 1 -Type DWord -Force
+$null = gpupdate /target:computer /force 2>&1
 Clear-DnsClientCache
-Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green
+Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / 多宿主智能DNS旁路已关闭 / DNS 缓存已刷新" -ForegroundColor Green
 
 # ---- 8. 注册保镖计划任务(取消默认 72h 超时强杀与电池断电停止限制) ----
 $action   = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$BASE\claude-bodyguard.ps1`""

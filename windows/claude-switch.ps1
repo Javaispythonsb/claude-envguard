@@ -737,6 +737,32 @@ function Save-HomeIpv6State {
     } catch {}
 }
 
+# 关闭 Windows 智能多宿主名称解析(SMHNR),防止 Dnscache 绕过 TUN 同时向物理网卡路由器发送明文 DNS 查询
+function Test-SmhnrDisabled {
+    try {
+        $prop = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -ErrorAction Stop
+        return ([int]$prop.DisableSmartNameResolution -eq 1)
+    } catch { return $false }
+}
+
+function Save-HomeSmhnrState {
+    $stateFile = Join-Path $BASE 'smhnr-state.json'
+    if (Test-Path -LiteralPath $stateFile) { return }
+    $existed = $false
+    $val = 0
+    try {
+        $prop = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -ErrorAction Stop
+        $existed = $true
+        $val = [int]$prop.DisableSmartNameResolution
+    } catch {}
+    if ($existed -and $val -eq 1) { return }
+    try {
+        New-Item -ItemType Directory -Force -Path $BASE -ErrorAction Stop | Out-Null
+        $payload = ([pscustomobject]@{ version = 1; existed = [bool]$existed; value = [int]$val }) | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($stateFile, $payload, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+}
+
 # 保镖健康度检查:不仅看计划任务是否存在,还实查运行态/心跳与 72h·电池策略隐患
 function Get-BodyguardHealth {
     $bg = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
@@ -1964,7 +1990,10 @@ function Invoke-Fix {
         Save-HomeIpv6State
         $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false"
     }
-    $adminScript += "Clear-DnsClientCache"
+    if (-not (Test-SmhnrDisabled)) {
+        Save-HomeSmhnrState
+        $adminScript += "if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient')) { New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Force | Out-Null }; Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -Value 1 -Type DWord -Force; `$null = gpupdate /target:computer /force 2>&1"
+    }
     $bgFix = Get-BodyguardHealth
     $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
     $targetBg  = Join-Path $BASE 'claude-bodyguard.ps1'
@@ -1985,14 +2014,16 @@ function Invoke-Fix {
         }
     }
     if ($adminScript.Count -gt 0) {
-        "FIX:修复时区/IPv6/DNS/保镖(需要管理员授权)..."
+        $adminScript += "Clear-DnsClientCache"
+        "FIX:修复时区/IPv6/DNS防漏/保镖(需要管理员授权)..."
         $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
         [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
         try { Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" } catch { "FIX:管理员授权被取消" }
         Remove-Item $tmp -ErrorAction SilentlyContinue
-        "FIX:时区/IPv6/DNS/保镖 ✓"
+        "FIX:时区/IPv6/DNS防漏/保镖 ✓"
     } else {
-        "FIX:时区/IPv6/保镖 无需修复 ✓"
+        try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
+        "FIX:时区/IPv6/DNS防漏/保镖 无需修复 ✓"
     }
 
     # B2. 置顶规则:先识别 Clash 模式,绝不盲目写 Merge.yaml
@@ -3462,6 +3493,22 @@ function Invoke-ShieldRestore {
         "WARN:未找到原时区记录(home-tz.txt,可能由旧版安装器修改),未改动当前时区($currentTz),如需恢复请在系统设置手动调整"
         $tzSummary = "无原时区记录(保持 $currentTz)"
     }
+    $smhnrStateFile = Join-Path $BASE 'smhnr-state.json'
+    $savedSmhnr = $null
+    if (Test-Path -LiteralPath $smhnrStateFile -PathType Leaf) {
+        try {
+            $parsedSmhnr = ([System.IO.File]::ReadAllText($smhnrStateFile, [System.Text.Encoding]::UTF8)) | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $parsedSmhnr -and [int]$parsedSmhnr.version -eq 1) { $savedSmhnr = $parsedSmhnr }
+        } catch {}
+    }
+    if ($null -ne $savedSmhnr) {
+        if ([bool]$savedSmhnr.existed) {
+            $smVal = [int]$savedSmhnr.value
+            $adminLines += "if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient')) { New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Force | Out-Null }; Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -Value $smVal -Type DWord -Force; `$null = gpupdate /target:computer /force 2>&1"
+        } else {
+            $adminLines += "Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -ErrorAction SilentlyContinue; `$null = gpupdate /target:computer /force 2>&1"
+        }
+    }
     $adminLines += "Clear-DnsClientCache"
     $tmp = "$env:TEMP\claude-restore-$([guid]::NewGuid().Guid).ps1"
     try {
@@ -3481,6 +3528,9 @@ function Invoke-ShieldRestore {
     }
     if ($null -ne $savedAdapters) {
         Remove-Item -LiteralPath $ipv6StateFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $savedSmhnr) {
+        Remove-Item -LiteralPath $smhnrStateFile -Force -ErrorAction SilentlyContinue
     }
     Log "已退出护盾($ipv6Summary;$tzSummary)"
     "OK:已暂停保镖，$ipv6Summary，$tzSummary"
