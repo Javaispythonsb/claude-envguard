@@ -80,7 +80,7 @@
                 <div class="sicon warn" id="heroIcon">…</div>
                 <div>
                   <h3 id="heroTitle">正在执行 14 项环境安全审计…</h3>
-                  <p id="heroDesc">8 项硬性红线（含无警告要求）全部通过且无失败项后，自动解锁启动入口。</p>
+                  <p id="heroDesc">6 项硬性防漏红线全部通过且无失败项后，自动解锁启动入口。</p>
                 </div>
                 <div class="pill warn" id="heroPill">AUDITING</div>
               </div>
@@ -128,7 +128,7 @@
           <div class="card checkcard">
             <div class="ct" style="margin-bottom:10px">
               <span>// 14 SECURITY CHECKS</span>
-              <span id="checkSummary">8 项硬性红线 + 6 项可选检查</span>
+              <span id="checkSummary">6 项硬性防漏红线 + 8 项可选检查</span>
             </div>
             <div class="clist" id="checkListGrid"></div>
           </div>
@@ -215,7 +215,7 @@
               <div class="optrow">
                 <div>
                   <div class="ol">允许可选检查项失败降级为警告</div>
-                  <div class="od">仅作用于右侧 6 项非关键检查，绝不放宽出口国家、TUN 与保镖等硬性红线</div>
+                  <div class="od">仅作用于右侧 8 项可选检查，绝不放宽代理内核、TUN、出口国家、IPv6、保镖与置顶规则 6 项硬性红线</div>
                 </div>
                 <button class="tg" type="button" id="tgAllowOptional">OFF</button>
               </div>
@@ -229,14 +229,14 @@
             </div>
 
             <div class="card">
-              <div class="ct"><span>// 6 项可选检查开关 &amp; 8 项硬性红线</span></div>
+              <div class="ct"><span>// 8 项可选检查开关 &amp; 6 项硬性防漏红线</span></div>
               <div id="optionalChecksContainer"></div>
               <div class="optrow">
-                <div><div class="ol">代理内核 · TUN 网卡 · 出口国家与 IP · IPv6 关闭</div></div>
+                <div><div class="ol">代理内核 · TUN 网卡 · 出口国家与 IP</div></div>
                 <span class="locked">硬性锁定</span>
               </div>
               <div class="optrow">
-                <div><div class="ol">系统时区 · 区域格式 Locale · 保镖存活 · 置顶规则</div></div>
+                <div><div class="ol">IPv6 关闭 · 保镖存活 · 置顶规则 / 隧道接管</div></div>
                 <span class="locked">硬性锁定</span>
               </div>
             </div>

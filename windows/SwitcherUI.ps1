@@ -379,7 +379,7 @@ $win = [Windows.Markup.XamlReader]::Load($reader)
 $rows = New-Object System.Collections.ObjectModel.ObservableCollection[Object]
 $win.FindName('CheckList').ItemsSource = $rows
 $checkNames = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
-$hardChecks = @('代理内核','TUN网卡','出口IP','时区','地区','IPv6','保镖','规则置顶')
+$hardChecks = @('代理内核','TUN网卡','出口IP','IPv6','保镖','规则置顶')
 $clientModes = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')
 $script:isBusy = $false
 $script:environmentReady = $false
@@ -782,11 +782,12 @@ function Show-CheckSettings {
         <StackPanel Grid.Row="0" Margin="0,0,0,14"><TextBlock Text="检查设置" FontSize="20" FontWeight="Bold"/><TextBlock Text="硬性安全项始终执行；跳过不等于通过" FontSize="11" Foreground="#B3FFFFFF" Margin="0,4,0,0"/></StackPanel>
         <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"><StackPanel>
             <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14" Margin="0,0,0,12"><StackPanel><TextBlock Text="可自定义的非关键检查" FontWeight="Bold" Margin="0,0,0,10"/>
+                <CheckBox x:Name="Check_TZ" Content="系统时区对齐（关闭则保留本机时钟）" Margin="0,5"/><CheckBox x:Name="Check_Region" Content="区域格式 Locale（关闭则保留日期/数字格式）" Margin="0,5"/>
                 <CheckBox x:Name="Check_IP" Content="IP 与上次一致" Margin="0,5"/><CheckBox x:Name="Check_DNS" Content="DNS 走隧道" Margin="0,5"/><CheckBox x:Name="Check_WebRTC" Content="WebRTC" Margin="0,5"/>
                 <CheckBox x:Name="Check_Locale" Content="客户端语言" Margin="0,5"/><CheckBox x:Name="Check_ASN" Content="ASN 属性" Margin="0,5"/><CheckBox x:Name="Check_Eco" Content="生态可达性" Margin="0,5"/>
-                <TextBlock Text="关闭后会真正跳过探测，并以灰色显示。出口国家、代理/TUN、Kill-Switch、保镖、账号归档和更新校验不可关闭。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap" Margin="0,8,0,0"/>
+                <TextBlock Text="关闭后会真正跳过探测（时区/区域格式关闭后一键修复也不会改动系统时钟与格式），并以灰色显示。出口国家、代理/TUN、IPv6、保镖、置顶规则等 6 项硬性防漏项不可关闭。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap" Margin="0,8,0,0"/>
             </StackPanel></Border>
-            <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14" Margin="0,0,0,12"><StackPanel><CheckBox x:Name="CheckAllow" Content="将上述非关键项的失败降为警告" Margin="0,5"/><TextBlock Text="只影响以上 6 项，不放宽硬性安全项，也不会自动关闭检测。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap" Margin="0,0,0,8"/><CheckBox x:Name="CheckLogging" Content="记录脱敏客户端日志" Margin="0,5"/><TextBlock Text="仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap"/></StackPanel></Border>
+            <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14" Margin="0,0,0,12"><StackPanel><CheckBox x:Name="CheckAllow" Content="将上述非关键项的失败降为警告" Margin="0,5"/><TextBlock Text="只影响以上 8 项，不放宽 6 项硬性防漏红线，也不会自动关闭检测。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap" Margin="0,0,0,8"/><CheckBox x:Name="CheckLogging" Content="记录脱敏客户端日志" Margin="0,5"/><TextBlock Text="仅记录版本、命令、退出码、耗时和检查状态，不记录 IP、凭据或账号内容。" FontSize="11" Foreground="#B3FFFFFF" TextWrapping="Wrap"/></StackPanel></Border>
             <Border CornerRadius="10" Background="#0DFFFFFF" Padding="14"><StackPanel><Button x:Name="BtnExportInSettings" Content="导出脱敏诊断日志…" Padding="12,7" HorizontalAlignment="Left"/><TextBlock Text="%USERPROFILE%\.claude-switcher\logs\client.log" FontSize="10" Foreground="#99FFFFFF" Margin="0,8,0,0"/></StackPanel></Border>
         </StackPanel></ScrollViewer>
         <StackPanel Grid.Row="2" Margin="0,14,0,0"><TextBlock x:Name="SettingsMessage" Text="" FontSize="11" Foreground="#FFFACC15" TextWrapping="Wrap" Margin="0,0,0,8"/><StackPanel Orientation="Horizontal"><Button x:Name="BtnDefaults" Content="恢复默认" Padding="12,7"/><Button x:Name="BtnSaveSettings" Content="保存并重新检查" Padding="12,7" Margin="12,0,0,0" FontWeight="Bold" Background="#FF6366F1"/></StackPanel></StackPanel>
@@ -794,7 +795,7 @@ function Show-CheckSettings {
 </Window>
 "@
     $settingsReader = New-Object System.Xml.XmlNodeReader ([xml]$settingsXaml); $settingsWin = [Windows.Markup.XamlReader]::Load($settingsReader); $settingsWin.Owner = $win
-    $map = @(@{ Name = 'IP一致'; Control = 'Check_IP' },@{ Name = 'DNS'; Control = 'Check_DNS' },@{ Name = 'WebRTC'; Control = 'Check_WebRTC' },@{ Name = '客户端语言'; Control = 'Check_Locale' },@{ Name = 'ASN属性'; Control = 'Check_ASN' },@{ Name = '生态可达性'; Control = 'Check_Eco' })
+    $map = @(@{ Name = '时区'; Control = 'Check_TZ' },@{ Name = '地区'; Control = 'Check_Region' },@{ Name = 'IP一致'; Control = 'Check_IP' },@{ Name = 'DNS'; Control = 'Check_DNS' },@{ Name = 'WebRTC'; Control = 'Check_WebRTC' },@{ Name = '客户端语言'; Control = 'Check_Locale' },@{ Name = 'ASN属性'; Control = 'Check_ASN' },@{ Name = '生态可达性'; Control = 'Check_Eco' })
     $disabled = @($config.disabled); foreach ($item in $map) { $settingsWin.FindName($item.Control).IsChecked = ($disabled -notcontains $item.Name) }
     $settingsWin.FindName('CheckAllow').IsChecked = [bool]$config.allowOptionalFailures; $settingsWin.FindName('CheckLogging').IsChecked = [bool]$config.logging
     $settingsWin.FindName('BtnDefaults').Add_Click({ foreach ($item in $map) { $settingsWin.FindName($item.Control).IsChecked = $true }; $settingsWin.FindName('CheckAllow').IsChecked = $false; $settingsWin.FindName('CheckLogging').IsChecked = $true; $settingsWin.FindName('SettingsMessage').Text = '已恢复默认选项，点击保存后生效' })

@@ -317,6 +317,11 @@ if (-not (Test-Path -LiteralPath $homeTzFile) -and $origTz -and $origTz -ne $TZ_
     [System.IO.File]::WriteAllText($homeTzFile, $origTz, (New-Object System.Text.UTF8Encoding($false)))
 }
 Set-TimeZone -Id $TZ_TARGET
+$origLocale = [System.Globalization.CultureInfo]::CurrentCulture.Name
+$homeLocaleFile = Join-Path $BASE 'home-locale.txt'
+if (-not (Test-Path -LiteralPath $homeLocaleFile) -and $origLocale -and $origLocale -ine $LOCALE_TARGET) {
+    [System.IO.File]::WriteAllText($homeLocaleFile, $origLocale, (New-Object System.Text.UTF8Encoding($false)))
+}
 try {
     Set-Culture -CultureInfo $LOCALE_TARGET -ErrorAction Stop
     Write-Host "[OK] 地区格式已设置为 $LOCALE_TARGET" -ForegroundColor Green

@@ -102,7 +102,7 @@ try {
     $defaultKeys = (@((Get-CheckConfig).Keys) | Sort-Object) -join ','
     Assert '默认检查配置只含上游字段' ($defaultKeys -eq 'allowOptionalFailures,disabled,logging') "实际=$defaultKeys"
 
-    # 2. 时区与地区只按系统设置判定；即使检查配置里混入旧的放宽字段也不能判为通过
+    # 2. 时区与地区受检查开关控制：开启时按系统设置严格判定，关闭时显示 skip，开启 allowOptionalFailures 时降级为 warn
     $detailAst = ([Management.Automation.Language.Parser]::ParseFile($core, [ref]$null, [ref]$null)).Find({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-CheckDetail'
     }, $true)
@@ -113,20 +113,37 @@ try {
         if (-not $statement) { throw "找不到生产检查语句: $Condition" }
         return [scriptblock]::Create($statement.Extent.Text)
     }
-    $tzCheck = Get-CheckStatement '$tz -eq $TZ_TARGET'
-    $localeCheck = Get-CheckStatement '$cult -eq $LOCALE_TARGET'
-    $script:CheckConfig = @{ disabled = @(); allowOptionalFailures = $true; logging = $true; tzMode = 'process'; relaxLocale = $true }
+    $tzCheck = Get-CheckStatement "Test-CheckDisabled '时区'"
+    $localeCheck = Get-CheckStatement "Test-CheckDisabled '地区'"
     $TZ_TARGET = 'Pacific Standard Time'
     $LOCALE_TARGET = 'en-US'
-    $tz = 'China Standard Time'
-    Assert '系统时区不符即失败' ((@(& $tzCheck) -join '') -eq '时区=fail:China Standard Time')
-    $tz = 'Pacific Standard Time'
-    Assert '系统时区一致才通过' ((@(& $tzCheck) -join '') -eq '时区=ok')
-    $cult = 'zh-CN'
-    Assert '区域格式不符即失败' ((@(& $localeCheck) -join '') -eq '地区=fail:zh-CN(期望en-US)')
-    $cult = 'en-US'
-    Assert '区域格式一致才通过' ((@(& $localeCheck) -join '') -eq '地区=ok:en-US')
-    $script:CheckConfig = $null
+    $script:MockTzId = 'China Standard Time'
+    function Get-TimeZone { [pscustomobject]@{ Id = $script:MockTzId } }
+    $savedTestCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        $script:CheckConfig = @{ disabled = @(); allowOptionalFailures = $false; logging = $true }
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('zh-CN')
+        Assert '开关打开且系统时区不符时判 fail' ((@(& $tzCheck) -join '') -eq '时区=fail:China Standard Time')
+        Assert '开关打开且区域格式不符时判 fail' ((@(& $localeCheck) -join '') -eq '地区=fail:zh-CN(期望en-US)')
+
+        $script:MockTzId = 'Pacific Standard Time'
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+        Assert '系统时区一致时通过' ((@(& $tzCheck) -join '') -eq '时区=ok')
+        Assert '区域格式一致时通过' ((@(& $localeCheck) -join '') -eq '地区=ok:en-US')
+
+        $script:MockTzId = 'China Standard Time'
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('zh-CN')
+        $script:CheckConfig = @{ disabled = @(); allowOptionalFailures = $true; logging = $true }
+        Assert 'allowOptionalFailures 开启时时区不符降为 warn' ((@(& $tzCheck) -join '') -match '^时区=warn:')
+        Assert 'allowOptionalFailures 开启时区域格式不符降为 warn' ((@(& $localeCheck) -join '') -match '^地区=warn:')
+
+        $script:CheckConfig = @{ disabled = @('时区', '地区'); allowOptionalFailures = $false; logging = $true }
+        Assert '开关关闭时时区显示 skip' ((@(& $tzCheck) -join '') -eq '时区=skip:用户已禁用')
+        Assert '开关关闭时区域格式显示 skip' ((@(& $localeCheck) -join '') -eq '地区=skip:用户已禁用')
+    } finally {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedTestCulture
+        $script:CheckConfig = $null
+    }
 
     # 3. 受检启动：桌面版不注入也不声称注入 TZ；CLI 注入目标 IANA 时区；门禁不过不启动
     $COUNTRY_TARGET = 'US'
@@ -342,11 +359,11 @@ try {
     # 7. 与 Tauri 相同的调用方式：无窗口子进程、UTF-8 标准输入、按 UTF-8 解码标准输出
     $profileA = Join-Path $root 'user-a'
     New-Item -ItemType Directory -Path $profileA -Force | Out-Null
-    $payload = '{"disabled":["IP一致","客户端语言","ASN属性","生态可达性"],"allowOptionalFailures":false,"logging":true}'
+    $payload = '{"disabled":["时区","地区","IP一致","客户端语言","ASN属性","生态可达性"],"allowOptionalFailures":false,"logging":true}'
     $r = Invoke-CoreProcess $core @('set-check-config', '--stdin') $payload $profileA
     $savedPath = Join-Path $profileA '.claude-switcher\checks.json'
     $savedDisabled = if (Test-Path -LiteralPath $savedPath) { (@((Get-Content -LiteralPath $savedPath -Raw -Encoding UTF8 | ConvertFrom-Json).disabled) -join ',') } else { '' }
-    Assert '无窗口子进程经 stdin 保存中文检查项' ($r.Exit -eq 0 -and $r.Out -match 'OK:检查设置已保存' -and $savedDisabled -eq 'IP一致,客户端语言,ASN属性,生态可达性') "退出码=$($r.Exit) 已保存=$savedDisabled 错误=$($r.Err)"
+    Assert '无窗口子进程经 stdin 保存中文检查项(含时区与地区)' ($r.Exit -eq 0 -and $r.Out -match 'OK:检查设置已保存' -and $savedDisabled -eq '时区,地区,IP一致,客户端语言,ASN属性,生态可达性') "退出码=$($r.Exit) 已保存=$savedDisabled 错误=$($r.Err)"
     $r = Invoke-CoreProcess $core @('get-check-config') '' $profileA
     $readBack = (@(($r.Out | ConvertFrom-Json).disabled) -join ',')
     Assert 'get-check-config 读回同一组中文检查项' ($r.Exit -eq 0 -and $readBack -eq $savedDisabled) "输出=$($r.Out)"

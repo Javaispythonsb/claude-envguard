@@ -110,7 +110,7 @@ try {
     $script:PROXY_MODE = 'other'
     Assert 'other 模式保留通用虚拟网卡回退' ((Get-TunStatus).up -and (& $bodyguardTun).up)
 
-    # 2. 启动门禁：8 项硬性检查出现 warn/skip 必须阻断；6 项可选检查 warn/skip 放行、fail 阻断
+    # 2. 启动门禁：6 项硬性防漏检查出现 warn/skip 必须阻断；8 项可选检查(含时区/地区) warn/skip 放行、fail 阻断
     $allChecks = @('代理内核','TUN网卡','出口IP','IP一致','时区','地区','IPv6','DNS','WebRTC','保镖','规则置顶','客户端语言','ASN属性','生态可达性')
     $script:FakeDetailLines = @()
     $realCheckDetail = ${function:Invoke-CheckDetail}
@@ -121,7 +121,7 @@ try {
     $out = (@(Invoke-Check) -join "`n")
     Assert '14 项全 ok 时门禁放行' ($script:exitCode -eq 0 -and $out -eq 'OK:环境检查通过') "输出=$out"
 
-    foreach ($hard in @('保镖', '规则置顶', '地区', '时区')) {
+    foreach ($hard in @('代理内核', 'TUN网卡', '出口IP', 'IPv6', '保镖', '规则置顶')) {
         $script:FakeDetailLines = @($allChecks | ForEach-Object { if ($_ -eq $hard) { "$_=warn:测试降级" } else { "$_=ok" } })
         $script:exitCode = 0
         $out = (@(Invoke-Check) -join "`n")
@@ -130,21 +130,26 @@ try {
 
     $script:FakeDetailLines = @($allChecks | ForEach-Object {
         if ($_ -in @('WebRTC', '客户端语言', 'ASN属性')) { "$_=warn:可选提示" }
-        elseif ($_ -eq 'DNS') { "$_=skip:用户已禁用" }
+        elseif ($_ -in @('时区', '地区', 'DNS')) { "$_=skip:用户已禁用" }
         else { "$_=ok" }
     })
     $script:exitCode = 0
     $out = (@(Invoke-Check) -join "`n")
-    Assert '可选项为 warn 或 skip 且 8 项硬性全 ok 时门禁放行' ($script:exitCode -eq 0 -and $out -eq 'OK:环境检查通过') "输出=$out"
+    Assert '时区/地区关闭(skip)且 6 项硬性防漏全 ok 时门禁放行' ($script:exitCode -eq 0 -and $out -eq 'OK:环境检查通过') "输出=$out"
+
+    $script:FakeDetailLines = @($allChecks | ForEach-Object { if ($_ -eq '时区') { '时区=fail:China Standard Time' } else { "$_=ok" } })
+    $script:exitCode = 0
+    $out = (@(Invoke-Check) -join "`n")
+    Assert '时区开关打开且判 fail 时门禁仍阻断' ($script:exitCode -eq 1 -and $out -eq 'FAIL:时区') "输出=$out"
 
     # 同时核验 uistate.ready 与 Invoke-Check 门禁完全一致
     $lastCheckFile = Join-Path $BASE 'last-check.txt'
     [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -eq '保镖') { "$_=warn:旧策略" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
     $uiBlocked = (Invoke-UiState $false) | ConvertFrom-Json
     Assert '硬性项 warn 时 uistate.ready 为 false' ($uiBlocked.ready -eq $false)
-    [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -eq 'WebRTC') { "$_=warn:未确认" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
+    [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -in @('时区', '地区')) { "$_=skip:用户已禁用" } elseif ($_ -eq 'WebRTC') { "$_=warn:未确认" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
     $uiReady = (Invoke-UiState $false) | ConvertFrom-Json
-    Assert '仅可选项 warn 时 uistate.ready 为 true' ($uiReady.ready -eq $true)
+    Assert '时区与地区 skip 且 6 项硬性全 ok 时 uistate.ready 为 true' ($uiReady.ready -eq $true)
 
     Set-Item -Path function:Invoke-CheckDetail -Value $realCheckDetail
 

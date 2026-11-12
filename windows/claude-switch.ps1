@@ -152,7 +152,7 @@ function Get-AppVersion {
 }
 
 function ConvertTo-CheckConfig($Value) {
-    $optional = @('IP一致','DNS','WebRTC','客户端语言','ASN属性','生态可达性')
+    $optional = @('时区','地区','IP一致','DNS','WebRTC','客户端语言','ASN属性','生态可达性')
     $keys = @('disabled','allowOptionalFailures','logging')
     if ($null -eq $Value -or $Value -isnot [pscustomobject]) { throw '检查配置必须是 JSON 对象' }
     foreach ($key in @($Value.PSObject.Properties.Name)) {
@@ -719,6 +719,14 @@ function Save-HomeTimeZone([string]$TargetTz) {
     try { [System.IO.File]::WriteAllText($homeTzFile, $current, (New-Object System.Text.UTF8Encoding($false))) } catch {}
 }
 
+# 只记录第一次改成目标前的原区域格式,供 shield-restore 还原
+function Save-HomeLocale([string]$TargetLocale) {
+    $homeLocaleFile = Join-Path $BASE 'home-locale.txt'
+    $current = [System.Globalization.CultureInfo]::CurrentCulture.Name
+    if ((Test-Path -LiteralPath $homeLocaleFile) -or -not $current -or $current -ieq $TargetLocale) { return }
+    try { [System.IO.File]::WriteAllText($homeLocaleFile, $current, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+}
+
 # 记录关闭 IPv6 前各网卡的 ms_tcpip6 原状态(仅在尚无快照且至少有一块网卡启用 IPv6 时记录,避免把护盾态当成日常态)
 function Save-HomeIpv6State {
     $stateFile = Join-Path $BASE 'ipv6-state.json'
@@ -941,29 +949,39 @@ function Invoke-SetRegion {
     $script:IANA_TZ_OVERRIDE = $ianaTz
     $script:LOCALE_TARGET = $locale
 
-    Save-HomeTimeZone $tzId
-    $tmp = "$env:TEMP\claude-set-region-$([guid]::NewGuid().Guid).ps1"
-    try {
-        $tzEsc = $tzId.Replace("'", "''")
-        $tmpScript = "`$ErrorActionPreference = 'Stop'`r`nSet-TimeZone -Id '$tzEsc'`r`nif ((Get-TimeZone).Id -ne '$tzEsc') { exit 1 }`r`n"
-        $tmpScript | Out-File -Encoding utf8 $tmp
-        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
-        if ($proc -and $proc.ExitCode -eq 0) {
-            "OK:时区已设置为 $tzId"
-        } else {
+    $script:CheckConfig = try { Get-CheckConfig } catch { @{ disabled = @(); allowOptionalFailures = $false; logging = $true } }
+    if (Test-CheckDisabled '时区') {
+        "INFO:时区检查已关闭,已更新目标基线($tzId)但保留本机系统时钟"
+    } else {
+        Save-HomeTimeZone $tzId
+        $tmp = "$env:TEMP\claude-set-region-$([guid]::NewGuid().Guid).ps1"
+        try {
+            $tzEsc = $tzId.Replace("'", "''")
+            $tmpScript = "`$ErrorActionPreference = 'Stop'`r`nSet-TimeZone -Id '$tzEsc'`r`nif ((Get-TimeZone).Id -ne '$tzEsc') { exit 1 }`r`n"
+            $tmpScript | Out-File -Encoding utf8 $tmp
+            $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
+            if ($proc -and $proc.ExitCode -eq 0) {
+                "OK:时区已设置为 $tzId"
+            } else {
+                "WARN:时区未修改,请手动设置"
+            }
+        } catch {
             "WARN:时区未修改,请手动设置"
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
-    } catch {
-        "WARN:时区未修改,请手动设置"
-    } finally {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
 
-    try {
-        Set-Culture -CultureInfo $locale -ErrorAction Stop
-        "OK:地区格式已设置为 $locale"
-    } catch {
-        "WARN:地区格式未修改,请手动在「区域格式」中修改"
+    if (Test-CheckDisabled '地区') {
+        "INFO:区域格式检查已关闭,已更新目标基线($locale)但保留本机日期/数字格式"
+    } else {
+        Save-HomeLocale $locale
+        try {
+            Set-Culture -CultureInfo $locale -ErrorAction Stop
+            "OK:地区格式已设置为 $locale"
+        } catch {
+            "WARN:地区格式未修改,请手动在「区域格式」中修改"
+        }
     }
 
     "OK:region=$country tz=$ianaTz locale=$locale source=$($geo.Source)"
@@ -1836,11 +1854,19 @@ function Invoke-CheckDetail {
         if ($e.ip) { $e.ip | Out-File -Encoding ascii -NoNewline $lastipFile }
     }
 
-    $tz = (Get-TimeZone).Id
-    if ($tz -eq $TZ_TARGET) { "时区=ok" } else { "时区=fail:$tz" }
+    if (Test-CheckDisabled '时区') {
+        Format-OptionalResult '时区' 'ok'
+    } else {
+        $tz = (Get-TimeZone).Id
+        if ($tz -eq $TZ_TARGET) { Format-OptionalResult '时区' 'ok' } else { Format-OptionalResult '时区' 'fail' $tz }
+    }
 
-    $cult = [System.Globalization.CultureInfo]::CurrentCulture.Name
-    if ($cult -eq $LOCALE_TARGET) { "地区=ok:$cult" } else { "地区=fail:$cult(期望$LOCALE_TARGET)" }
+    if (Test-CheckDisabled '地区') {
+        Format-OptionalResult '地区' 'ok'
+    } else {
+        $cult = [System.Globalization.CultureInfo]::CurrentCulture.Name
+        if ($cult -eq $LOCALE_TARGET) { Format-OptionalResult '地区' 'ok' $cult } else { Format-OptionalResult '地区' 'fail' "$cult(期望$LOCALE_TARGET)" }
+    }
 
     $v6off = [bool](Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true })
     if (-not $v6off) { "IPv6=ok:已关闭" } else { "IPv6=fail:未关闭" }
@@ -1937,7 +1963,7 @@ function Invoke-CheckDetail {
     Stop-ProbePrefetch
 }
 
-$HARD_CHECKS = @('代理内核','TUN网卡','出口IP','时区','地区','IPv6','保镖','规则置顶')
+$HARD_CHECKS = @('代理内核','TUN网卡','出口IP','IPv6','保镖','规则置顶')
 
 function Invoke-Check {
     $results = @(Invoke-CheckDetail)
@@ -1949,7 +1975,7 @@ function Invoke-Check {
         if ($states.Contains($name)) { $invalid = $true; continue }
         $states[$name] = $state
     }
-    # 8 项硬性检查必须全部为 ok(warn/skip 同样阻断);6 项可选检查仅 fail 阻断
+    # 6 项硬性防漏检查必须全部为 ok(warn/skip 同样阻断);8 项可选检查仅 fail 阻断
     $blocked = @($states.Keys | Where-Object {
         $states[$_] -eq 'fail' -or (($HARD_CHECKS -contains $_) -and $states[$_] -ne 'ok')
     })
@@ -2063,9 +2089,23 @@ function Invoke-Fix {
         }
     }
 
-    # B. 时区/IPv6/DNS防漏/保镖(需管理员:通过 UAC 弹一次)
+    # B. 时区(按开关)/区域格式(按开关)/IPv6/DNS防漏/保镖(需管理员的合并为一次 UAC)
+    $script:CheckConfig = try { Get-CheckConfig } catch { @{ disabled = @(); allowOptionalFailures = $false; logging = $true } }
+    if (Test-CheckDisabled '地区') {
+        "FIX:区域格式检查已关闭,保留本机日期/数字格式"
+    } elseif ([System.Globalization.CultureInfo]::CurrentCulture.Name -ne $LOCALE_TARGET) {
+        Save-HomeLocale $LOCALE_TARGET
+        try {
+            Set-Culture -CultureInfo $LOCALE_TARGET -ErrorAction Stop
+            "FIX:区域格式已同步为 $LOCALE_TARGET ✓"
+        } catch {
+            "FIX:区域格式未同步,请手动在系统「区域格式」中修改"
+        }
+    }
     $adminScript = @()
-    if ((Get-TimeZone).Id -ne $TZ_TARGET) {
+    if (Test-CheckDisabled '时区') {
+        "FIX:时区检查已关闭,保留本机系统时钟"
+    } elseif ((Get-TimeZone).Id -ne $TZ_TARGET) {
         Save-HomeTimeZone $TZ_TARGET
         $tzEscFix = $TZ_TARGET.Replace("'", "''")
         $adminScript += "Set-TimeZone -Id '$tzEscFix'"
@@ -3535,8 +3575,20 @@ function Invoke-ShieldRestore {
     if ($null -ne $savedSmhnr) {
         Remove-Item -LiteralPath $smhnrStateFile -Force -ErrorAction SilentlyContinue
     }
-    Log "已退出护盾($ipv6Summary;$tzSummary)"
-    "OK:已暂停保镖，$ipv6Summary，$tzSummary"
+    $homeLocaleFile = Join-Path $BASE 'home-locale.txt'
+    $localeNote = ''
+    if (Test-Path -LiteralPath $homeLocaleFile -PathType Leaf) {
+        $restoreLocale = ''
+        try { $restoreLocale = ([System.IO.File]::ReadAllText($homeLocaleFile, [System.Text.Encoding]::UTF8)).Trim() } catch {}
+        if ($restoreLocale -and [System.Globalization.CultureInfo]::CurrentCulture.Name -ne $restoreLocale) {
+            try {
+                Set-Culture -CultureInfo $restoreLocale -ErrorAction Stop
+                $localeNote = "，已还原区域格式为 $restoreLocale"
+            } catch {}
+        }
+    }
+    Log "已退出护盾($ipv6Summary;$tzSummary$localeNote)"
+    "OK:已暂停保镖，$ipv6Summary，$tzSummary$localeNote"
 }
 
 function Invoke-UiState([bool]$Fresh = $false) {

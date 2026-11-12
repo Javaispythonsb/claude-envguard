@@ -6,11 +6,11 @@ const CHECK_SPECS = [
   { key: '代理内核', label: '代理内核', hard: true },
   { key: 'TUN网卡', label: 'TUN 网卡', hard: true },
   { key: '出口IP', label: '出口国家与 IP', hard: true },
-  { key: '时区', label: '时区对齐', hard: true },
-  { key: '地区', label: '区域格式 Locale', hard: true },
   { key: 'IPv6', label: 'IPv6 旁路防护', hard: true },
   { key: '保镖', label: '保镖进程急停', hard: true },
   { key: '规则置顶', label: '置顶规则 / 隧道接管', hard: true },
+  { key: '时区', label: '时区对齐', hard: false },
+  { key: '地区', label: '区域格式 Locale', hard: false },
   { key: 'IP一致', label: 'IP 稳定性 (48h)', hard: false },
   { key: 'DNS', label: 'DNS 隧道与解析器归属', hard: false },
   { key: 'WebRTC', label: 'WebRTC STUN 探针', hard: false },
@@ -20,6 +20,8 @@ const CHECK_SPECS = [
 ];
 
 const OPTIONAL_ITEMS = [
+  { key: '时区', title: '系统时区对齐（关掉则保留本机时钟，一键修复不改时间）' },
+  { key: '地区', title: '区域格式 Locale 对齐（关掉则保留中文日期/数字格式）' },
   { key: 'WebRTC', title: 'WebRTC 国内外 STUN 交叉探针' },
   { key: 'DNS', title: 'DNS 隧道与实际解析器归属校验' },
   { key: 'IP一致', title: '出口 IP 48 小时跳变提醒' },
@@ -220,13 +222,13 @@ function applyUiState(data, elapsedMs = 0) {
     heroIcon.className = 'sicon blocked';
     heroIcon.textContent = '✕';
     heroTitle.textContent = `启动门禁已阻断（${blockedNames.slice(0, 3).join('、')}）`;
-    heroDesc.textContent = '8 项硬性红线必须全部为 [ OK ] 且无失败项：可点击「一键修复」处理保镖/时区/IPv6/规则，复检通过后解锁。';
+    heroDesc.textContent = '6 项硬性防漏红线必须全部为 [ OK ] 且无失败项：可点「一键修复」处理，或在「护盾与设置」中关闭时区/区域格式等可选项。';
     heroPill.className = 'pill blocked';
     heroPill.textContent = `BLOCKED · ${blockedNames.length}`;
   } else if (warnCount > 0 || skipCount > 0) {
     heroIcon.className = 'sicon warn';
     heroIcon.textContent = '!';
-    heroTitle.textContent = '8 项硬性红线已全部通过 · 允许启动（可选项含提示/跳过）';
+    heroTitle.textContent = '6 项硬性防漏红线已全部通过 · 允许启动（可选项含提示/跳过）';
     heroDesc.textContent = `通过 ${okCount} 项，提示 ${warnCount} 项${skipCount ? `，跳过 ${skipCount} 项` : ''}；保镖以 10s 周期执行进程级急停。`;
     heroPill.className = 'pill warn';
     heroPill.textContent = `READY · ${okCount}/14 OK`;
