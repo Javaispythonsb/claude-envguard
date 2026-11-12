@@ -1,26 +1,27 @@
 // Apple HIG Dynamic Island & Control Center Platter pure view-model helpers
-// Strictly preserves security invariants, IP masking, and zero em-dash copy.
+// Preserves security invariants, IP masking, full 14-check domain mapping, and zero em-dash copy.
 
 export const POD_WIDTH = 480;
 export const POD_COMPACT_HEIGHT = 64;
 
 export const FIXABLE_OPTIONAL = new Set(['时区', '地区', 'DNS', 'WebRTC', '生态可达性']);
+export const HARD_FIXABLE = new Set(['代理内核', 'TUN网卡', 'IPv6', '保镖', '规则置顶']);
 
 export const CHECK_SPECS = [
-  { key: '代理内核', label: '代理内核', hard: true },
-  { key: 'TUN网卡', label: 'TUN 网卡', hard: true },
-  { key: '出口IP', label: '出口地区', hard: true },
-  { key: 'IPv6', label: 'IPv6 阻断', hard: true },
-  { key: '保镖', label: '常驻保镖', hard: true },
-  { key: '规则置顶', label: '置顶规则', hard: true },
-  { key: 'DNS', label: 'DNS 归属', hard: false },
-  { key: 'WebRTC', label: 'WebRTC', hard: false },
-  { key: '生态可达性', label: '服务连通', hard: false },
-  { key: 'IP一致', label: 'IP 稳定', hard: false },
-  { key: '客户端语言', label: '客户端语言', hard: false },
-  { key: 'ASN属性', label: 'ASN 属性', hard: false },
-  { key: '时区', label: '系统时区', hard: false },
-  { key: '地区', label: '区域格式', hard: false }
+  { key: '代理内核', label: '代理内核', hard: true, domain: 'tunnel' },
+  { key: 'TUN网卡', label: 'TUN 网卡', hard: true, domain: 'tunnel' },
+  { key: '出口IP', label: '出口地区', hard: true, domain: 'egress' },
+  { key: 'IPv6', label: 'IPv6 阻断', hard: true, domain: 'egress' },
+  { key: '保镖', label: '常驻保镖', hard: true, domain: 'leak' },
+  { key: '规则置顶', label: '置顶规则', hard: true, domain: 'tunnel' },
+  { key: 'DNS', label: 'DNS 归属', hard: false, domain: 'leak' },
+  { key: 'WebRTC', label: 'WebRTC', hard: false, domain: 'leak' },
+  { key: '生态可达性', label: '服务连通', hard: false, domain: 'leak' },
+  { key: 'IP一致', label: 'IP 稳定', hard: false, domain: 'egress' },
+  { key: '客户端语言', label: '客户端语言', hard: false, domain: 'locale' },
+  { key: 'ASN属性', label: 'ASN 属性', hard: false, domain: 'egress' },
+  { key: '时区', label: '系统时区', hard: false, domain: 'locale' },
+  { key: '地区', label: '区域格式', hard: false, domain: 'locale' }
 ];
 
 export const OPTIONAL_ITEMS = [
@@ -57,7 +58,7 @@ export function maskDisplayIp(text) {
  */
 export function conciseCheckValue(spec, st, rawDetail, countryTarget) {
   const detail = maskDisplayIp(rawDetail || '').trim();
-  if (st === 'skip') return '已跳过';
+  if (st === 'skip') return '已免检';
 
   if (spec.key === '出口IP') {
     if (st === 'ok') return countryTarget || '合规';
@@ -66,7 +67,7 @@ export function conciseCheckValue(spec, st, rawDetail, countryTarget) {
   }
   if (spec.key === 'DNS') {
     if (detail.includes('解析器位于 ')) {
-      const cc = detail.split('解析器位于 ').pop().trim().split(/\s+/)[0];
+      const cc = detail.split('解析器位于 ').pop().trim().split(/[;；\s]+/)[0];
       if (cc) return cc;
     }
     return st === 'ok' ? '海外' : st === 'warn' ? '待查' : '泄漏';
@@ -86,8 +87,23 @@ export function conciseCheckValue(spec, st, rawDetail, countryTarget) {
     return reason ? reason[1].slice(0, 6) : '未验证';
   }
   if (spec.key === 'ASN属性') {
-    if (detail.includes('ISP') || detail.includes('住宅')) return 'ISP';
-    if (detail.includes('机房') || detail.includes('hosting')) return '机房';
+    if (/isp|住宅/i.test(detail)) return '住宅 ISP';
+    if (/hosting|机房/i.test(detail)) return '机房';
+    if (/content|cdn/i.test(detail)) return 'CDN';
+    if (/education|edu/i.test(detail)) return '教育网';
+    if (/business|enterprise/i.test(detail)) return '商业网';
+    if (/未确认|unknown/i.test(detail)) return '待确认';
+  }
+  if (spec.key === '客户端语言') {
+    const mismatch = detail.match(/Claude=([a-zA-Z-]+).*?期望\s*([a-zA-Z-]+)/i);
+    if (mismatch) return `${mismatch[1]}≠${mismatch[2]}`;
+    const okLang = detail.match(/Claude=([a-zA-Z-]+)/i);
+    if (st === 'ok' && okLang) return okLang[1];
+    if (/未能读取/.test(detail)) return '未读取';
+    return st === 'ok' ? '匹配' : '不匹配';
+  }
+  if (spec.key === '时区' || spec.key === '地区') {
+    if (st === 'ok') return '一致';
   }
   if (st === 'ok') return '正常';
   if (st === 'warn') return detail.startsWith('非关键失败已忽略') ? '已降级' : '提示';
@@ -103,80 +119,266 @@ function worstTone(states) {
 }
 
 /**
- * Builds the 2x2 Apple Control Center Platter Tiles summarizing live telemetry.
+ * Builds the 2x2 Apple Control Center Platter Tiles covering all 14 checks across 4 domains:
+ * 1. tunnel (代理内核 + TUN网卡 + 规则置顶)
+ * 2. egress (出口IP + IPv6 + IP一致 + ASN属性)
+ * 3. leak   (DNS + WebRTC + 生态可达性 + 保镖)
+ * 4. locale (客户端语言 + 时区 + 地区)
  */
 export function buildPlatterTiles(data, checkMap) {
   const get = (k) => checkMap.get(k) || { state: 'skip', detail: '' };
   const cc = data?.country_target || '--';
   const clientName = CLIENT_NAMES[data?.proxy_mode] || data?.proxy_mode || '未识别';
 
+  // 1. Tunnel & Rules (3 hard checks)
   const cCore = get('代理内核');
   const cTun = get('TUN网卡');
   const cRule = get('规则置顶');
-  const tunnelTone = (cCore.state !== 'ok' || cTun.state !== 'ok' || cRule.state !== 'ok')
-    ? (cCore.state === 'skip' && cTun.state === 'skip' ? 'skip' : 'fail')
-    : 'ok';
+  const tunnelAllSkip = cCore.state === 'skip' && cTun.state === 'skip' && cRule.state === 'skip';
+  const tunnelTone = tunnelAllSkip
+    ? 'skip'
+    : (cCore.state === 'ok' && cTun.state === 'ok' && cRule.state === 'ok' ? 'ok' : 'fail');
   const tunnelSub = tunnelTone === 'ok'
     ? 'TUN 接管 · 规则置顶'
-    : cTun.state !== 'ok'
-      ? 'TUN 未就绪'
-      : cCore.state !== 'ok'
-        ? '代理内核未运行'
-        : '分流规则待验证';
+    : tunnelTone === 'skip'
+      ? '等待探测隧道'
+      : cTun.state !== 'ok'
+        ? 'TUN 网卡未就绪'
+        : cCore.state !== 'ok'
+          ? '代理内核未运行'
+          : '分流置顶待验证';
 
+  // 2. Egress & Network (出口IP + IPv6 + IP一致 + ASN属性)
   const cExit = get('出口IP');
   const cV6 = get('IPv6');
   const cStable = get('IP一致');
-  const egressTone = (cExit.state !== 'ok' || cV6.state !== 'ok')
-    ? (cExit.state === 'skip' && cV6.state === 'skip' ? 'skip' : 'fail')
-    : cStable.state === 'warn'
-      ? 'warn'
-      : 'ok';
-  const egressSub = cExit.state !== 'ok'
-    ? (cExit.state === 'skip' ? '等待出口探测' : '出口地区不符')
-    : cV6.state !== 'ok'
-      ? 'IPv6 尚未阻断'
-      : cStable.state === 'warn'
-        ? 'IP 近期发生变动'
-        : 'IPv6 已关 · 链路纯净';
+  const cAsn = get('ASN属性');
+  const egressHardBad = cExit.state !== 'ok' || cV6.state !== 'ok';
+  const egressAllSkip = [cExit, cV6, cStable, cAsn].every((x) => x.state === 'skip');
+  const egressTone = egressAllSkip
+    ? 'skip'
+    : egressHardBad
+      ? 'fail'
+      : worstTone([cExit.state, cV6.state, cStable.state, cAsn.state]);
+  const asnShort = conciseCheckValue({ key: 'ASN属性' }, cAsn.state, cAsn.detail, cc);
+  const egressSub = egressAllSkip
+    ? '等待出口探测'
+    : cExit.state !== 'ok'
+      ? '出口地区不符'
+      : cV6.state !== 'ok'
+        ? 'IPv6 尚未阻断'
+        : cStable.state === 'warn' || cStable.state === 'fail'
+          ? '出口 IP 近期变动'
+          : cAsn.state === 'warn' || cAsn.state === 'fail'
+            ? `IPv6 已关 · ${asnShort}节点`
+            : 'IPv6 已关 · 链路纯净';
 
+  // 3. Leak & Bodyguard (DNS + WebRTC + 生态可达性 + 保镖)
   const cDns = get('DNS');
   const cRtc = get('WebRTC');
-  const leakTone = worstTone([cDns.state, cRtc.state]);
+  const cEco = get('生态可达性');
+  const cGuard = get('保镖');
+  const leakAllSkip = [cDns, cRtc, cEco, cGuard].every((x) => x.state === 'skip');
+  const leakTone = leakAllSkip
+    ? 'skip'
+    : cGuard.state !== 'ok'
+      ? 'fail'
+      : worstTone([cDns.state, cRtc.state, cEco.state]);
   const dnsVal = conciseCheckValue({ key: 'DNS' }, cDns.state, cDns.detail, cc);
-  const leakSub = leakTone === 'ok'
-    ? `DNS ${dnsVal} · STUN 无暴露`
-    : leakTone === 'skip'
-      ? '防漏项已设为跳过'
+  const leakSub = leakAllSkip
+    ? '等待泄漏与守护探测'
+    : cGuard.state !== 'ok'
+      ? '常驻保镖未激活'
       : cDns.state === 'fail' || cDns.state === 'warn'
         ? `DNS ${dnsVal} · 需关注`
-        : 'WebRTC 候选需关注';
+        : cRtc.state === 'fail' || cRtc.state === 'warn'
+          ? 'WebRTC 候选需关注'
+          : cEco.state === 'fail' || cEco.state === 'warn'
+            ? 'Claude 连通性波动'
+            : `DNS ${dnsVal === '已免检' ? '免检' : dnsVal} · 保镖在线`;
 
-  const cGuard = get('保镖');
-  const cEco = get('生态可达性');
-  const guardTone = cGuard.state !== 'ok'
-    ? (cGuard.state === 'skip' ? 'skip' : 'fail')
-    : cEco.state === 'fail' || cEco.state === 'warn'
-      ? 'warn'
-      : 'ok';
-  const guardTitle = cGuard.state === 'ok' ? '保镖守护中' : cGuard.state === 'warn' ? '保镖待升级' : '保镖未运行';
-  const guardSub = cGuard.state === 'ok'
-    ? (cEco.state === 'ok' ? '10s 巡检 · 服务连通' : '10s 掉线急停巡检中')
-    : '进程急停保护未激活';
+  // 4. Locale & Language (客户端语言 + 时区 + 地区)
+  const cLang = get('客户端语言');
+  const cTz = get('时区');
+  const cLoc = get('地区');
+  const localeStates = [cLang.state, cTz.state, cLoc.state];
+  const localeTone = worstTone(localeStates);
+  const langVal = conciseCheckValue({ key: '客户端语言' }, cLang.state, cLang.detail, cc);
+  const skipCount = localeStates.filter((s) => s === 'skip').length;
+  const localeSub = localeTone === 'skip'
+    ? '3 项均设为免检'
+    : cLang.state === 'warn' || cLang.state === 'fail'
+      ? `客户端 ${langVal}`
+      : cTz.state === 'warn' || cTz.state === 'fail'
+        ? '系统时区不匹配'
+        : cLoc.state === 'warn' || cLoc.state === 'fail'
+          ? '区域格式不匹配'
+          : skipCount > 0
+            ? `语言匹配 · ${skipCount} 项免检`
+            : '时区、语言与格式一致';
 
   return [
     { id: 'tunnel', title: clientName, sub: tunnelSub, tone: tunnelTone },
     { id: 'egress', title: `出口 · ${cc}`, sub: egressSub, tone: egressTone },
-    { id: 'leak', title: 'DNS 与 WebRTC', sub: leakSub, tone: leakTone },
-    { id: 'guard', title: guardTitle, sub: guardSub, tone: guardTone }
+    { id: 'leak', title: '防漏与保镖', sub: leakSub, tone: leakTone },
+    { id: 'locale', title: '区域与语言', sub: localeSub, tone: localeTone }
   ];
+}
+
+/**
+ * Generates human-readable guidance & contextual quick action for any check item.
+ */
+export function describeCheckGuidance(spec, st, rawDetail, countryTarget) {
+  const detail = maskDisplayIp(rawDetail || '').trim();
+  if (st === 'ok') {
+    return {
+      hint: detail || '该安全检查项已通过验证。',
+      actionType: null,
+      actionLabel: ''
+    };
+  }
+  if (st === 'skip') {
+    return {
+      hint: '当前已在「设置」中设为免检跳过，不参与启动阻断。',
+      actionType: 'goto-settings',
+      actionLabel: '去设置'
+    };
+  }
+
+  if (spec.key === '出口IP') {
+    return {
+      hint: `${detail || '当前出口国家与目标不一致'}。若已切换代理国家节点，可点右侧重新锁定目标地区。`,
+      actionType: 'tool:set-region',
+      actionLabel: '重锁地区'
+    };
+  }
+  if (spec.key === '客户端语言') {
+    return {
+      hint: `${detail || '客户端语言与出口地区不一致'}。可在 Claude 设置切换为对应语言，或将此提示项设为免检。`,
+      actionType: 'mute',
+      actionLabel: '设为免检'
+    };
+  }
+  if (spec.key === 'ASN属性') {
+    return {
+      hint: `${detail || '当前出口属于机房或 CDN 网络'}。非阻断参考项：追求原生住宅属性可换 ISP 节点，也可设为免检。`,
+      actionType: 'mute',
+      actionLabel: '设为免检'
+    };
+  }
+  if (spec.key === 'IP一致') {
+    return {
+      hint: `${detail || '出口 IP 与上次记录不同'}。频繁跳 IP 易触发风控，建议固定代理节点；确认无误后重检即可。`,
+      actionType: 'mute',
+      actionLabel: '设为免检'
+    };
+  }
+  if (spec.key === 'WebRTC') {
+    if (st === 'warn' && /未收到|不可达|超时|timeout/i.test(detail)) {
+      return {
+        hint: `${detail}。当前代理节点可能拦截或未转发 UDP STUN，无本机 IP 暴露；可换支持 UDP 的节点或设为免检。`,
+        actionType: 'mute',
+        actionLabel: '设为免检'
+      };
+    }
+  }
+  if (HARD_FIXABLE.has(spec.key) || FIXABLE_OPTIONAL.has(spec.key)) {
+    const fixableNow = st === 'fail' || String(rawDetail || '').startsWith('非关键失败已忽略');
+    return {
+      hint: `${detail || '检测到配置偏差'}。${fixableNow ? '可点击右侧执行自动修复' : '非阻断提示项，可在设置中调整免检策略'}。`,
+      actionType: fixableNow ? 'fix' : 'mute',
+      actionLabel: fixableNow ? '一键修复' : '设为免检'
+    };
+  }
+  return {
+    hint: detail || `状态：${countryTarget || '--'} 待处理`,
+    actionType: null,
+    actionLabel: ''
+  };
+}
+
+/**
+ * Builds top-priority Anomaly Callout cards for all checks in `fail` or `warn` state.
+ */
+export function buildAnomalyCallouts(data, checkMap) {
+  if (!checkMap || checkMap.size === 0) return [];
+  const cc = data?.country_target || '--';
+  const items = [];
+  for (const spec of CHECK_SPECS) {
+    const found = checkMap.get(spec.key);
+    if (!found) continue;
+    const st = found.state;
+    if (st !== 'fail' && st !== 'warn') continue;
+    const badge = conciseCheckValue(spec, st, found.detail, cc);
+    const guide = describeCheckGuidance(spec, st, found.detail, cc);
+    items.push({
+      key: spec.key,
+      label: spec.label,
+      hard: spec.hard,
+      state: st,
+      badge,
+      hint: guide.hint,
+      actionType: guide.actionType,
+      actionLabel: guide.actionLabel
+    });
+  }
+  // Sort hard/fail items ahead of optional warnings
+  items.sort((a, b) => {
+    const score = (x) => (x.state === 'fail' ? 0 : 1) * 10 + (x.hard ? 0 : 1);
+    return score(a) - score(b);
+  });
+  return items;
+}
+
+/**
+ * Summarizes the 14 checks for the collapsible matrix bar.
+ */
+export function summarizeMatrixCounts(checkMap) {
+  let ok = 0;
+  let warn = 0;
+  let fail = 0;
+  let skip = 0;
+  for (const spec of CHECK_SPECS) {
+    const st = checkMap?.get(spec.key)?.state || 'skip';
+    if (st === 'ok') ok++;
+    else if (st === 'warn') warn++;
+    else if (st === 'fail') fail++;
+    else skip++;
+  }
+  const parts = [`${ok} 正常`];
+  if (fail > 0) parts.push(`${fail} 未过`);
+  if (warn > 0) parts.push(`${warn} 提示`);
+  if (skip > 0) parts.push(`${skip} 免检`);
+  return { ok, warn, fail, skip, summaryText: parts.join(' · ') };
+}
+
+/**
+ * Normalizes a user-typed or pasted URL for the isolated safe browser.
+ * Auto-prepends https:// for bare domains like "claude.ai/login".
+ */
+export function normalizeSafeUrl(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return { ok: false, url: '', reason: '请输入或粘贴要隔离打开的链接' };
+  if (/[\s"<>`']/.test(trimmed)) {
+    return { ok: false, url: '', reason: '链接包含非法空白或引号字符' };
+  }
+  if (/^https?:\/\/[^/\s]+\S*$/i.test(trimmed)) {
+    return { ok: true, url: trimmed, reason: '' };
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) {
+    return { ok: false, url: '', reason: '仅支持 https:// 或 http:// 网页链接' };
+  }
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+([/?#]\S*)?$/i.test(trimmed)) {
+    return { ok: true, url: `https://${trimmed}`, reason: '' };
+  }
+  return { ok: false, url: '', reason: '请输入有效的网址（如 claude.ai）' };
 }
 
 /**
  * Computes the Compact Dynamic Island primary button role according to Apple HIG:
  * - Busy: muted disabled progress label
  * - Ready: System Green (#30D158) "启动" -> launches Claude Desktop
- * - Blocked + Fixable: System Amber (#FFD600) "修复" -> runs 1-click fix directly!
+ * - Blocked + Fixable: System Amber (#FFD60A) "修复" -> runs 1-click fix directly!
  * - Blocked + Unfixable: Muted Red "已锁定" -> disabled
  * - Incomplete initial load: Muted "审计中…" -> disabled
  */

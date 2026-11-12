@@ -941,6 +941,56 @@ fn set_programmatic_pos(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, x:
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
+fn set_window_rect_atomic(
+    window: &WebviewWindow,
+    dock: &Arc<Mutex<DockInner>>,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    {
+        let mut st = dock.lock().unwrap();
+        st.last_programmatic_target = Some((x, y));
+        st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: *mut std::ffi::c_void,
+                hwnd_insert_after: *mut std::ffi::c_void,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                u_flags: u32,
+            ) -> i32;
+        }
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        if let Ok(hwnd) = window.hwnd() {
+            // SAFETY: Single atomic Win32 SetWindowPos updates (x, y, w, h) in one DWM frame
+            // without altering Z-order or stealing foreground activation.
+            unsafe {
+                SetWindowPos(
+                    hwnd.0,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    w.max(1),
+                    h.max(1),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return;
+        }
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+    let _ = window.set_size(PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
+}
+
 fn glide_window(
     window: &WebviewWindow,
     dock: &Arc<Mutex<DockInner>>,
@@ -1093,7 +1143,6 @@ enum WatcherAction {
         to: (i32, i32),
     },
     TuckEdge {
-        from: (i32, i32),
         edge: DockEdge,
         dock_x: i32,
         dock_y: i32,
@@ -1235,7 +1284,6 @@ fn start_dock_watcher(
                         };
                     } else if st.edge != DockEdge::None {
                         action = WatcherAction::TuckEdge {
-                            from: (wx, wy),
                             edge: st.edge,
                             dock_x: st.dock_x,
                             dock_y: st.dock_y,
@@ -1413,7 +1461,6 @@ fn start_dock_watcher(
                                             >= Duration::from_millis(1200)
                                     {
                                         action = WatcherAction::TuckEdge {
-                                            from: (wx, wy),
                                             edge: st.edge,
                                             dock_x: st.dock_x,
                                             dock_y: st.dock_y,
@@ -1475,7 +1522,6 @@ fn start_dock_watcher(
                     let _ = window.emit("dock-state", payload);
                 }
                 WatcherAction::TuckEdge {
-                    from,
                     edge,
                     dock_x,
                     dock_y,
@@ -1483,20 +1529,19 @@ fn start_dock_watcher(
                     seam,
                     peek,
                 } => {
-                    let _ = window.emit("collapse-drawers", ());
-                    std::thread::sleep(Duration::from_millis(45));
-                    let fresh_size = window.outer_size().unwrap_or(wsize);
-                    let f_ww = fresh_size.width as i32;
-                    let f_wh = fresh_size.height as i32;
-                    let cur_from = window
-                        .outer_position()
-                        .map(|p| (p.x, p.y))
-                        .unwrap_or(from);
+                    let _ = window.emit(
+                        "collapse-drawers",
+                        serde_json::json!({ "immediate": true }),
+                    );
+                    let f_ww = pod_default_w;
+                    let f_wh = pod_base_h;
+                    set_window_rect_atomic(&window, &dock, dock_x, dock_y, f_ww, f_wh);
                     let target =
                         tucked_window_pos(dock_x, dock_y, f_ww, f_wh, area, peek, edge, seam);
-                    glide_window(&window, &dock, cur_from, target, 10, 15);
+                    glide_window(&window, &dock, (dock_x, dock_y), target, 10, 14);
                     let payload = {
                         let mut st = dock.lock().unwrap();
+                        st.pod_h_phys = pod_base_h;
                         st.tucked = true;
                         st.idle = true;
                         st.payload()
@@ -1510,9 +1555,13 @@ fn start_dock_watcher(
                     glide_window(&window, &dock, from, to, 10, 14);
                 }
                 WatcherAction::EnterOrb { orb_pos, orb_size } => {
-                    let _ = window.emit("collapse-drawers", ());
+                    let _ = window.emit(
+                        "collapse-drawers",
+                        serde_json::json!({ "immediate": true }),
+                    );
                     let payload = {
                         let mut st = dock.lock().unwrap();
+                        st.pod_h_phys = pod_base_h;
                         st.orb_collapsed = true;
                         st.tucked = false;
                         st.idle = true;
@@ -1521,9 +1570,15 @@ fn start_dock_watcher(
                     };
                     let _ = window.set_ignore_cursor_events(false);
                     let _ = window.emit("dock-state", payload);
-                    std::thread::sleep(Duration::from_millis(20));
-                    let _ = window.set_size(PhysicalSize::new(orb_size as u32, orb_size as u32));
-                    set_programmatic_pos(&window, &dock, orb_pos.0, orb_pos.1);
+                    std::thread::sleep(Duration::from_millis(16));
+                    set_window_rect_atomic(
+                        &window,
+                        &dock,
+                        orb_pos.0,
+                        orb_pos.1,
+                        orb_size,
+                        orb_size,
+                    );
                 }
                 WatcherAction::ExitOrb {
                     pod_pos,
@@ -1531,13 +1586,8 @@ fn start_dock_watcher(
                     pod_h,
                     payload,
                 } => {
-                    {
-                        let mut st = dock.lock().unwrap();
-                        st.ignore_moves_until = Instant::now() + Duration::from_millis(320);
-                    }
                     let _ = window.set_ignore_cursor_events(false);
-                    let _ = window.set_size(PhysicalSize::new(pod_w as u32, pod_h as u32));
-                    set_programmatic_pos(&window, &dock, pod_pos.0, pod_pos.1);
+                    set_window_rect_atomic(&window, &dock, pod_pos.0, pod_pos.1, pod_w, pod_h);
                     let _ = window.emit("dock-state", payload);
                 }
             }
@@ -1556,6 +1606,47 @@ fn set_dock_hold(dock: State<'_, DockController>, hold: bool) {
     st.ui_hold = hold;
     if hold {
         st.last_hover_at = Instant::now();
+    }
+}
+
+#[tauri::command]
+fn set_pod_envelope(
+    window: WebviewWindow,
+    dock: State<'_, DockController>,
+    logical_h: f64,
+    collapsed: bool,
+) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let clamped_logical = logical_h.clamp(POD_BASE_HEIGHT_LOGICAL_PX, 960.0);
+    let new_h = (clamped_logical * scale).round() as i32;
+    let base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
+    let default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
+    let margin = (8.0 * scale).round() as i32;
+
+    let rect_opt = {
+        let mut st = dock.inner.lock().unwrap();
+        if st.tucked || st.orb_collapsed {
+            None
+        } else {
+            let pod_w = st.pod_w_phys.max(default_w);
+            if collapsed {
+                st.pod_h_phys = base_h;
+            }
+            let (vis_x, vis_y) = compute_visible_pod_pos(
+                st.dock_x,
+                st.dock_y,
+                pod_w,
+                new_h,
+                st.work_area,
+                st.edge,
+                margin,
+            );
+            Some((vis_x, vis_y, pod_w, new_h))
+        }
+    };
+
+    if let Some((vx, vy, vw, vh)) = rect_opt {
+        set_window_rect_atomic(&window, &dock.inner, vx, vy, vw, vh);
     }
 }
 
@@ -1829,6 +1920,7 @@ fn main() {
             export_diagnostics,
             get_dock_state,
             set_dock_hold,
+            set_pod_envelope,
             set_dock_pinned,
             set_standby_mode,
             expand_from_orb,

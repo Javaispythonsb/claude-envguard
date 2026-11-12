@@ -1,49 +1,85 @@
 /* ==========================================================================
-   Claude EnvGuard v2.0 — Apple HIG (2025/2026) Dynamic Island & Platter UI
-   - Minimal / Compact (480×64 Single-Row Pill) / Expanded Platter
-   - Strict Concentric Geometry: R_outer (32px) - Padding (14px) = R_inner (18px)
-   - Apple Dark Mode Vibrancy Hierarchy & Official Semantic Colors
+   Claude EnvGuard v2.0 — Apple HIG (2025/2026) Optical & Fluid Design System
+   - Dual-Ring Edge Optics: Outer 1px Obsidian Seal + Inner 1px Specular Rim
+   - 4-Level Dark Z-Elevation: Recessed Well / Base / Grouped Platter / Elevated Tile
+   - Exact Concentricity: Compact (480×64, R=999px round, 36px + 14px pad)
+                          Expanded (480×auto, R=28px squircle, inner R=14px)
+   - Emil Kowalski Motion Craft & WCAG 2.2 AA Accessible Contrast
    ========================================================================== */
 
 :root {
-  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Segoe UI Variable Text', 'PingFang SC', 'Microsoft YaHei UI', system-ui, sans-serif;
+  color-scheme: dark;
+
+  /* Include 'Segoe UI' so Windows 10 Latin/Numerals never fall back to Microsoft YaHei UI */
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI Variable Text', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', system-ui, sans-serif;
   --font-mono: 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', 'Consolas', ui-monospace, monospace;
 
-  /* Apple Obsidian Dynamic Island Surface & Platter Fills */
-  --island-bg: #08090c;
-  --platter-bg: rgba(255, 255, 255, 0.052);
-  --platter-hover: rgba(255, 255, 255, 0.088);
-  --fill-primary: rgba(120, 120, 128, 0.34);
-  --fill-secondary: rgba(120, 120, 128, 0.26);
-  --fill-tertiary: rgba(118, 118, 128, 0.20);
+  /* Level 0: Obsidian Island Base Gradient */
+  --island-bg-top: #111319;
+  --island-bg-mid: #090b10;
+  --island-bg-bot: #07080b;
 
-  /* Four-Level Apple Dark Vibrancy Labels */
+  /* Level -1: Recessed Well (Segmented Track, URL Well, Console) */
+  --well-bg: rgba(0, 0, 0, 0.46);
+  --well-shadow:
+    inset 0 1.5px 2.5px rgba(0, 0, 0, 0.72),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.48),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.065);
+
+  /* Level +1: Inset Grouped Platter (Check Matrix, Settings Rows) */
+  --platter-grouped-bg: rgba(255, 255, 255, 0.042);
+  --platter-grouped-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.075),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.058);
+
+  /* Level +2: Elevated Control Center Tiles & Gliders */
+  --tile-elevated-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.096) 0%, rgba(255, 255, 255, 0.056) 100%);
+  --tile-elevated-hover: linear-gradient(180deg, rgba(255, 255, 255, 0.135) 0%, rgba(255, 255, 255, 0.085) 100%);
+  --tile-elevated-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.15),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.078),
+    0 2px 6px rgba(0, 0, 0, 0.36);
+
+  /* Translucent Control Fills */
+  --fill-primary: rgba(120, 120, 128, 0.36);
+  --fill-secondary: rgba(120, 120, 128, 0.28);
+  --fill-tertiary: rgba(118, 118, 128, 0.22);
+
+  /* WCAG 2.2 AA Calibrated Apple Dark Vibrancy Labels */
   --label-1: #ffffff;
-  --label-2: rgba(235, 235, 245, 0.62);
-  --label-3: rgba(235, 235, 245, 0.36);
-  --label-4: rgba(235, 235, 245, 0.18);
+  --label-2: rgba(235, 235, 245, 0.68);
+  --label-3: rgba(235, 235, 245, 0.50); /* >= 4.56:1 on dark platters */
+  --label-4: rgba(235, 235, 245, 0.28);
 
-  /* Keylines & Hairline Separators */
-  --rim-top: rgba(255, 255, 255, 0.22);
-  --rim-border: rgba(255, 255, 255, 0.13);
-  --platter-rim: rgba(255, 255, 255, 0.085);
+  /* Dual-Ring Edge Optics */
+  --outer-obsidian-seal: rgba(0, 0, 0, 0.92);
+  --inner-rim-top: rgba(255, 255, 255, 0.21);
+  --inner-rim-side: rgba(255, 255, 255, 0.088);
   --sep-line: rgba(84, 84, 88, 0.46);
 
-  /* Apple 2026 Dark Mode Semantic System Palette */
+  /* Apple Semantic Palette & Accessible Hover Steps (No filter:brightness!) */
   --sys-green: #30d158;
-  --sys-amber: #ffd600;
-  --sys-red: #ff4245;
-  --sys-blue: #0091ff;
+  --sys-green-hover: #3be065;
+  --sys-amber: #ffd60a;
+  --sys-amber-hover: #ffe033;
+  --sys-amber-text: #ffd426;
+  --sys-red: #ff453a;
+  --sys-blue: #0a84ff;
+  --btn-blue-bg: #0071e3;       /* >= 4.70:1 with #ffffff text */
+  --btn-blue-hover: #0077ed;
 
-  /* Concentric Radii (R_inner = R_outer - Padding) */
-  --r-outer: 32px;
+  /* Concentric Radii: R_inner (14) = R_expanded (28) - Padding (14) */
   --pad-outer: 14px;
-  --r-platter: 18px;
-  --r-nested: 11px;
+  --r-compact: 999px;
+  --r-expanded: 28px;
+  --r-platter: 14px;
+  --r-tile-sm: 12px;
+  --r-nested: 9px;
 
-  /* Apple Fluid Spring Curves */
-  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
-  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  /* Emil Kowalski Motion Curves */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
 }
 
 * {
@@ -66,7 +102,7 @@ html, body {
 :root[data-runtime="web"] body {
   min-height: 100vh;
   background:
-    radial-gradient(920px 520px at 20% 14%, rgba(0, 145, 255, 0.22), transparent 62%),
+    radial-gradient(920px 520px at 20% 14%, rgba(10, 132, 255, 0.22), transparent 62%),
     radial-gradient(760px 480px at 82% 18%, rgba(48, 209, 88, 0.14), transparent 60%),
     #06070a !important;
   display: flex;
@@ -79,15 +115,24 @@ html, body {
 :root[data-runtime="tauri"] .web-stage { display: none; }
 :root[data-runtime="web"] .pod-stage { display: none; }
 
-/* Continuous Squircle Curvature where Chromium/WebView2 supports it */
+/* Squircle ONLY on Expanded Panel & Rectangular Platters; Compact Island stays pure round Stadium! */
 @supports (corner-shape: squircle) {
-  .pod,
+  :root[data-expanded="true"] .pod,
   .inset-platter,
   .cc-tile,
+  .anomaly-card,
   .tool-tile,
   .console-platter,
+  .url-well,
+  .url-well .pill-blue,
+  .apple-popup-btn,
+  .apple-popup-menu,
+  .port-input,
   .web-pod {
     corner-shape: squircle;
+  }
+  :root[data-expanded="false"] .pod {
+    corner-shape: round;
   }
 }
 
@@ -101,8 +146,8 @@ svg.ico {
   fill: none;
   flex-shrink: 0;
 }
-svg.ico.md { width: 17px; height: 17px; stroke-width: 2.25; }
-svg.ico.sm { width: 13.5px; height: 13.5px; stroke-width: 1.95; }
+svg.ico.md { width: 17px; height: 17px; stroke-width: 2.2; }
+svg.ico.sm { width: 14px; height: 14px; stroke-width: 1.95; }
 svg.ico.xs { width: 12px; height: 12px; stroke-width: 2; }
 
 button:focus-visible,
@@ -110,6 +155,9 @@ select:focus-visible,
 input:focus-visible {
   outline: 2px solid var(--sys-blue);
   outline-offset: 2px;
+}
+.url-well input:focus-visible {
+  outline: none;
 }
 
 /* ================= ZERO-HALO DESKTOP STAGE ================= */
@@ -120,9 +168,12 @@ input:focus-visible {
   width: 480px;
   background: transparent;
 }
+/* 60×60 stage centers the 56×56 ceramic orb with a 2px transparent anti-clip buffer */
 :root[data-orb="true"] .pod-stage {
   width: 60px;
   height: 60px;
+  display: grid;
+  place-items: center;
 }
 
 /* Live Magnetic Edge Snap Guide */
@@ -163,10 +214,10 @@ input:focus-visible {
 /* ================= MINIMAL MODE 1: EDGE SENSOR PILL (9px) ================= */
 .edge-handle {
   position: fixed;
-  background: var(--island-bg);
+  background: #08090c;
   box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.18),
-    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+    inset 0 0 0 1px rgba(0, 0, 0, 0.9),
+    inset 0 0 0 1.5px rgba(255, 255, 255, 0.16);
   display: none;
   place-items: center;
   pointer-events: none;
@@ -177,7 +228,7 @@ input:focus-visible {
   display: block;
   border-radius: 999px;
   background: var(--sys-green);
-  transition: background-color 200ms var(--ease-out);
+  transition: background-color 180ms ease;
 }
 .edge-bar.auditing,
 .edge-bar.warn { background: var(--sys-amber); }
@@ -201,7 +252,6 @@ input:focus-visible {
   height: 3px;
 }
 
-/* Strictly 48px tall so it fits comfortably inside the 64px compact island height */
 :root[data-dock="left"][data-tucked="true"] .edge-handle {
   display: grid;
   right: 0;
@@ -235,73 +285,67 @@ input:focus-visible {
   right: 0;
 }
 
-/* ================= MINIMAL MODE 2: 60×60 CERAMIC OBSIDIAN ORB ================= */
+/* ================= MINIMAL MODE 2: 56×56 CERAMIC OBSIDIAN ORB ================= */
 .shield-orb {
   position: relative;
   display: none;
-  width: 60px;
-  height: 60px;
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  border: none;
   border-radius: 50%;
   background:
-    radial-gradient(82% 46% at 50% 4%, rgba(255, 255, 255, 0.20) 0%, rgba(255, 255, 255, 0) 100%),
-    linear-gradient(180deg, #12141a 0%, #07080b 56%, #040507 100%);
+    radial-gradient(76% 42% at 50% 8%, rgba(255, 255, 255, 0.25) 0%, rgba(255, 255, 255, 0.04) 58%, transparent 100%),
+    linear-gradient(180deg, #161922 0%, #090b10 54%, #050609 100%);
   box-shadow:
-    inset 0 1px 0.5px rgba(255, 255, 255, 0.34),
-    inset 0 -1.5px 2px rgba(0, 0, 0, 0.9),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.16);
+    0 1px 2.5px rgba(0, 0, 0, 0.52),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.94),
+    inset 0 1.5px 1px rgba(255, 255, 255, 0.34),
+    inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.10);
   color: var(--sys-green);
   place-items: center;
   cursor: pointer;
   overflow: hidden;
-  transition: transform 180ms var(--ease-spring), box-shadow 200ms var(--ease-out), color 200ms var(--ease-out);
+  transition: transform 150ms var(--ease-out), box-shadow 200ms ease, color 200ms ease;
 }
 .shield-orb .orb-glow {
   position: absolute;
-  inset: 17px;
+  inset: 14px;
   border-radius: 50%;
-  background: radial-gradient(circle, currentColor 0%, transparent 70%);
-  opacity: 0.12;
+  background: radial-gradient(circle, currentColor 0%, transparent 72%);
+  opacity: 0.16;
   pointer-events: none;
-  transition: opacity 200ms var(--ease-out), transform 200ms var(--ease-out);
-}
-.shield-orb:hover {
-  box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.44),
-    inset 0 0 0 1.25px rgba(255, 255, 255, 0.28);
-}
-.shield-orb:hover .orb-glow {
-  opacity: 0.22;
-  transform: scale(1.12);
-}
-.shield-orb:active {
-  transform: scale(0.94);
+  transition: opacity 200ms ease, transform 200ms var(--ease-out);
 }
 .shield-orb.auditing { color: var(--sys-amber); }
 .shield-orb.blocked {
   color: var(--sys-red);
   box-shadow:
-    inset 0 1px 1px rgba(255, 120, 120, 0.32),
-    inset 0 0 0 1.2px rgba(255, 66, 69, 0.48);
+    0 1px 2.5px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.94),
+    inset 0 1.5px 1px rgba(255, 130, 130, 0.36),
+    inset 0 -1.5px 1.5px rgba(255, 69, 58, 0.24);
 }
 
 .orb-shield {
   position: relative;
   z-index: 1;
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
   pointer-events: none;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
 }
 .orb-shield .shield-outline {
-  stroke-width: 1.75;
+  stroke-width: 1.85;
   fill: currentColor;
-  fill-opacity: 0.10;
+  fill-opacity: 0.13;
 }
 .orb-shield .shield-mark {
-  stroke-width: 2.05;
+  stroke-width: 2.15;
 }
 
 :root[data-orb="true"] .shield-orb { display: grid; }
@@ -313,33 +357,53 @@ input:focus-visible {
 
 /* ================= COMPACT & EXPANDED DYNAMIC ISLAND SURFACE ================= */
 .pod {
-  --rim-tint: var(--rim-border);
+  --pod-r: var(--r-compact);
+  --rim-accent: var(--inner-rim-side);
+  position: relative;
   width: 480px;
   min-height: 64px;
-  border-radius: var(--r-outer);
-  padding: 13px var(--pad-outer);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.032) 0%, rgba(255, 255, 255, 0) 44px),
-    var(--island-bg);
-  box-shadow:
-    inset 0 1px 0 var(--rim-top),
-    inset 0 0 0 1px var(--rim-tint);
+  border-radius: var(--pod-r);
+  padding: var(--pad-outer);
+  background: linear-gradient(180deg, var(--island-bg-top) 0%, var(--island-bg-mid) 48px, var(--island-bg-bot) 100%);
+  box-shadow: inset 0 0 0 1px var(--outer-obsidian-seal);
   display: flex;
   flex-direction: column;
   gap: 11px;
-  cursor: grab;
+  cursor: default;
   opacity: 1;
-  transition: opacity 160ms var(--ease-out), border-radius 200ms var(--ease-spring), box-shadow 220ms var(--ease-out);
+  isolation: isolate;
+  transform-origin: 50% 0%;
+  transition: opacity 160ms ease, border-radius 200ms var(--ease-drawer);
 }
-.pod:active { cursor: grabbing; }
-.pod[data-alert="blocked"] { --rim-tint: rgba(255, 66, 69, 0.34); }
-.pod[data-alert="auditing"] { --rim-tint: rgba(255, 214, 0, 0.24); }
+:root[data-expanded="true"] .pod {
+  --pod-r: var(--r-expanded);
+}
+.pod[data-alert="blocked"] { --rim-accent: rgba(255, 69, 58, 0.42); }
+.pod[data-alert="auditing"] { --rim-accent: rgba(255, 214, 10, 0.30); }
+
+/* Inner 1px Specular Rim: crisp dark border against white wallpaper, luminous rim against black wallpaper */
+.pod::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: calc(var(--pod-r) - 1px);
+  padding: 1px;
+  background: linear-gradient(180deg, var(--inner-rim-top) 0%, var(--rim-accent) 45%, rgba(255, 255, 255, 0.05) 100%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 20;
+}
 
 /* Flush docked corners hug physical screen bezel seamlessly */
-:root[data-dock="top"] .pod { border-radius: 0 0 var(--r-outer) var(--r-outer); }
-:root[data-dock="left"] .pod { border-radius: 0 var(--r-outer) var(--r-outer) 0; }
-:root[data-dock="right"] .pod { border-radius: var(--r-outer) 0 0 var(--r-outer); }
-:root[data-dock="none"] .pod { border-radius: var(--r-outer); }
+:root[data-dock="top"] .pod { border-radius: 0 0 var(--pod-r) var(--pod-r); }
+:root[data-dock="left"] .pod { border-radius: 0 var(--pod-r) var(--pod-r) 0; }
+:root[data-dock="right"] .pod { border-radius: var(--pod-r) 0 0 var(--pod-r); }
+
+:root[data-dock="top"] .pod::after { border-radius: 0 0 calc(var(--pod-r) - 1px) calc(var(--pod-r) - 1px); }
+:root[data-dock="left"] .pod::after { border-radius: 0 calc(var(--pod-r) - 1px) calc(var(--pod-r) - 1px) 0; }
+:root[data-dock="right"] .pod::after { border-radius: calc(var(--pod-r) - 1px) 0 0 calc(var(--pod-r) - 1px); }
 
 :root[data-tucked="true"] .pod {
   opacity: 0;
@@ -348,49 +412,141 @@ input:focus-visible {
 
 /* Free-floating idle translucency (only when collapsed) */
 :root[data-dock="none"][data-idle="true"][data-expanded="false"] .pod {
-  opacity: 0.68;
+  opacity: 0.70;
 }
 
-/* ================= COMPACT SINGLE-ROW ISLAND (64px) ================= */
+.js-drag-surface { cursor: grab; }
+.js-drag-surface:active { cursor: grabbing; }
+
+/* ================= COMPACT SINGLE-ROW ISLAND (64px = 36px + 14px * 2) ================= */
 .pod-main {
-  min-height: 38px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.pod-summary-trigger {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  border-radius: 18px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
   display: flex;
   align-items: center;
   gap: 11px;
+  cursor: pointer;
 }
 
-/* Concentric 38×38 Status Ring (19px radius + 13px padding = 32px outer radius!) */
+/* SVG Dual-Track Activity Ring (36×36, radius 18 + 14px pad = 32px zero-eccentricity concentricity!) */
 .ring-gauge {
-  width: 38px;
-  height: 38px;
-  border-radius: 50%;
-  background: conic-gradient(var(--sys-green) 0% 100%, rgba(255, 255, 255, 0.1) 100%);
+  position: relative;
+  width: 36px;
+  height: 36px;
   display: grid;
   place-items: center;
   flex-shrink: 0;
-  transition: background 240ms var(--ease-out);
+  color: var(--sys-green);
+  transition: color 200ms ease;
 }
-.ring-gauge.sm { width: 38px; height: 38px; }
-.ring-gauge.auditing {
-  background: conic-gradient(var(--sys-amber) 0% 68%, rgba(255, 255, 255, 0.10) 68% 100%);
-}
-.ring-gauge.blocked {
-  background: conic-gradient(var(--sys-red) 0% 36%, rgba(255, 255, 255, 0.12) 36% 100%);
-}
+.ring-gauge.sm { width: 36px; height: 36px; }
+.ring-gauge.auditing { color: var(--sys-amber); }
+.ring-gauge.blocked { color: var(--sys-red); }
 .ring-gauge * { pointer-events: none; }
 
-.ring-inner {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  background: var(--island-bg);
+.ring-svg {
+  position: absolute;
+  inset: 0;
+  width: 36px;
+  height: 36px;
+  transform: rotate(-90deg);
+  fill: none;
+  will-change: transform;
+}
+.ring-halo {
+  fill: currentColor;
+  fill-opacity: 0.08;
+  transition: fill 200ms ease;
+}
+.ring-track {
+  stroke: rgba(255, 255, 255, 0.11);
+  stroke-width: 3.2;
+}
+.ring-arc {
+  stroke: currentColor;
+  stroke-width: 3.2;
+  stroke-linecap: round;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 0;
+  transition: stroke-dashoffset 280ms var(--ease-out), stroke 200ms ease;
+}
+.ring-gauge.auditing .ring-svg {
+  animation: ringSpin 950ms linear infinite;
+}
+.ring-gauge.auditing .ring-arc {
+  stroke-dashoffset: 32;
+}
+.ring-gauge.blocked .ring-arc {
+  stroke-dashoffset: 64;
+}
+
+@keyframes ringSpin {
+  from { transform: rotate(-90deg); }
+  to { transform: rotate(270deg); }
+}
+
+.ring-glyph {
+  position: relative;
+  z-index: 1;
   display: grid;
   place-items: center;
-  color: var(--sys-green);
 }
-.ring-inner.sm { width: 30px; height: 30px; }
-.ring-gauge.auditing .ring-inner { color: var(--sys-amber); }
-.ring-gauge.blocked .ring-inner { color: var(--sys-red); }
+.ring-glyph-svg .glyph-wait,
+.ring-glyph-svg .glyph-check,
+.ring-glyph-svg .glyph-block {
+  opacity: 0;
+  transform-origin: 12px 12px;
+  transform: scale(0.88);
+  transition: opacity 150ms ease, transform 180ms var(--ease-out);
+}
+.glyph-check {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  transition:
+    stroke-dashoffset 220ms 35ms var(--ease-out),
+    opacity 140ms ease,
+    transform 180ms var(--ease-out);
+}
+.ring-gauge:not(.auditing):not(.blocked) .glyph-check {
+  opacity: 1;
+  transform: scale(1);
+  stroke-dashoffset: 0;
+}
+.ring-gauge.auditing .glyph-wait {
+  opacity: 1;
+  transform: scale(1);
+  animation: waitPulse 1.2s ease-in-out infinite;
+}
+@keyframes waitPulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+.ring-gauge.blocked .glyph-block {
+  opacity: 1;
+  transform: scale(1);
+}
+
+#btnRecheck.is-spinning svg {
+  animation: recheckSpin 620ms var(--ease-out);
+}
+@keyframes recheckSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 .pod-text {
   flex: 1;
@@ -399,10 +555,10 @@ input:focus-visible {
 .pod-text h1,
 .pod-text h2 {
   margin: 0;
-  font-size: 14.5px;
+  font-size: 14px;
   font-weight: 600;
-  letter-spacing: -0.015em;
-  line-height: 1.24;
+  letter-spacing: 0.01em;
+  line-height: 1.22;
   color: var(--label-1);
   white-space: nowrap;
   overflow: hidden;
@@ -410,7 +566,7 @@ input:focus-visible {
 }
 .pod-text p {
   margin: 2px 0 0;
-  font-size: 11.5px;
+  font-size: 11px;
   line-height: 1.24;
   color: var(--label-2);
   white-space: nowrap;
@@ -426,95 +582,93 @@ input:focus-visible {
   flex-shrink: 0;
 }
 
-/* Secondary Capsule Button (CLI) */
+/* Concentric 36px Right Controls (radius 18 + 14px pad = 32px exact match with left ring!) */
 .capsule-secondary {
-  height: 34px;
+  height: 36px;
   padding: 0 13px;
   border: none;
   border-radius: 999px;
   background: var(--fill-tertiary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   color: var(--label-1);
   font-family: inherit;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.01em;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-out), transform 140ms var(--ease-spring), opacity 150ms var(--ease-out);
 }
-.capsule-secondary:hover:not(:disabled) { background: var(--fill-primary); }
-.capsule-secondary:active:not(:disabled) { transform: scale(0.95); }
-.capsule-secondary:disabled { opacity: 0.32; cursor: not-allowed; }
+.capsule-secondary:disabled { opacity: 0.34; cursor: not-allowed; }
 
-/* Contextual Primary Action Capsule (Apple System Green / Amber / Red / Muted) */
 .capsule-primary {
-  height: 34px;
+  height: 36px;
   padding: 0 16px;
   border: none;
   border-radius: 999px;
   font-family: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 160ms var(--ease-out), color 160ms var(--ease-out), transform 140ms var(--ease-spring), filter 150ms var(--ease-out);
 }
 .capsule-primary[data-tone="green"] {
   background: var(--sys-green);
   color: #031507;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 1px 3px rgba(0, 0, 0, 0.35);
 }
 .capsule-primary[data-tone="amber"] {
   background: var(--sys-amber);
   color: #1c1400;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.34),
+    0 1px 3px rgba(0, 0, 0, 0.35);
 }
 .capsule-primary[data-tone="red"] {
-  background: rgba(255, 66, 69, 0.18);
+  background: rgba(255, 69, 58, 0.18);
   color: var(--sys-red);
 }
 .capsule-primary[data-tone="muted"] {
   background: var(--fill-tertiary);
   color: var(--label-2);
 }
-.capsule-primary:hover:not(:disabled) { filter: brightness(1.07); }
-.capsule-primary:active:not(:disabled) { transform: scale(0.95); }
 .capsule-primary:disabled { cursor: not-allowed; }
 
-/* Concentric Circular Icon Button */
 .circle-icon {
-  width: 34px;
-  height: 34px;
+  position: relative;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   border: none;
   background: var(--fill-tertiary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
   color: var(--label-2);
   display: grid;
   place-items: center;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out), transform 140ms var(--ease-spring);
 }
 .circle-icon.sm {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
 }
-.circle-icon:hover:not(:disabled) {
-  background: var(--fill-primary);
-  color: var(--label-1);
+/* Invisible hit-slop expansion for comfortable Fitts targeting */
+.circle-icon.sm::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
 }
-.circle-icon:active:not(:disabled) { transform: scale(0.93); }
 .circle-icon:disabled { opacity: 0.34; cursor: not-allowed; }
 
 /* Apple HIG Rule: White solid fill is strictly reserved for Toggled Active states! */
 .circle-icon.toggled {
   background: #f5f5f7;
   color: #07080b;
-}
-.circle-icon.toggled:hover:not(:disabled) {
-  background: #ffffff;
-  color: #07080b;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
 
 .expand-btn .chev {
-  transition: transform 220ms var(--ease-spring);
+  transition: transform 200ms var(--ease-drawer);
 }
 :root[data-expanded="true"] .expand-btn {
   background: var(--fill-secondary);
@@ -531,6 +685,8 @@ input:focus-visible {
   gap: 10px;
   padding-top: 10px;
   border-top: 0.5px solid var(--sep-line);
+  transform-origin: 50% 0%;
+  will-change: transform, opacity;
 }
 .expanded-sheet[hidden],
 .tab-panel[hidden] {
@@ -544,35 +700,36 @@ input:focus-visible {
   gap: 10px;
 }
 
-/* Equal-Width Sliding Apple Segmented Control */
+/* Level -1 Recessed Well Segmented Control with Direct GPU Glider */
 .seg-track {
   position: relative;
   display: grid;
-  grid-template-columns: repeat(3, 72px);
+  grid-template-columns: repeat(3, 74px);
   padding: 2px;
   border-radius: 999px;
-  background: rgba(118, 118, 128, 0.22);
-  box-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
 }
 .seg-glider {
   position: absolute;
   top: 2px;
   bottom: 2px;
   left: 2px;
-  width: 72px;
+  width: 74px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.17);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.14) 100%);
   box-shadow:
-    inset 0 0.5px 0 rgba(255, 255, 255, 0.24),
-    0 1px 3px rgba(0, 0, 0, 0.36);
-  transform: translate3d(calc(var(--seg-idx, 0) * 100%), 0, 0);
-  transition: transform 220ms var(--ease-spring);
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    0 1px 3px rgba(0, 0, 0, 0.45);
+  transform: translate3d(0%, 0, 0);
+  transition: transform 200ms var(--ease-drawer);
   pointer-events: none;
+  will-change: transform;
 }
 .seg-tab {
   position: relative;
   z-index: 1;
-  height: 26px;
+  height: 28px;
   border: none;
   border-radius: 999px;
   background: transparent;
@@ -581,9 +738,7 @@ input:focus-visible {
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  transition: color 160ms var(--ease-out);
 }
-.seg-tab:hover:not(.active) { color: var(--label-1); }
 .seg-tab.active {
   color: var(--label-1);
   font-weight: 600;
@@ -592,31 +747,54 @@ input:focus-visible {
 .sheet-quick-icons {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
+.tab-stage {
+  position: relative;
+}
 .tab-panel {
   display: flex;
   flex-direction: column;
   gap: 9px;
+  transform-origin: 50% 0%;
+  will-change: transform, opacity;
+}
+.tab-panel.is-exiting {
+  position: absolute;
+  inset: 0 0 auto 0;
+  width: 100%;
+  pointer-events: none;
 }
 
-/* ================= VIEW 1: 2×2 CONTROL CENTER PLATTER TILES ================= */
+/* ================= VIEW 1: 2×2 INTERACTIVE CONTROL CENTER TILES ================= */
 .cc-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
 .cc-tile {
   border-radius: var(--r-platter);
-  padding: 9px 11px;
-  background: var(--platter-bg);
-  box-shadow: inset 0 0.5px 0 var(--platter-rim);
+  padding: 10px 12px;
+  border: none;
+  background: var(--tile-elevated-bg);
+  box-shadow: var(--tile-elevated-shadow);
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
+  cursor: pointer;
+}
+.cc-tile.is-filtering {
+  background: linear-gradient(180deg, rgba(10, 132, 255, 0.20) 0%, rgba(10, 132, 255, 0.11) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 0 0 1px rgba(10, 132, 255, 0.48),
+    0 2px 6px rgba(0, 0, 0, 0.36);
 }
 
 .cc-icon {
@@ -628,18 +806,18 @@ input:focus-visible {
   flex-shrink: 0;
   background: rgba(120, 120, 128, 0.24);
   color: var(--label-2);
-  transition: background-color 180ms var(--ease-out), color 180ms var(--ease-out);
+  transition: background-color 180ms ease, color 180ms ease;
 }
 .cc-icon[data-tone="ok"] {
   background: rgba(48, 209, 88, 0.16);
   color: var(--sys-green);
 }
 .cc-icon[data-tone="warn"] {
-  background: rgba(255, 214, 0, 0.16);
+  background: rgba(255, 214, 10, 0.16);
   color: var(--sys-amber);
 }
 .cc-icon[data-tone="fail"] {
-  background: rgba(255, 66, 69, 0.18);
+  background: rgba(255, 69, 58, 0.18);
   color: var(--sys-red);
 }
 
@@ -664,45 +842,141 @@ input:focus-visible {
   text-overflow: ellipsis;
 }
 
-/* ================= INSET GROUPED PLATTER & 7×2 SYMMETRIC CHECK MATRIX ================= */
-.inset-platter {
+/* ================= ANOMALY CALLOUT CARDS (TOP-PRIORITY EXPLAINABLE ALERTS) ================= */
+.anomaly-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.anomaly-stack[hidden] { display: none !important; }
+
+.anomaly-card {
   border-radius: var(--r-platter);
-  background: var(--platter-bg);
-  box-shadow: inset 0 0.5px 0 var(--platter-rim);
+  padding: 8px 11px 8px 13px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--platter-grouped-bg);
+  box-shadow: var(--platter-grouped-shadow);
   overflow: hidden;
 }
-.inset-platter.pad-sm {
-  padding: 7px 9px;
+.anomaly-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--sys-amber);
+}
+.anomaly-card.is-fail {
+  background: rgba(255, 69, 58, 0.075);
+  box-shadow: inset 0 0 0 1px rgba(255, 69, 58, 0.24);
+}
+.anomaly-card.is-fail::before {
+  background: var(--sys-red);
+}
+.anomaly-body {
+  flex: 1;
+  min-width: 0;
+}
+.anomaly-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--sys-amber-text);
+}
+.anomaly-card.is-fail .anomaly-head {
+  color: var(--sys-red);
+}
+.anomaly-hint {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.38;
+  color: var(--label-2);
 }
 
-/* 2 Columns × 7 Rows = 14 Checks, Zero Orphan Cells */
-.check-matrix {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+/* ================= LEVEL +1 INSET PLATTER & COLLAPSIBLE 7×2 CHECK MATRIX ================= */
+.inset-platter {
+  border-radius: var(--r-platter);
+  background: var(--platter-grouped-bg);
+  box-shadow: var(--platter-grouped-shadow);
+  overflow: hidden;
+}
+.inset-platter.allow-overflow {
+  overflow: visible;
 }
 
-.check-row {
-  height: 28px;
+.matrix-fold-bar {
+  width: 100%;
+  height: 34px;
   padding: 0 12px;
+  border: none;
+  background: transparent;
+  color: var(--label-1);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  border-bottom: 0.5px solid rgba(255, 255, 255, 0.055);
-  transition: background-color 120ms var(--ease-out);
+  cursor: pointer;
 }
-.check-row:hover {
-  background: rgba(255, 255, 255, 0.035);
+.fold-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
-/* Vertical center divider between odd & even columns */
-.check-row:nth-child(odd) {
-  border-right: 0.5px solid rgba(255, 255, 255, 0.055);
+.fold-summary {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--label-2);
 }
-/* Last two rows (13 & 14) have no bottom divider */
-.check-row:nth-last-child(-n+2) {
-  border-bottom: none;
+.fold-chev {
+  color: var(--label-3);
+  transition: transform 180ms var(--ease-drawer);
+}
+.matrix-fold-bar[aria-expanded="true"] {
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.065);
+}
+.matrix-fold-bar[aria-expanded="true"] .fold-chev {
+  transform: rotate(180deg);
 }
 
+.check-matrix {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.check-matrix[hidden] { display: none !important; }
+
+.check-row {
+  height: 30px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.055);
+  border-right: 0.5px solid rgba(255, 255, 255, 0.055);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+}
+.check-row.col-even {
+  border-right: none;
+}
+.check-row.is-selected {
+  background: rgba(255, 255, 255, 0.065);
+}
 .check-row .cname {
   font-size: 12px;
   color: var(--label-1);
@@ -722,24 +996,56 @@ input:focus-visible {
 }
 .check-row .cval {
   font-size: 11px;
+  font-weight: 400;
   color: var(--label-2);
 }
-.check-row.is-fail .cval { color: var(--sys-red); font-weight: 500; }
-.check-row.is-warn .cval { color: var(--sys-amber); }
+.check-row.is-fail .cval { color: var(--sys-red); font-weight: 600; }
+.check-row.is-warn .cval { color: var(--sys-amber-text); font-weight: 500; }
 .check-row.is-skip .cval { color: var(--label-3); }
 
+/* Full-width inline detail drawer directly beneath the clicked check row */
+.check-inline-detail {
+  grid-column: 1 / -1;
+  padding: 8px 12px 9px;
+  background: rgba(0, 0, 0, 0.34);
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.065);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.check-inline-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.44;
+  color: var(--label-2);
+  user-select: text;
+}
+
+/* Even 6×6 Status Dots + Hollow Ring for Skipped (Color-Independent A11y) */
 .sdot {
-  width: 6.5px;
-  height: 6.5px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--sys-green);
+  box-shadow: 0 0 6px rgba(48, 209, 88, 0.42);
   flex-shrink: 0;
 }
-.sdot.warn { background: var(--sys-amber); }
-.sdot.fail { background: var(--sys-red); }
-.sdot.skip { background: var(--label-4); }
+.sdot.warn {
+  background: var(--sys-amber);
+  box-shadow: 0 0 6px rgba(255, 214, 10, 0.38);
+}
+.sdot.fail {
+  background: var(--sys-red);
+  box-shadow: 0 0 6px rgba(255, 69, 58, 0.45);
+}
+.sdot.skip {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.4px rgba(235, 235, 245, 0.48);
+}
 
-/* ================= PLATTER FOOTER (FIX vs SEPARATED DESTRUCTIVE ROLE) ================= */
+/* ================= PLATTER FOOTER & DUAL-LAYER 5s DESTRUCTIVE RITUAL ================= */
 .sheet-foot {
   display: flex;
   align-items: center;
@@ -758,8 +1064,8 @@ input:focus-visible {
   padding: 0 12px;
   border-radius: 999px;
   border: none;
-  background: rgba(255, 214, 0, 0.16);
-  color: var(--sys-amber);
+  background: rgba(255, 214, 10, 0.16);
+  color: var(--sys-amber-text);
   font-family: inherit;
   font-size: 11.5px;
   font-weight: 600;
@@ -767,12 +1073,7 @@ input:focus-visible {
   align-items: center;
   gap: 5px;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-out), transform 140ms var(--ease-spring), opacity 150ms var(--ease-out);
 }
-.pill-action-amber:hover:not(:disabled) {
-  background: rgba(255, 214, 0, 0.25);
-}
-.pill-action-amber:active:not(:disabled) { transform: scale(0.95); }
 .pill-action-amber:disabled {
   background: rgba(118, 118, 128, 0.14);
   color: var(--label-3);
@@ -785,48 +1086,70 @@ input:focus-visible {
   color: var(--label-3);
 }
 
-/* Apple HIG Destructive Role: Tinted System Red, turns Solid Red when Armed */
 .pill-destructive {
+  position: relative;
   height: 28px;
-  padding: 0 13px;
+  padding: 0;
   border-radius: 999px;
   border: none;
-  background: rgba(255, 66, 69, 0.14);
+  background: rgba(255, 69, 58, 0.14);
   color: var(--sys-red);
   font-family: inherit;
   font-size: 11.5px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out), transform 140ms var(--ease-spring), opacity 150ms var(--ease-out);
 }
-.pill-destructive:hover:not(:disabled) {
-  background: rgba(255, 66, 69, 0.24);
-}
-.pill-destructive:active:not(:disabled) { transform: scale(0.95); }
 .pill-destructive:disabled { opacity: 0.36; cursor: not-allowed; }
-.pill-destructive.armed {
+.pill-destructive .dest-layer {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 13px;
+  white-space: nowrap;
+}
+.pill-destructive .dest-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
   background: var(--sys-red);
   color: #ffffff;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  clip-path: inset(0 100% 0 0);
+  pointer-events: none;
+  will-change: clip-path;
+}
+.pill-destructive.armed {
+  box-shadow: inset 0 0 0 1px rgba(255, 69, 58, 0.45);
 }
 
-/* ================= VIEW 2: ISOLATED SAFE BROWSER & 3×2 TOOLS ================= */
-.url-row {
+/* ================= VIEW 2: UNIFIED URL WELL & 3×2 ELEVATED TOOLS ================= */
+.url-well {
+  height: 38px;
+  padding: 5px 5px 5px 11px;
+  border-radius: var(--r-platter);
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
+  transition: box-shadow 160ms ease;
+}
+.url-well:focus-within {
+  box-shadow: var(--well-shadow), 0 0 0 2px rgba(10, 132, 255, 0.42);
 }
 .muted-ico {
   color: var(--label-3);
-  margin-left: 3px;
 }
 .platter-input {
   flex: 1;
   min-width: 0;
   height: 28px;
-  padding: 0 9px;
-  border-radius: var(--r-nested);
+  padding: 0 4px;
   border: none;
-  background: rgba(0, 0, 0, 0.28);
+  background: transparent;
   color: var(--label-1);
   font-family: inherit;
   font-size: 12px;
@@ -834,37 +1157,67 @@ input:focus-visible {
   cursor: text;
 }
 .platter-input::placeholder { color: var(--label-3); }
+.platter-input.ok-flash::placeholder { color: var(--sys-green); }
+
+.well-aux-btn {
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--label-2);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.well-aux-btn[hidden],
+.well-clear-btn[hidden] {
+  display: none !important;
+}
+
+.well-clear-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--label-2);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
 
 .pill-blue {
   height: 28px;
-  padding: 0 14px;
-  border-radius: 999px;
+  padding: 0 13px;
+  border-radius: var(--r-nested);
   border: none;
-  background: var(--sys-blue);
+  background: var(--btn-blue-bg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26);
   color: #ffffff;
   font-family: inherit;
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
-  transition: filter 150ms var(--ease-out), transform 140ms var(--ease-spring), opacity 150ms var(--ease-out);
 }
-.pill-blue:hover:not(:disabled) { filter: brightness(1.1); }
-.pill-blue:active:not(:disabled) { transform: scale(0.95); }
 .pill-blue:disabled { opacity: 0.38; cursor: not-allowed; }
 
 .tool-bento {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 .tool-tile {
   height: 40px;
   padding: 0 12px;
-  border-radius: var(--r-platter);
+  border-radius: var(--r-tile-sm);
   border: none;
-  background: var(--platter-bg);
-  box-shadow: inset 0 0.5px 0 var(--platter-rim);
+  background: var(--tile-elevated-bg);
+  box-shadow: var(--tile-elevated-shadow);
   color: var(--label-2);
   font-family: inherit;
   font-size: 12px;
@@ -873,36 +1226,57 @@ input:focus-visible {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out), transform 140ms var(--ease-spring);
 }
 .tool-tile svg.ico { color: var(--sys-blue); }
-.tool-tile:hover {
-  background: var(--platter-hover);
-  color: var(--label-1);
-}
-.tool-tile:active { transform: scale(0.97); }
 .tool-tile.active {
-  background: rgba(0, 145, 255, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(0, 145, 255, 0.38);
+  background: linear-gradient(180deg, rgba(10, 132, 255, 0.22) 0%, rgba(10, 132, 255, 0.12) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.22),
+    inset 0 0 0 1px rgba(10, 132, 255, 0.45);
   color: var(--label-1);
 }
 
 .console-platter {
   border-radius: var(--r-platter);
-  background: rgba(0, 0, 0, 0.48);
-  box-shadow: inset 0 0 0 0.5px var(--platter-rim);
-  padding: 10px 12px;
-  max-height: 132px;
-  overflow: auto;
-  user-select: text;
-  cursor: auto;
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
+  overflow: hidden;
 }
 .console-platter[hidden],
 #inlineBrowserBox[hidden] {
   display: none !important;
 }
+
+.drawer-toolbar {
+  height: 30px;
+  padding: 0 10px 0 12px;
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.07);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.drawer-toolbar.platter-head {
+  background: rgba(255, 255, 255, 0.02);
+}
+.drawer-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--label-2);
+}
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .console-platter pre {
   margin: 0;
+  padding: 9px 12px 10px;
+  max-height: 118px;
+  overflow: auto;
+  user-select: text;
+  cursor: auto;
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.52;
@@ -910,13 +1284,19 @@ input:focus-visible {
   white-space: pre-wrap;
   word-break: break-word;
 }
+.console-platter pre::-webkit-scrollbar { width: 6px; height: 6px; }
+.console-platter pre::-webkit-scrollbar-track { background: transparent; margin: 4px 0; }
+.console-platter pre::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+}
 
 .bcheck-matrix {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .matrix-row {
-  height: 29px;
+  height: 30px;
   padding: 0 12px;
   display: flex;
   align-items: center;
@@ -934,19 +1314,25 @@ input:focus-visible {
   font-size: 12px;
   color: var(--label-2);
 }
+.matrix-row .mright {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
 .matrix-row .mval {
   font-size: 11px;
   font-weight: 500;
   color: var(--label-1);
-  max-width: 116px;
+  max-width: 108px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* ================= VIEW 3: APPLE INSET SETTINGS & IOS CAPSULE SWITCHES ================= */
+/* ================= VIEW 3: CUSTOM APPLE POP-UP MENU & INSTANT AUTO-SAVE SWITCHES ================= */
 .setting-row {
-  min-height: 36px;
+  min-height: 38px;
   padding: 4px 12px;
   display: flex;
   align-items: center;
@@ -966,36 +1352,93 @@ input:focus-visible {
   gap: 6px;
 }
 
-.platter-select {
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 8px;
-  border: 0.5px solid rgba(255, 255, 255, 0.12);
-  background: rgba(118, 118, 128, 0.22);
+/* Custom Dark Vibrancy Pop-up Menu (replaces jarring Win32 white/square native <select> popup) */
+.apple-popup {
+  position: relative;
+}
+.apple-popup-btn {
+  height: 28px;
+  padding: 0 9px 0 11px;
+  border-radius: var(--r-nested);
+  border: none;
+  background: var(--tile-elevated-bg);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.10);
   color: var(--label-1);
   font-family: inherit;
   font-size: 12px;
-  outline: none;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   cursor: pointer;
 }
-.platter-select option {
-  background: #15161c;
+.apple-popup-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.popup-chev { color: var(--label-2); }
+
+.apple-popup-menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(20, 22, 29, 0.96);
+  backdrop-filter: blur(22px) saturate(180%);
+  box-shadow:
+    0 10px 26px rgba(0, 0, 0, 0.68),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.90),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.apple-popup-menu[hidden] { display: none !important; }
+.apple-popup-item {
+  width: 100%;
+  height: 26px;
+  padding: 0 10px 0 24px;
+  position: relative;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
   color: var(--label-1);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.apple-popup-item:focus-visible {
+  background: var(--btn-blue-bg);
+  color: #ffffff;
+  outline: none;
+}
+.apple-popup-item[aria-selected="true"]::before {
+  content: "✓";
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .port-inline {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
 }
 .port-inline[hidden] { display: none !important; }
 .port-input {
-  width: 82px;
-  height: 26px;
+  width: 84px;
+  height: 28px;
   padding: 0 8px;
-  border-radius: 8px;
-  border: 0.5px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.3);
+  border-radius: var(--r-nested);
+  border: none;
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
   color: var(--label-1);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1008,29 +1451,27 @@ input:focus-visible {
   border-radius: 999px;
   border: none;
   background: var(--fill-tertiary);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
   color: var(--label-2);
   font-family: inherit;
   font-size: 11.5px;
   font-weight: 500;
+  white-space: nowrap;
   cursor: pointer;
-  transition: background-color 140ms var(--ease-out), color 140ms var(--ease-out), transform 140ms var(--ease-spring);
 }
-.mini-pill:hover:not(:disabled) {
-  background: var(--fill-primary);
-  color: var(--label-1);
-}
-.mini-pill:active:not(:disabled) { transform: scale(0.95); }
+.mini-pill:disabled { opacity: 0.36; cursor: not-allowed; }
 
 .seg-mini {
   display: inline-flex;
   padding: 2px;
   border-radius: 999px;
-  background: rgba(118, 118, 128, 0.22);
+  background: var(--well-bg);
+  box-shadow: var(--well-shadow);
   gap: 2px;
 }
 .seg-mini-btn {
-  height: 22px;
-  padding: 0 10px;
+  height: 24px;
+  padding: 0 11px;
   border: none;
   border-radius: 999px;
   background: transparent;
@@ -1039,23 +1480,43 @@ input:focus-visible {
   font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: background-color 150ms var(--ease-out), color 150ms var(--ease-out);
 }
-.seg-mini-btn:hover:not(.on) { color: var(--label-1); }
-/* HIG Toggled Active state uses crisp white thumb */
+/* Unified Elevated Smoky Glider Material (does not compete with primary CTAs) */
 .seg-mini-btn.on {
-  background: #f5f5f7;
-  color: #07080b;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.14) 100%);
+  color: var(--label-1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    0 1px 3px rgba(0, 0, 0, 0.45);
   font-weight: 600;
 }
 
-/* 8 Optional Checks in 2×4 Symmetric Matrix with Native iOS Capsule Switches */
-.switch-matrix {
+.section-caption {
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--label-3);
+}
+.sync-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--sys-green);
+}
+.sync-badge.saving { color: var(--sys-amber-text); }
+.sync-badge.err { color: var(--sys-red); }
+.sync-badge[hidden] { display: none !important; }
+
+/* 8 Optional Checks + 2 Policy Switches with Native iOS Capsule Switches */
+.switch-matrix,
+.policy-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 .switch-cell {
-  height: 32px;
+  height: 34px;
   padding: 0 12px;
   border: none;
   border-bottom: 0.5px solid rgba(255, 255, 255, 0.055);
@@ -1066,8 +1527,8 @@ input:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   cursor: pointer;
-  transition: background-color 120ms var(--ease-out), color 140ms var(--ease-out);
 }
 .switch-cell:nth-child(odd) {
   border-right: 0.5px solid rgba(255, 255, 255, 0.055);
@@ -1075,23 +1536,20 @@ input:focus-visible {
 .switch-cell:nth-last-child(-n+2) {
   border-bottom: none;
 }
-.switch-cell:hover {
-  background: rgba(255, 255, 255, 0.035);
-}
 .switch-cell.on {
   color: var(--label-1);
 }
 
-/* Genuine Apple iOS Sliding Capsule Switch (34×20px) */
 .ios-switch {
   position: relative;
   width: 34px;
   height: 20px;
   border-radius: 999px;
   background: rgba(120, 120, 128, 0.36);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.35);
   display: inline-block;
   flex-shrink: 0;
-  transition: background-color 180ms var(--ease-spring);
+  transition: background-color 180ms var(--ease-drawer), transform 150ms var(--ease-out);
 }
 .ios-thumb {
   position: absolute;
@@ -1101,9 +1559,9 @@ input:focus-visible {
   height: 16px;
   border-radius: 50%;
   background: #ffffff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.48);
   transform: translate3d(0, 0, 0);
-  transition: transform 180ms var(--ease-spring);
+  transition: transform 180ms var(--ease-drawer);
 }
 .on .ios-switch {
   background: var(--sys-green);
@@ -1113,45 +1571,130 @@ input:focus-visible {
 }
 
 .set-foot-bar {
+  padding: 0 2px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
-.policy-switches {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+.set-foot-hint {
+  font-size: 11px;
+  color: var(--label-3);
 }
-.inline-switch-row {
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--label-2);
-  font-family: inherit;
-  font-size: 11.5px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
+
+/* ================= SIZE-INVERSE PRESS FEEDBACK & FINE-POINTER HOVER GATE ================= */
+.capsule-primary,
+.capsule-secondary,
+.pill-action-amber,
+.pill-destructive,
+.pill-blue,
+.mini-pill,
+.well-aux-btn,
+.well-clear-btn,
+.circle-icon,
+.cc-tile,
+.tool-tile,
+.seg-tab,
+.seg-mini-btn,
+.switch-cell,
+.apple-popup-btn,
+.matrix-fold-bar,
+.check-row {
+  transition:
+    background-color 150ms ease,
+    background 150ms ease,
+    color 150ms ease,
+    opacity 150ms ease,
+    transform 150ms var(--ease-out);
 }
-.inline-switch-row.on { color: var(--label-1); }
-.set-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+
+/* L1: Wide tiles & rows (0.985) */
+.cc-tile:active:not(:disabled),
+.tool-tile:active:not(:disabled),
+.switch-cell:active:not(:disabled),
+.check-row:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+/* L2: Standard capsules & segmented buttons (0.965) */
+.capsule-primary:active:not(:disabled),
+.capsule-secondary:active:not(:disabled),
+.pill-action-amber:active:not(:disabled),
+.pill-destructive:active:not(:disabled),
+.pill-blue:active:not(:disabled),
+.mini-pill:active:not(:disabled),
+.well-aux-btn:active:not(:disabled),
+.apple-popup-btn:active:not(:disabled),
+.seg-tab:active:not(.active),
+.seg-mini-btn:active:not(.on) {
+  transform: scale(0.965);
+}
+
+/* L3: Compact circular buttons & orb (0.95) */
+.circle-icon:active:not(:disabled),
+.well-clear-btn:active:not(:disabled),
+.shield-orb:active,
+.switch-cell:active .ios-switch {
+  transform: scale(0.95);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .shield-orb:hover {
+    box-shadow:
+      0 1.5px 3px rgba(0, 0, 0, 0.55),
+      inset 0 0 0 1px rgba(0, 0, 0, 0.94),
+      inset 0 1.5px 1.2px rgba(255, 255, 255, 0.45),
+      inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.16);
+  }
+  .shield-orb:hover .orb-glow {
+    opacity: 0.25;
+    transform: scale(1.10);
+  }
+  .capsule-secondary:hover:not(:disabled),
+  .circle-icon:hover:not(:disabled),
+  .mini-pill:hover:not(:disabled),
+  .well-aux-btn:hover:not(:disabled),
+  .well-clear-btn:hover:not(:disabled) {
+    background: var(--fill-primary);
+    color: var(--label-1);
+  }
+  .circle-icon.toggled:hover:not(:disabled) {
+    background: #ffffff;
+    color: #07080b;
+  }
+  .capsule-primary[data-tone="green"]:hover:not(:disabled) { background: var(--sys-green-hover); }
+  .capsule-primary[data-tone="amber"]:hover:not(:disabled) { background: var(--sys-amber-hover); }
+  .capsule-primary[data-tone="red"]:hover:not(:disabled) { background: rgba(255, 69, 58, 0.26); }
+  .pill-blue:hover:not(:disabled) { background: var(--btn-blue-hover); }
+  .pill-action-amber:hover:not(:disabled) { background: rgba(255, 214, 10, 0.25); }
+  .pill-destructive:not(.armed):hover:not(:disabled) { background: rgba(255, 69, 58, 0.24); }
+  .cc-tile:not(.is-filtering):hover,
+  .tool-tile:not(.active):hover,
+  .apple-popup-btn:hover:not(:disabled) {
+    background: var(--tile-elevated-hover);
+    color: var(--label-1);
+  }
+  .apple-popup-item:hover {
+    background: var(--btn-blue-bg);
+    color: #ffffff;
+  }
+  .seg-tab:hover:not(.active),
+  .seg-mini-btn:hover:not(.on) { color: var(--label-1); }
+  .matrix-fold-bar:hover,
+  .check-row:hover,
+  .switch-cell:hover { background: rgba(255, 255, 255, 0.038); }
 }
 
 /* ================= STANDALONE WEB / MOBILE PWA ================= */
 .web-pod {
   width: 430px;
   max-width: 100%;
-  border-radius: var(--r-outer);
+  border-radius: var(--r-expanded);
   padding: 16px var(--pad-outer);
-  background: var(--island-bg);
+  background: linear-gradient(180deg, var(--island-bg-top) 0%, var(--island-bg-bot) 100%);
   box-shadow:
-    inset 0 1px 0 var(--rim-top),
-    inset 0 0 0 1px var(--rim-border);
+    inset 0 1px 0 var(--inner-rim-top),
+    inset 0 0 0 1px var(--inner-rim-side);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1192,9 +1735,30 @@ input:focus-visible {
   text-align: center;
 }
 
+/* ================= ACCESSIBLE REDUCED MOTION (KEEP COMPREHENSION FADES, DROP MOTION) ================= */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
+  .ring-gauge.auditing .ring-svg,
+  #btnRecheck.is-spinning svg {
+    animation: none !important;
+  }
+  .seg-glider,
+  .ios-thumb,
+  .expand-btn .chev,
+  .fold-chev,
+  .shield-orb .orb-glow {
+    transition-duration: 0ms !important;
+  }
+  .capsule-primary:active,
+  .capsule-secondary:active,
+  .pill-action-amber:active,
+  .pill-destructive:active,
+  .pill-blue:active,
+  .mini-pill:active,
+  .circle-icon:active,
+  .cc-tile:active,
+  .tool-tile:active,
+  .switch-cell:active,
+  .check-row:active {
+    transform: none !important;
   }
 }
