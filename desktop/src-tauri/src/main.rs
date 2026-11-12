@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -96,13 +97,130 @@ struct DockStatePayload {
     standby_mode: StandbyMode,
     tucked: bool,
     orb: bool,
+    play: bool,
     seam: bool,
     idle: bool,
     pinned: bool,
     preview: DockEdge,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImpactEvent {
+    axis: &'static str,
+    normal_speed: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OrbFxPayload {
+    angle: f64,
+    impact_axis: Option<&'static str>,
+    impact_speed: f64,
+    combo: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VelocityTracker {
+    samples: VecDeque<(f64, f64, f64)>,
+}
+
+impl VelocityTracker {
+    fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    fn push(&mut self, t: f64, x: f64, y: f64) {
+        while let Some(&(old_t, _, _)) = self.samples.front() {
+            if t - old_t > 0.085 || self.samples.len() >= 10 {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.samples.push_back((t, x, y));
+    }
+
+    fn velocity(&self, max_speed: f64) -> (f64, f64) {
+        let Some(&(t_last, x_last, y_last)) = self.samples.back() else {
+            return (0.0, 0.0);
+        };
+        let mut anchor = None;
+        for &(t, x, y) in self.samples.iter() {
+            let dt = t_last - t;
+            if dt >= 0.006 {
+                anchor = Some((t, x, y));
+                if dt <= 0.065 {
+                    break;
+                }
+            }
+        }
+        let Some((t0, x0, y0)) = anchor else {
+            return (0.0, 0.0);
+        };
+        let dt = (t_last - t0).max(0.006);
+        let mut vx = (x_last - x0) / dt;
+        let mut vy = (y_last - y0) / dt;
+        let speed = vx.hypot(vy);
+        if speed > max_speed && speed > 0.0 {
+            let k = max_speed / speed;
+            vx *= k;
+            vy *= k;
+        }
+        (vx, vy)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OrbPhysicsBounds {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+impl OrbPhysicsBounds {
+    fn from_work_area(area: WorkRect, orb_size: i32, inset: i32) -> Self {
+        let min_x = (area.x - inset) as f64;
+        let max_x = (area.right() - orb_size + inset) as f64;
+        let min_y = (area.y - inset) as f64;
+        let max_y = (area.bottom() - orb_size + inset) as f64;
+        Self {
+            min_x,
+            max_x: max_x.max(min_x),
+            min_y,
+            max_y: max_y.max(min_y),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OrbPhysics {
+    px: f64,
+    py: f64,
+    vx: f64,
+    vy: f64,
+    omega: f64,
+    angle_deg: f64,
+    sleeping: bool,
+    combo: u32,
+}
+
+impl Default for OrbPhysics {
+    fn default() -> Self {
+        Self {
+            px: 0.0,
+            py: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            omega: 0.0,
+            angle_deg: 0.0,
+            sleeping: true,
+            combo: 0,
+        }
+    }
+}
+
 struct DockInner {
+    epoch: Instant,
     edge: DockEdge,
     standby_mode: StandbyMode,
     dock_x: i32,
@@ -114,6 +232,22 @@ struct DockInner {
     work_area: WorkRect,
     tucked: bool,
     orb_collapsed: bool,
+    play_mode: bool,
+    orb_coasting: bool,
+    custom_dragging: bool,
+    drag_offset: (i32, i32),
+    vel_tracker: VelocityTracker,
+    physics: OrbPhysics,
+    last_physics_tick: Instant,
+    last_kick_at: Instant,
+    last_cursor: Option<(Instant, f64, f64)>,
+    last_emitted_angle: f64,
+    orb_hover_armed: bool,
+    orb_hover_since: Option<Instant>,
+    orb_expand_suppress_until: Instant,
+    pre_play_orb_pos: Option<(i32, i32)>,
+    pre_play_standby: Option<StandbyMode>,
+    pending_orb_return: Option<(i32, i32)>,
     seam_mode: bool,
     idle: bool,
     pinned: bool,
@@ -134,6 +268,7 @@ impl DockInner {
     fn new() -> Self {
         let now = Instant::now();
         Self {
+            epoch: now,
             edge: DockEdge::Top,
             standby_mode: StandbyMode::Edge,
             dock_x: 0,
@@ -150,6 +285,22 @@ impl DockInner {
             },
             tucked: false,
             orb_collapsed: false,
+            play_mode: false,
+            orb_coasting: false,
+            custom_dragging: false,
+            drag_offset: (24, 24),
+            vel_tracker: VelocityTracker::default(),
+            physics: OrbPhysics::default(),
+            last_physics_tick: now,
+            last_kick_at: now,
+            last_cursor: None,
+            last_emitted_angle: 0.0,
+            orb_hover_armed: true,
+            orb_hover_since: None,
+            orb_expand_suppress_until: now,
+            pre_play_orb_pos: None,
+            pre_play_standby: None,
+            pending_orb_return: None,
             seam_mode: false,
             idle: false,
             pinned: false,
@@ -173,6 +324,7 @@ impl DockInner {
             standby_mode: self.standby_mode,
             tucked: self.tucked,
             orb: self.orb_collapsed,
+            play: self.play_mode,
             seam: self.seam_mode,
             idle: self.idle,
             pinned: self.pinned,
@@ -751,7 +903,198 @@ const PEEK_LOGICAL_PX: f64 = 9.0;
 const SNAP_THRESHOLD_LOGICAL_PX: f64 = 48.0;
 const POD_WIDTH_LOGICAL_PX: f64 = 480.0;
 const POD_BASE_HEIGHT_LOGICAL_PX: f64 = 64.0;
-const ORB_SIZE_LOGICAL_PX: f64 = 60.0;
+const ORB_SIZE_LOGICAL_PX: f64 = 72.0;
+const ORB_VISUAL_RADIUS_LOGICAL_PX: f64 = 28.0;
+const ORB_INSET_LOGICAL_PX: f64 = 8.0;
+const ORB_HOVER_EXPAND_MS: u64 = 260;
+
+fn closest_point_on_segment(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> (f64, f64) {
+    let abx = bx - ax;
+    let aby = by - ay;
+    let len_sq = abx * abx + aby * aby;
+    if len_sq <= 1e-9 {
+        return (ax, ay);
+    }
+    let t = (((px - ax) * abx + (py - ay) * aby) / len_sq).clamp(0.0, 1.0);
+    (ax + abx * t, ay + aby * t)
+}
+
+fn step_orb_gravity(
+    phys: &mut OrbPhysics,
+    dt: f64,
+    bounds: OrbPhysicsBounds,
+    scale: f64,
+) -> Option<ImpactEvent> {
+    if phys.sleeping {
+        return None;
+    }
+    let dt = dt.clamp(0.001, 0.032);
+    let scale = scale.max(0.5);
+    let gravity = 2250.0 * scale;
+    let max_speed = 4600.0 * scale;
+    let radius = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
+
+    phys.vy += gravity * dt;
+    phys.vx *= (1.0 - 0.16 * dt).max(0.0);
+    phys.vy *= (1.0 - 0.06 * dt).max(0.0);
+
+    let speed = phys.vx.hypot(phys.vy);
+    if speed > max_speed && speed > 0.0 {
+        let k = max_speed / speed;
+        phys.vx *= k;
+        phys.vy *= k;
+    }
+
+    phys.px += phys.vx * dt;
+    phys.py += phys.vy * dt;
+
+    let mut best_impact: Option<ImpactEvent> = None;
+    let mut consider_impact = |axis: &'static str, raw_speed_phys: f64| {
+        let norm_logical = raw_speed_phys / scale;
+        if norm_logical >= 95.0 {
+            if best_impact.map_or(true, |b| norm_logical > b.normal_speed) {
+                best_impact = Some(ImpactEvent {
+                    axis,
+                    normal_speed: norm_logical,
+                });
+            }
+        }
+    };
+
+    if phys.px < bounds.min_x {
+        phys.px = bounds.min_x;
+        let hit_v = phys.vx.abs();
+        if phys.vx < 0.0 {
+            phys.vx = -phys.vx * 0.78;
+        }
+        phys.omega = (phys.vy / radius) * 0.55;
+        consider_impact("x", hit_v);
+    } else if phys.px > bounds.max_x {
+        phys.px = bounds.max_x;
+        let hit_v = phys.vx.abs();
+        if phys.vx > 0.0 {
+            phys.vx = -phys.vx * 0.78;
+        }
+        phys.omega = -(phys.vy / radius) * 0.55;
+        consider_impact("x", hit_v);
+    }
+
+    if phys.py < bounds.min_y {
+        phys.py = bounds.min_y;
+        let hit_v = phys.vy.abs();
+        if phys.vy < 0.0 {
+            phys.vy = -phys.vy * 0.72;
+        }
+        consider_impact("y", hit_v);
+    }
+
+    if phys.py >= bounds.max_y {
+        phys.py = bounds.max_y;
+        let hit_v = phys.vy.abs();
+        phys.combo = 0;
+
+        if phys.vy > 105.0 * scale {
+            phys.vy = -phys.vy * 0.75;
+            phys.vx *= 0.94;
+            phys.omega = phys.vx / radius;
+            consider_impact("y", hit_v);
+        } else {
+            phys.vy = 0.0;
+            let decel = 320.0 * scale * dt;
+            if phys.vx.abs() <= decel {
+                phys.vx = 0.0;
+            } else {
+                phys.vx -= phys.vx.signum() * decel;
+            }
+            phys.vx *= (1.0 - 2.4 * dt).max(0.0);
+            phys.omega = phys.vx / radius;
+            if phys.vx.abs() < 8.0 * scale {
+                phys.vx = 0.0;
+                phys.omega = 0.0;
+                phys.sleeping = true;
+            }
+        }
+    } else {
+        phys.omega *= (1.0 - 0.45 * dt).max(0.0);
+    }
+
+    if !phys.sleeping {
+        phys.angle_deg = (phys.angle_deg + phys.omega.to_degrees() * dt) % 360.0;
+    }
+
+    best_impact
+}
+
+fn apply_cursor_kick(
+    phys: &mut OrbPhysics,
+    prev_cur: (f64, f64),
+    cur: (f64, f64),
+    dt: f64,
+    orb_size: f64,
+    bounds: OrbPhysicsBounds,
+    scale: f64,
+) -> Option<ImpactEvent> {
+    if dt <= 0.0005 || dt > 0.15 {
+        return None;
+    }
+    let scale = scale.max(0.5);
+    let cvx = (cur.0 - prev_cur.0) / dt;
+    let cvy = (cur.1 - prev_cur.1) / dt;
+    let cspeed = cvx.hypot(cvy);
+
+    let on_floor = phys.sleeping || (phys.py >= bounds.max_y - 2.0 && phys.vy.abs() < 45.0 * scale);
+    let min_kick_speed = if on_floor {
+        600.0 * scale
+    } else {
+        310.0 * scale
+    };
+    if cspeed < min_kick_speed {
+        return None;
+    }
+
+    let bcx = phys.px + orb_size * 0.5;
+    let bcy = phys.py + orb_size * 0.5;
+    let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
+
+    // Require outside-in cursor strike so resting or wiggling cursor inside the ball never machine-gun kicks it
+    let dist_prev = (prev_cur.0 - bcx).hypot(prev_cur.1 - bcy);
+    if dist_prev < r * 0.84 {
+        return None;
+    }
+
+    let (qx, qy) = closest_point_on_segment(prev_cur.0, prev_cur.1, cur.0, cur.1, bcx, bcy);
+    let seg_dist = (bcx - qx).hypot(bcy - qy);
+    let pad = if on_floor { 4.0 * scale } else { 7.0 * scale };
+    if seg_dist > r + pad {
+        return None;
+    }
+
+    let dx = bcx - qx;
+    let dy = bcy - qy;
+    let dlen = dx.hypot(dy);
+    let (nx, ny) = if dlen > 1e-4 {
+        (dx / dlen, dy / dlen)
+    } else {
+        (0.0, -1.0)
+    };
+
+    let kick_vx = (cvx * 0.62 + nx * 240.0 * scale).clamp(-3600.0 * scale, 3600.0 * scale);
+    let raw_vy = cvy * 0.62 + ny * 340.0 * scale - 290.0 * scale;
+    let kick_vy = raw_vy
+        .clamp(-3600.0 * scale, 2200.0 * scale)
+        .min(-430.0 * scale);
+
+    phys.vx = kick_vx;
+    phys.vy = kick_vy;
+    phys.omega = (kick_vx / r) * 0.92;
+    phys.sleeping = false;
+    phys.combo = phys.combo.saturating_add(1);
+
+    Some(ImpactEvent {
+        axis: if nx.abs() > ny.abs() { "x" } else { "y" },
+        normal_speed: ((cspeed * 0.72) / scale).clamp(420.0, 2200.0),
+    })
+}
 
 fn compute_visible_pod_pos(
     dock_x: i32,
@@ -1054,10 +1397,52 @@ fn monitor_work_rect(window: &WebviewWindow, ref_x: i32, ref_y: i32) -> Option<W
 }
 
 fn set_programmatic_pos(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, x: i32, y: i32) {
+    set_window_pos_fast(window, dock, x, y);
+}
+
+fn set_window_pos_fast(
+    window: &WebviewWindow,
+    dock: &Arc<Mutex<DockInner>>,
+    x: i32,
+    y: i32,
+) {
     {
         let mut st = dock.lock().unwrap();
         st.last_programmatic_target = Some((x, y));
-        st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
+        st.ignore_moves_until = Instant::now() + Duration::from_millis(220);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetWindowPos(
+                hwnd: *mut std::ffi::c_void,
+                hwnd_insert_after: *mut std::ffi::c_void,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                u_flags: u32,
+            ) -> i32;
+        }
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        if let Ok(hwnd) = window.hwnd() {
+            // SAFETY: Moves HWND directly in DWM without triggering WM_SIZE or DragFullWindows=0 wireframe.
+            unsafe {
+                SetWindowPos(
+                    hwnd.0,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return;
+        }
     }
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
@@ -1177,6 +1562,11 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
             st.seam_mode = seam;
             st.tucked = false;
             st.orb_collapsed = false;
+            st.play_mode = false;
+            st.orb_coasting = false;
+            st.custom_dragging = false;
+            st.pending_orb_return = None;
+            st.physics = OrbPhysics::default();
             st.idle = false;
             st.preview = DockEdge::None;
             st.pending_user_move = false;
@@ -1250,6 +1640,17 @@ fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
 
 enum WatcherAction {
     None,
+    MoveFast {
+        to: (i32, i32),
+        payload: Option<DockStatePayload>,
+        fx: Option<OrbFxPayload>,
+    },
+    GlideOrbReturn {
+        from: (i32, i32),
+        to: (i32, i32),
+        payload: DockStatePayload,
+        fx: OrbFxPayload,
+    },
     SnapPod {
         to: (i32, i32),
         saved: SavedDock,
@@ -1279,6 +1680,7 @@ enum WatcherAction {
     EnterOrb {
         orb_pos: (i32, i32),
         orb_size: i32,
+        play: bool,
     },
     ExitOrb {
         pod_pos: (i32, i32),
@@ -1287,6 +1689,7 @@ enum WatcherAction {
         payload: DockStatePayload,
     },
     EmitOnly(DockStatePayload),
+    EmitOrbFx(OrbFxPayload),
 }
 
 fn start_dock_watcher(
@@ -1296,7 +1699,20 @@ fn start_dock_watcher(
 ) {
     std::thread::spawn(move || {
         while !quitting.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(35));
+            let sleep_ms = {
+                let st = dock.lock().unwrap();
+                if st.custom_dragging
+                    || st.orb_coasting
+                    || (st.play_mode && st.orb_collapsed && !st.physics.sleeping)
+                {
+                    8
+                } else if st.play_mode && st.orb_collapsed {
+                    16
+                } else {
+                    30
+                }
+            };
+            std::thread::sleep(Duration::from_millis(sleep_ms));
             if quitting.load(Ordering::SeqCst) {
                 break;
             }
@@ -1321,6 +1737,7 @@ fn start_dock_watcher(
             let threshold = (SNAP_THRESHOLD_LOGICAL_PX * scale).round() as i32;
             let margin = (8.0 * scale).round() as i32;
             let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as i32;
+            let orb_inset = (ORB_INSET_LOGICAL_PX * scale).round() as i32;
             let pod_default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
             let pod_base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
             let mouse_down = is_primary_mouse_down();
@@ -1333,6 +1750,9 @@ fn start_dock_watcher(
                 if st.animating {
                     continue;
                 }
+                let prev_cursor = st.last_cursor;
+                st.last_cursor = Some((now, cur.x, cur.y));
+
                 if !st.orb_collapsed && !st.tucked && ww >= (pod_default_w - 20) {
                     st.pod_w_phys = ww;
                     if wh <= pod_base_h + (24.0 * scale).round() as i32 {
@@ -1340,14 +1760,185 @@ fn start_dock_watcher(
                     }
                 }
 
-                if st.force_untuck && (st.tucked || st.orb_collapsed) {
+                // 0. Smooth return glide after exiting Gravity Play Mode back to parked Orb spot
+                if let Some(return_to) = st.pending_orb_return.take() {
+                    st.play_mode = false;
+                    st.orb_coasting = false;
+                    st.custom_dragging = false;
+                    st.physics = OrbPhysics::default();
+                    st.last_emitted_angle = 0.0;
+                    st.orb_hover_since = None;
+                    st.orb_hover_armed = false;
+                    st.orb_expand_suppress_until = now + Duration::from_millis(520);
+                    action = WatcherAction::GlideOrbReturn {
+                        from: (wx, wy),
+                        to: return_to,
+                        payload: st.payload(),
+                        fx: OrbFxPayload {
+                            angle: 0.0,
+                            impact_axis: None,
+                            impact_speed: 0.0,
+                            combo: 0,
+                        },
+                    };
+                }
+                // 1. Live 120Hz Custom Dragging (eliminates Win32 DragFullWindows=0 hollow black box!)
+                else if st.custom_dragging {
+                    let target_x = cx - st.drag_offset.0;
+                    let target_y = cy - st.drag_offset.1;
+                    let t_sec = now.duration_since(st.epoch).as_secs_f64();
+                    let live_area = monitor_work_rect(
+                        &window,
+                        target_x + ww / 2,
+                        target_y + (wh.min(160)) / 2,
+                    )
+                    .unwrap_or(st.work_area);
+                    st.work_area = live_area;
+                    st.last_hover_at = now;
+                    st.orb_hover_since = None;
+
+                    if mouse_down {
+                        st.vel_tracker.push(t_sec, target_x as f64, target_y as f64);
+                        if st.orb_collapsed {
+                            let bounds =
+                                OrbPhysicsBounds::from_work_area(live_area, orb_size, orb_inset);
+                            let clamped_x =
+                                (target_x as f64).clamp(bounds.min_x, bounds.max_x).round() as i32;
+                            let clamped_y =
+                                (target_y as f64).clamp(bounds.min_y, bounds.max_y).round() as i32;
+                            st.physics.px = clamped_x as f64;
+                            st.physics.py = clamped_y as f64;
+                            action = WatcherAction::MoveFast {
+                                to: (clamped_x, clamped_y),
+                                payload: None,
+                                fx: None,
+                            };
+                        } else {
+                            let prev =
+                                detect_snap_edge(target_x, target_y, ww, wh, live_area, threshold);
+                            let mut emit_payload = None;
+                            if prev != st.preview {
+                                st.preview = prev;
+                                emit_payload = Some(st.payload());
+                            }
+                            action = WatcherAction::MoveFast {
+                                to: (target_x, target_y),
+                                payload: emit_payload,
+                                fx: None,
+                            };
+                        }
+                    } else {
+                        // Mouse button released -> finish custom drag with velocity handoff!
+                        st.custom_dragging = false;
+                        st.pending_user_move = false;
+                        let (vx, vy) = st.vel_tracker.velocity(4300.0 * scale);
+                        st.vel_tracker.clear();
+
+                        if st.orb_collapsed {
+                            let bounds =
+                                OrbPhysicsBounds::from_work_area(live_area, orb_size, orb_inset);
+                            let ox = (wx as f64).clamp(bounds.min_x, bounds.max_x);
+                            let oy = (wy as f64).clamp(bounds.min_y, bounds.max_y);
+
+                            if st.play_mode {
+                                // Throw / fling directly into 2D gravity physics!
+                                let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
+                                st.physics.px = ox;
+                                st.physics.py = oy;
+                                st.physics.vx = vx;
+                                st.physics.vy = vy;
+                                st.physics.omega = (vx / r) * 0.65;
+                                st.physics.sleeping = false;
+                                st.last_physics_tick = now;
+                            } else if vx.hypot(vy) >= 240.0 * scale {
+                                // Playful damped glide & bounce in normal Orb standby before parking!
+                                st.orb_coasting = true;
+                                st.physics.px = ox;
+                                st.physics.py = oy;
+                                st.physics.vx = vx * 0.62;
+                                st.physics.vy = vy * 0.62;
+                                st.physics.sleeping = false;
+                                st.last_physics_tick = now;
+                                st.orb_hover_armed = false;
+                            } else {
+                                let min_ox = live_area.x + margin;
+                                let max_ox = (live_area.right() - orb_size - margin).max(min_ox);
+                                let min_oy = live_area.y + margin;
+                                let max_oy = (live_area.bottom() - orb_size - margin).max(min_oy);
+                                let parked_x = (ox.round() as i32).clamp(min_ox, max_ox);
+                                let parked_y = (oy.round() as i32).clamp(min_oy, max_oy);
+                                let pod_w = st.pod_w_phys.max(pod_default_w);
+                                let pod_h = st.pod_h_phys.max(pod_base_h);
+                                let (px, py, new_edge) = compute_pod_pos_from_orb(
+                                    parked_x, parked_y, orb_size, pod_w, pod_h, live_area, margin,
+                                );
+                                st.orb_x = Some(parked_x);
+                                st.orb_y = Some(parked_y);
+                                st.dock_x = px;
+                                st.dock_y = py;
+                                st.edge = new_edge;
+                                st.seam_mode = has_adjacent_monitor_beyond_edge(
+                                    &window, px, py, pod_w, pod_h, live_area, new_edge,
+                                );
+                                st.orb_hover_armed = false;
+                                st.orb_expand_suppress_until = now + Duration::from_millis(450);
+                                action = WatcherAction::SaveOrbDrag {
+                                    to: (parked_x, parked_y),
+                                    saved: st.to_saved(),
+                                    payload: st.payload(),
+                                };
+                            }
+                        } else {
+                            st.preview = DockEdge::None;
+                            let anchor_h = st.pod_h_phys.max(pod_base_h);
+                            let proj_x = wx + (vx * 0.055).round() as i32;
+                            let proj_y = wy + (vy * 0.055).round() as i32;
+                            let (sx, sy, new_edge) = snap_window_rect(
+                                proj_x, proj_y, ww, anchor_h, live_area, threshold, margin,
+                            );
+                            let seam = has_adjacent_monitor_beyond_edge(
+                                &window, sx, sy, ww, anchor_h, live_area, new_edge,
+                            );
+                            st.edge = new_edge;
+                            st.dock_x = sx;
+                            st.dock_y = sy;
+                            st.seam_mode = seam;
+                            let (ox, oy) = compute_orb_pos_from_pod(
+                                sx, sy, ww, anchor_h, orb_size, live_area, new_edge, margin,
+                            );
+                            st.orb_x = Some(ox);
+                            st.orb_y = Some(oy);
+                            st.tucked = false;
+                            st.orb_collapsed = false;
+                            st.idle = false;
+                            st.last_hover_at = now;
+                            st.grace_until = now + Duration::from_millis(1400);
+                            let vis_to = compute_visible_pod_pos(
+                                sx, sy, ww, wh, live_area, new_edge, margin,
+                            );
+                            action = WatcherAction::SnapPod {
+                                to: vis_to,
+                                saved: st.to_saved(),
+                                payload: st.payload(),
+                            };
+                        }
+                    }
+                } else if st.force_untuck && (st.tucked || st.orb_collapsed) {
                     st.force_untuck = false;
                     st.force_tuck = false;
+                    st.play_mode = false;
+                    st.orb_coasting = false;
+                    st.physics = OrbPhysics::default();
                     st.idle = false;
                     st.last_hover_at = now;
                     st.grace_until = now + Duration::from_millis(2400);
+                    if let Some(prev_standby) = st.pre_play_standby.take() {
+                        st.standby_mode = prev_standby;
+                    }
+                    st.pre_play_orb_pos = None;
                     if st.orb_collapsed {
                         st.orb_collapsed = false;
+                        st.orb_hover_since = None;
                         let pod_w = st.pod_w_phys.max(pod_default_w);
                         let pod_h = st.pod_h_phys.max(pod_base_h);
                         let to = compute_visible_pod_pos(
@@ -1378,30 +1969,36 @@ fn start_dock_watcher(
                     st.force_tuck = false;
                     st.pinned = false;
                     st.ui_hold = false;
-                    if st.standby_mode == StandbyMode::Orb {
+                    if st.standby_mode == StandbyMode::Orb || st.play_mode {
                         let pod_w = st.pod_w_phys.max(pod_default_w);
                         let pod_h = st.pod_h_phys.max(pod_base_h);
-                        let opos = match (st.orb_x, st.orb_y) {
-                            (Some(ox), Some(oy)) => (ox, oy),
-                            _ => {
-                                let p = compute_orb_pos_from_pod(
-                                    st.dock_x,
-                                    st.dock_y,
-                                    pod_w,
-                                    pod_h,
-                                    orb_size,
-                                    st.work_area,
-                                    st.edge,
-                                    margin,
-                                );
-                                st.orb_x = Some(p.0);
-                                st.orb_y = Some(p.1);
-                                p
+                        let opos = if st.play_mode {
+                            (st.physics.px.round() as i32, st.physics.py.round() as i32)
+                        } else {
+                            match (st.orb_x, st.orb_y) {
+                                (Some(ox), Some(oy)) => (ox, oy),
+                                _ => {
+                                    let p = compute_orb_pos_from_pod(
+                                        st.dock_x,
+                                        st.dock_y,
+                                        pod_w,
+                                        pod_h,
+                                        orb_size,
+                                        st.work_area,
+                                        st.edge,
+                                        margin,
+                                    );
+                                    st.orb_x = Some(p.0);
+                                    st.orb_y = Some(p.1);
+                                    p
+                                }
                             }
                         };
+                        st.last_physics_tick = now;
                         action = WatcherAction::EnterOrb {
                             orb_pos: opos,
                             orb_size,
+                            play: st.play_mode,
                         };
                     } else if st.edge != DockEdge::None {
                         action = WatcherAction::TuckEdge {
@@ -1454,7 +2051,6 @@ fn start_dock_watcher(
                     } else {
                         st.pending_user_move = false;
                         st.preview = DockEdge::None;
-                        // Anchor using base capsule height so dragging while a drawer is open still remembers true home y!
                         let anchor_h = st.pod_h_phys.max(pod_base_h);
                         let (sx, sy, new_edge) =
                             snap_window_rect(wx, wy, ww, anchor_h, live_area, threshold, margin);
@@ -1466,7 +2062,6 @@ fn start_dock_watcher(
                         st.dock_y = sy;
                         st.work_area = live_area;
                         st.seam_mode = seam;
-                        // Re-compute companion orb anchor whenever user explicitly repositions the pod
                         let (ox, oy) = compute_orb_pos_from_pod(
                             sx, sy, ww, anchor_h, orb_size, live_area, new_edge, margin,
                         );
@@ -1486,7 +2081,223 @@ fn start_dock_watcher(
                         };
                     }
                 } else if st.orb_collapsed {
-                    // In Shield Orb standby: stay cleanly as the glowing orb until clicked (or tray woken)
+                    if st.play_mode {
+                        // 2A. Stress-Relief 2D Gravity Ball Mode!
+                        let bounds =
+                            OrbPhysicsBounds::from_work_area(st.work_area, orb_size, orb_inset);
+                        let dt = now
+                            .duration_since(st.last_physics_tick)
+                            .as_secs_f64()
+                            .clamp(0.001, 0.032);
+                        st.last_physics_tick = now;
+
+                        let mut impact = None;
+                        if !mouse_down
+                            && now.duration_since(st.last_kick_at) >= Duration::from_millis(105)
+                        {
+                            if let Some((prev_t, prev_cx, prev_cy)) = prev_cursor {
+                                let c_dt = now.duration_since(prev_t).as_secs_f64();
+                                if let Some(kick_hit) = apply_cursor_kick(
+                                    &mut st.physics,
+                                    (prev_cx, prev_cy),
+                                    (cur.x, cur.y),
+                                    c_dt,
+                                    orb_size as f64,
+                                    bounds,
+                                    scale,
+                                ) {
+                                    st.last_kick_at = now;
+                                    impact = Some(kick_hit);
+                                }
+                            }
+                        }
+
+                        if let Some(step_hit) =
+                            step_orb_gravity(&mut st.physics, dt, bounds, scale)
+                        {
+                            if impact.map_or(true, |k| step_hit.normal_speed > k.normal_speed) {
+                                impact = Some(step_hit);
+                            }
+                        }
+
+                        let nx = st.physics.px.round() as i32;
+                        let ny = st.physics.py.round() as i32;
+                        let pos_changed = nx != wx || ny != wy;
+                        let angle_delta = (st.physics.angle_deg - st.last_emitted_angle).abs();
+                        let fx = if impact.is_some() || angle_delta >= 2.2 {
+                            st.last_emitted_angle = st.physics.angle_deg;
+                            Some(OrbFxPayload {
+                                angle: st.physics.angle_deg,
+                                impact_axis: impact.map(|i| i.axis),
+                                impact_speed: impact.map_or(0.0, |i| i.normal_speed),
+                                combo: st.physics.combo,
+                            })
+                        } else {
+                            None
+                        };
+
+                        if pos_changed {
+                            action = WatcherAction::MoveFast {
+                                to: (nx, ny),
+                                payload: None,
+                                fx,
+                            };
+                        } else if let Some(fx_only) = fx {
+                            action = WatcherAction::EmitOrbFx(fx_only);
+                        }
+                    } else if st.orb_coasting {
+                        // 2B. Inertial damped glide when flicked in normal Orb standby
+                        let dt = now
+                            .duration_since(st.last_physics_tick)
+                            .as_secs_f64()
+                            .clamp(0.001, 0.032);
+                        st.last_physics_tick = now;
+                        let min_ox = (st.work_area.x + margin) as f64;
+                        let max_ox =
+                            ((st.work_area.right() - orb_size - margin) as f64).max(min_ox);
+                        let min_oy = (st.work_area.y + margin) as f64;
+                        let max_oy =
+                            ((st.work_area.bottom() - orb_size - margin) as f64).max(min_oy);
+
+                        let decay = (-7.5 * dt).exp();
+                        st.physics.vx *= decay;
+                        st.physics.vy *= decay;
+                        st.physics.px += st.physics.vx * dt;
+                        st.physics.py += st.physics.vy * dt;
+
+                        let mut impact: Option<ImpactEvent> = None;
+                        if st.physics.px < min_ox {
+                            st.physics.px = min_ox;
+                            let s = st.physics.vx.abs() / scale;
+                            st.physics.vx = -st.physics.vx * 0.62;
+                            if s > 120.0 {
+                                impact = Some(ImpactEvent {
+                                    axis: "x",
+                                    normal_speed: s,
+                                });
+                            }
+                        } else if st.physics.px > max_ox {
+                            st.physics.px = max_ox;
+                            let s = st.physics.vx.abs() / scale;
+                            st.physics.vx = -st.physics.vx * 0.62;
+                            if s > 120.0 {
+                                impact = Some(ImpactEvent {
+                                    axis: "x",
+                                    normal_speed: s,
+                                });
+                            }
+                        }
+                        if st.physics.py < min_oy {
+                            st.physics.py = min_oy;
+                            let s = st.physics.vy.abs() / scale;
+                            st.physics.vy = -st.physics.vy * 0.62;
+                            if s > 120.0 {
+                                impact = Some(ImpactEvent {
+                                    axis: "y",
+                                    normal_speed: s,
+                                });
+                            }
+                        } else if st.physics.py > max_oy {
+                            st.physics.py = max_oy;
+                            let s = st.physics.vy.abs() / scale;
+                            st.physics.vy = -st.physics.vy * 0.62;
+                            if s > 120.0 {
+                                impact = Some(ImpactEvent {
+                                    axis: "y",
+                                    normal_speed: s,
+                                });
+                            }
+                        }
+
+                        let nx = st.physics.px.round() as i32;
+                        let ny = st.physics.py.round() as i32;
+                        if st.physics.vx.hypot(st.physics.vy) < 28.0 * scale {
+                            st.orb_coasting = false;
+                            let pod_w = st.pod_w_phys.max(pod_default_w);
+                            let pod_h = st.pod_h_phys.max(pod_base_h);
+                            let (px, py, new_edge) = compute_pod_pos_from_orb(
+                                nx, ny, orb_size, pod_w, pod_h, st.work_area, margin,
+                            );
+                            st.orb_x = Some(nx);
+                            st.orb_y = Some(ny);
+                            st.dock_x = px;
+                            st.dock_y = py;
+                            st.edge = new_edge;
+                            st.seam_mode = has_adjacent_monitor_beyond_edge(
+                                &window, px, py, pod_w, pod_h, st.work_area, new_edge,
+                            );
+                            st.orb_expand_suppress_until = now + Duration::from_millis(380);
+                            action = WatcherAction::SaveOrbDrag {
+                                to: (nx, ny),
+                                saved: st.to_saved(),
+                                payload: st.payload(),
+                            };
+                        } else {
+                            let fx = impact.map(|i| OrbFxPayload {
+                                angle: 0.0,
+                                impact_axis: Some(i.axis),
+                                impact_speed: i.normal_speed,
+                                combo: 0,
+                            });
+                            action = WatcherAction::MoveFast {
+                                to: (nx, ny),
+                                payload: None,
+                                fx,
+                            };
+                        }
+                    } else {
+                        // 2C. Hover-to-Expand with 260ms Intent Gate (cancels cleanly on mousedown / drag / dblclick!)
+                        let orb_cx = wx as f64 + orb_size as f64 * 0.5;
+                        let orb_cy = wy as f64 + orb_size as f64 * 0.5;
+                        let hover_r = (ORB_VISUAL_RADIUS_LOGICAL_PX + 2.0) * scale;
+                        let dist = (cur.x - orb_cx).hypot(cur.y - orb_cy);
+                        let in_sphere = dist <= hover_r;
+
+                        if !in_sphere {
+                            st.orb_hover_since = None;
+                            if dist > hover_r + 10.0 * scale {
+                                st.orb_hover_armed = true;
+                            }
+                        } else if mouse_down {
+                            // Pressing mouse cancels hover-expand so drag & double-click work 100% reliably!
+                            st.orb_hover_since = None;
+                            st.orb_expand_suppress_until = now + Duration::from_millis(620);
+                        } else if st.orb_hover_armed && now >= st.orb_expand_suppress_until {
+                            match st.orb_hover_since {
+                                None => {
+                                    st.orb_hover_since = Some(now);
+                                }
+                                Some(since) => {
+                                    if now.duration_since(since)
+                                        >= Duration::from_millis(ORB_HOVER_EXPAND_MS)
+                                    {
+                                        st.orb_hover_since = None;
+                                        st.orb_collapsed = false;
+                                        st.idle = false;
+                                        st.last_hover_at = now;
+                                        st.grace_until = now + Duration::from_millis(1200);
+                                        let pod_w = st.pod_w_phys.max(pod_default_w);
+                                        let pod_h = st.pod_h_phys.max(pod_base_h);
+                                        let to = compute_visible_pod_pos(
+                                            st.dock_x,
+                                            st.dock_y,
+                                            pod_w,
+                                            pod_h,
+                                            st.work_area,
+                                            st.edge,
+                                            margin,
+                                        );
+                                        action = WatcherAction::ExitOrb {
+                                            pod_pos: to,
+                                            pod_w,
+                                            pod_h,
+                                            payload: st.payload(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     // Pod is currently expanded — keep strictly anchored to (dock_x, dock_y),
                     // shifting up temporarily ONLY while an open drawer exceeds the bottom work area,
@@ -1542,6 +2353,7 @@ fn start_dock_watcher(
                             action = WatcherAction::EnterOrb {
                                 orb_pos: opos,
                                 orb_size,
+                                play: false,
                             };
                         }
                     } else {
@@ -1617,8 +2429,30 @@ fn start_dock_watcher(
 
             match action {
                 WatcherAction::None => {}
+                WatcherAction::MoveFast { to, payload, fx } => {
+                    set_window_pos_fast(&window, &dock, to.0, to.1);
+                    if let Some(p) = payload {
+                        let _ = window.emit("dock-state", p);
+                    }
+                    if let Some(f) = fx {
+                        let _ = window.emit("orb-fx", f);
+                    }
+                }
+                WatcherAction::GlideOrbReturn {
+                    from,
+                    to,
+                    payload,
+                    fx,
+                } => {
+                    let _ = window.emit("dock-state", payload);
+                    let _ = window.emit("orb-fx", fx);
+                    glide_window(&window, &dock, from, to, 10, 12);
+                }
                 WatcherAction::EmitOnly(payload) => {
                     let _ = window.emit("dock-state", payload);
+                }
+                WatcherAction::EmitOrbFx(fx) => {
+                    let _ = window.emit("orb-fx", fx);
                 }
                 WatcherAction::AdjustOnScreen { to } => {
                     set_programmatic_pos(&window, &dock, to.0, to.1);
@@ -1675,7 +2509,11 @@ fn start_dock_watcher(
                     let _ = window.emit("dock-state", payload);
                     glide_window(&window, &dock, from, to, 10, 14);
                 }
-                WatcherAction::EnterOrb { orb_pos, orb_size } => {
+                WatcherAction::EnterOrb {
+                    orb_pos,
+                    orb_size,
+                    play,
+                } => {
                     let _ = window.emit(
                         "collapse-drawers",
                         serde_json::json!({ "immediate": true }),
@@ -1684,13 +2522,28 @@ fn start_dock_watcher(
                         let mut st = dock.lock().unwrap();
                         st.pod_h_phys = pod_base_h;
                         st.orb_collapsed = true;
+                        st.play_mode = play;
                         st.tucked = false;
                         st.idle = true;
+                        st.orb_hover_since = None;
+                        st.orb_hover_armed = false;
+                        st.orb_expand_suppress_until = Instant::now() + Duration::from_millis(480);
                         st.ignore_moves_until = Instant::now() + Duration::from_millis(320);
                         st.payload()
                     };
                     let _ = window.set_ignore_cursor_events(false);
                     let _ = window.emit("dock-state", payload);
+                    if !play {
+                        let _ = window.emit(
+                            "orb-fx",
+                            OrbFxPayload {
+                                angle: 0.0,
+                                impact_axis: None,
+                                impact_speed: 0.0,
+                                combo: 0,
+                            },
+                        );
+                    }
                     std::thread::sleep(Duration::from_millis(16));
                     set_window_rect_atomic(
                         &window,
@@ -1708,6 +2561,15 @@ fn start_dock_watcher(
                     payload,
                 } => {
                     let _ = window.set_ignore_cursor_events(false);
+                    let _ = window.emit(
+                        "orb-fx",
+                        OrbFxPayload {
+                            angle: 0.0,
+                            impact_axis: None,
+                            impact_speed: 0.0,
+                            combo: 0,
+                        },
+                    );
                     set_window_rect_atomic(&window, &dock, pod_pos.0, pod_pos.1, pod_w, pod_h);
                     let _ = window.emit("dock-state", payload);
                 }
@@ -1834,8 +2696,211 @@ fn set_standby_mode(
 fn expand_from_orb(dock: State<'_, DockController>) {
     let mut st = dock.inner.lock().unwrap();
     if st.orb_collapsed || st.tucked {
+        st.play_mode = false;
+        st.orb_coasting = false;
         st.force_untuck = true;
     }
+}
+
+#[tauri::command]
+fn begin_window_drag(window: WebviewWindow, dock: State<'_, DockController>) {
+    let (Ok(cur), Ok(wpos), Ok(wsize)) = (
+        window.cursor_position(),
+        window.outer_position(),
+        window.outer_size(),
+    ) else {
+        return;
+    };
+    let cx = cur.x.round() as i32;
+    let cy = cur.y.round() as i32;
+    let ww = (wsize.width as i32).max(1);
+    let wh = (wsize.height as i32).max(1);
+    let off_x = (cx - wpos.x).clamp(0, ww);
+    let off_y = (cy - wpos.y).clamp(0, wh);
+    let now = Instant::now();
+
+    let mut st = dock.inner.lock().unwrap();
+    let t_sec = now.duration_since(st.epoch).as_secs_f64();
+    st.custom_dragging = true;
+    st.orb_coasting = false;
+    st.drag_offset = (off_x, off_y);
+    st.vel_tracker.clear();
+    st.vel_tracker.push(t_sec, wpos.x as f64, wpos.y as f64);
+    st.physics.vx = 0.0;
+    st.physics.vy = 0.0;
+    st.physics.omega = 0.0;
+    st.physics.sleeping = true;
+    st.orb_hover_since = None;
+    st.orb_hover_armed = false;
+    st.orb_expand_suppress_until = now + Duration::from_millis(650);
+    st.last_hover_at = now;
+}
+
+#[tauri::command]
+fn toggle_orb_play_mode(
+    window: WebviewWindow,
+    dock: State<'_, DockController>,
+) -> DockStatePayload {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as i32;
+    let margin = (8.0 * scale).round() as i32;
+    let pod_default_w = (POD_WIDTH_LOGICAL_PX * scale).round() as i32;
+    let pod_base_h = (POD_BASE_HEIGHT_LOGICAL_PX * scale).round() as i32;
+    let cur_pos = window.outer_position().ok().map(|p| (p.x, p.y));
+    let cur_cursor = window.cursor_position().ok().map(|c| (c.x.round() as i32, c.y.round() as i32));
+    let now = Instant::now();
+
+    let mut emit_now = false;
+    let payload = {
+        let mut st = dock.inner.lock().unwrap();
+        st.custom_dragging = false;
+        st.orb_coasting = false;
+        st.orb_hover_since = None;
+        st.orb_hover_armed = false;
+        st.orb_expand_suppress_until = now + Duration::from_millis(650);
+
+        if st.play_mode {
+            // Exit Gravity Play Mode
+            st.play_mode = false;
+            let prev_standby = st.pre_play_standby.take().unwrap_or(st.standby_mode);
+            st.standby_mode = prev_standby;
+            let home_orb = st.pre_play_orb_pos.take().unwrap_or_else(|| {
+                let pod_w = st.pod_w_phys.max(pod_default_w);
+                let pod_h = st.pod_h_phys.max(pod_base_h);
+                compute_orb_pos_from_pod(
+                    st.dock_x,
+                    st.dock_y,
+                    pod_w,
+                    pod_h,
+                    orb_size,
+                    st.work_area,
+                    st.edge,
+                    margin,
+                )
+            });
+
+            if prev_standby == StandbyMode::Orb && st.orb_collapsed {
+                st.orb_x = Some(home_orb.0);
+                st.orb_y = Some(home_orb.1);
+                st.pending_orb_return = Some(home_orb);
+            } else {
+                st.physics = OrbPhysics::default();
+                st.force_untuck = true;
+            }
+        } else {
+            // Enter Gravity Play Mode!
+            let start_pos = if st.orb_collapsed {
+                let p = cur_pos.unwrap_or_else(|| {
+                    (
+                        st.orb_x.unwrap_or(st.work_area.x + margin),
+                        st.orb_y.unwrap_or(st.work_area.y + margin),
+                    )
+                });
+                st.pre_play_orb_pos = Some((st.orb_x.unwrap_or(p.0), st.orb_y.unwrap_or(p.1)));
+                st.pre_play_standby = None;
+                emit_now = true;
+                p
+            } else {
+                let pod_w = st.pod_w_phys.max(pod_default_w);
+                let pod_h = st.pod_h_phys.max(pod_base_h);
+                let home = compute_orb_pos_from_pod(
+                    st.dock_x,
+                    st.dock_y,
+                    pod_w,
+                    pod_h,
+                    orb_size,
+                    st.work_area,
+                    st.edge,
+                    margin,
+                );
+                st.pre_play_orb_pos = Some(home);
+                st.pre_play_standby = Some(st.standby_mode);
+                st.force_tuck = true;
+                if let Some((cx, cy)) = cur_cursor {
+                    let min_x = st.work_area.x + margin;
+                    let max_x = (st.work_area.right() - orb_size - margin).max(min_x);
+                    let min_y = st.work_area.y + margin;
+                    let max_y = (st.work_area.bottom() - orb_size - margin).max(min_y);
+                    (
+                        (cx - orb_size / 2).clamp(min_x, max_x),
+                        (cy - orb_size / 2).clamp(min_y, max_y),
+                    )
+                } else {
+                    home
+                }
+            };
+
+            let live_area = monitor_work_rect(&window, start_pos.0 + orb_size / 2, start_pos.1 + orb_size / 2)
+                .unwrap_or(st.work_area);
+            st.work_area = live_area;
+            st.play_mode = true;
+            st.physics = OrbPhysics {
+                px: start_pos.0 as f64,
+                py: start_pos.1 as f64,
+                vx: 165.0 * scale,
+                vy: -430.0 * scale,
+                omega: 4.2,
+                angle_deg: 0.0,
+                sleeping: false,
+                combo: 0,
+            };
+            st.last_physics_tick = now;
+        }
+        st.payload()
+    };
+
+    if emit_now {
+        let _ = window.emit("dock-state", payload.clone());
+    }
+    payload
+}
+
+#[tauri::command]
+fn orb_tap_impulse(window: WebviewWindow, dock: State<'_, DockController>) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let orb_size = (ORB_SIZE_LOGICAL_PX * scale).round() as f64;
+    let r = (ORB_VISUAL_RADIUS_LOGICAL_PX * scale).max(16.0);
+    let cur_opt = window.cursor_position().ok();
+    let now = Instant::now();
+
+    let fx_opt = {
+        let mut st = dock.inner.lock().unwrap();
+        if !st.orb_collapsed || !st.play_mode {
+            None
+        } else {
+            let lateral = if let Some(cur) = cur_opt {
+                let bcx = st.physics.px + orb_size * 0.5;
+                let norm = ((bcx - cur.x) / r).clamp(-1.0, 1.0);
+                norm * 460.0 * scale
+            } else {
+                0.0
+            };
+            st.physics.vx = (st.physics.vx * 0.45 + lateral).clamp(-2600.0 * scale, 2600.0 * scale);
+            st.physics.vy = (-940.0 * scale).min(st.physics.vy - 520.0 * scale);
+            st.physics.omega = (st.physics.vx / r) * 0.9;
+            st.physics.sleeping = false;
+            st.physics.combo = st.physics.combo.saturating_add(1);
+            st.last_physics_tick = now;
+            Some(OrbFxPayload {
+                angle: st.physics.angle_deg,
+                impact_axis: Some("y"),
+                impact_speed: 920.0,
+                combo: st.physics.combo,
+            })
+        }
+    };
+
+    if let Some(fx) = fx_opt {
+        let _ = window.emit("orb-fx", fx);
+    }
+}
+
+#[tauri::command]
+fn suppress_orb_hover(dock: State<'_, DockController>, ms: u64) {
+    let mut st = dock.inner.lock().unwrap();
+    let clamped = ms.clamp(80, 2000);
+    st.orb_hover_since = None;
+    st.orb_expand_suppress_until = Instant::now() + Duration::from_millis(clamped);
 }
 
 #[tauri::command]
@@ -1845,7 +2910,26 @@ fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
     };
     let should_hide = {
         let mut st = dock.inner.lock().unwrap();
-        if st.standby_mode == StandbyMode::Orb || st.edge != DockEdge::None {
+        if st.orb_collapsed && st.play_mode {
+            // Pressing Escape while in Gravity Play Mode exits play mode back to parked Orb / Pod!
+            let prev_standby = st.pre_play_standby.take().unwrap_or(st.standby_mode);
+            st.standby_mode = prev_standby;
+            if prev_standby == StandbyMode::Orb {
+                if let Some(home) = st.pre_play_orb_pos.take() {
+                    st.orb_x = Some(home.0);
+                    st.orb_y = Some(home.1);
+                    st.pending_orb_return = Some(home);
+                } else {
+                    st.play_mode = false;
+                    st.physics = OrbPhysics::default();
+                }
+            } else {
+                st.play_mode = false;
+                st.physics = OrbPhysics::default();
+                st.force_untuck = true;
+            }
+            false
+        } else if st.standby_mode == StandbyMode::Orb || st.edge != DockEdge::None {
             st.force_tuck = true;
             false
         } else {
@@ -2048,6 +3132,10 @@ fn main() {
             set_dock_pinned,
             set_standby_mode,
             expand_from_orb,
+            begin_window_drag,
+            toggle_orb_play_mode,
+            orb_tap_impulse,
+            suppress_orb_hover,
             tuck_or_hide
         ])
         .run(tauri::generate_context!())
@@ -2286,5 +3374,101 @@ mod tests {
         let short_sha = env!("ENVGUARD_GIT_SHORT_SHA");
         assert!(sha == "unknown" || sha.len() == 40);
         assert!(short_sha == "unknown" || short_sha.len() == 7);
+    }
+
+    #[test]
+    fn gravity_orb_bounces_off_floor_walls_and_sleeps_cleanly() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        let bounds = OrbPhysicsBounds::from_work_area(area, 72, 8);
+        // Visual 56px sphere inside 72px stage touches taskbar y=1040 cleanly at py = 1040 - 72 + 8 = 976
+        assert_eq!(bounds.max_y, 976.0);
+        assert_eq!(bounds.min_x, -8.0);
+        assert_eq!(bounds.max_x, 1856.0);
+
+        let mut phys = OrbPhysics {
+            px: 400.0,
+            py: 970.0,
+            vx: 220.0,
+            vy: 900.0,
+            omega: 0.0,
+            angle_deg: 0.0,
+            sleeping: false,
+            combo: 3,
+        };
+
+        // First step crosses floor -> rebounds upward (vy < 0), resets juggle combo, emits Y impact
+        let hit = step_orb_gravity(&mut phys, 0.016, bounds, 1.0);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().axis, "y");
+        assert!(phys.vy < -400.0);
+        assert_eq!(phys.combo, 0);
+        assert!(!phys.sleeping);
+
+        // Simulate 8 seconds of settling -> ball must come to complete 0% CPU sleep on the taskbar floor
+        for _ in 0..1000 {
+            if phys.sleeping {
+                break;
+            }
+            step_orb_gravity(&mut phys, 0.008, bounds, 1.0);
+        }
+        assert!(phys.sleeping, "gravity orb must enter sleep state once settled");
+        assert_eq!(phys.py, bounds.max_y);
+        assert_eq!(phys.vx, 0.0);
+        assert_eq!(phys.vy, 0.0);
+    }
+
+    #[test]
+    fn cursor_sweep_kicks_ball_upward_and_increments_combo_without_resting_jitter() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1040,
+        };
+        let bounds = OrbPhysicsBounds::from_work_area(area, 72, 8);
+        let mut phys = OrbPhysics {
+            px: 600.0,
+            py: 500.0,
+            vx: 0.0,
+            vy: 300.0,
+            omega: 0.0,
+            angle_deg: 0.0,
+            sleeping: false,
+            combo: 0,
+        };
+
+        // Cursor already resting inside the ball (636, 536) wiggling slightly -> must NOT kick
+        let no_kick = apply_cursor_kick(&mut phys, (634.0, 536.0), (638.0, 534.0), 0.016, 72.0, bounds, 1.0);
+        assert!(no_kick.is_none());
+        assert_eq!(phys.combo, 0);
+
+        // Fast upward swipe from below-outside (636, 590) -> through ball (636, 528) in 16ms -> kicks upward!
+        let kick = apply_cursor_kick(&mut phys, (636.0, 590.0), (636.0, 528.0), 0.016, 72.0, bounds, 1.0);
+        assert!(kick.is_some());
+        assert!(phys.vy < -400.0, "cursor kick must launch orb upward");
+        assert_eq!(phys.combo, 1);
+    }
+
+    #[test]
+    fn velocity_tracker_computes_clamped_flick_vector() {
+        let mut vt = VelocityTracker::default();
+        vt.push(0.000, 100.0, 200.0);
+        vt.push(0.016, 132.0, 168.0);
+        vt.push(0.032, 164.0, 136.0);
+        let (vx, vy) = vt.velocity(4000.0);
+        assert!((vx - 2000.0).abs() < 1e-3);
+        assert!((vy + 2000.0).abs() < 1e-3);
+
+        // Extreme spike gets clamped cleanly to max_speed
+        vt.clear();
+        vt.push(0.000, 0.0, 0.0);
+        vt.push(0.010, 900.0, 0.0);
+        let (cvx, _) = vt.velocity(3000.0);
+        assert!((cvx - 3000.0).abs() < 1e-3);
     }
 }

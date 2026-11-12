@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-runtime="web" data-dock="top" data-standby="edge" data-orb="false" data-tucked="false" data-seam="false" data-idle="false" data-preview="none" data-expanded="false">
+<html lang="zh-CN" data-runtime="web" data-dock="top" data-standby="edge" data-orb="false" data-play="false" data-tucked="false" data-seam="false" data-idle="false" data-preview="none" data-expanded="false">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -22,22 +22,30 @@
       <i class="edge-bar" id="edgeStatusBar"></i>
     </div>
 
-    <!-- Minimal 待机态 ②：56×56 陶瓷黑高光微球（居中于 60×60 缓冲舞台 · 支持键盘/点击展开与按住拖动） -->
-    <button type="button" class="shield-orb" id="shieldOrb" title="点击展开 · 按住可拖动" aria-label="展开 Claude 环境卫士控制面板">
-      <span class="orb-glow" aria-hidden="true"></span>
-      <svg class="orb-shield" id="orbShieldSvg" viewBox="0 0 24 24" aria-hidden="true">
-        <path class="shield-outline" d="M12 21.35c5.2-2.65 7.5-6.25 7.5-10.6V5.6L12 2.75 4.5 5.6v5.15c0 4.35 2.3 7.95 7.5 10.6Z"/>
-        <path class="shield-mark" id="orbMarkPath" d="m9.2 12.1 2 2.05 3.85-3.95"/>
-      </svg>
+    <!-- Minimal 待机态 ②：56×56 呼吸流光黑曜陶瓷微球（居中于 72×72 防裁切舞台 · 悬停展开 / 实时跟手拖动 / 双击重力解压球） -->
+    <button type="button" class="shield-orb" id="shieldOrb" title="环境安全 · 悬停展开 · 按住拖动 · 双击进入重力解压球" aria-label="展开 Claude 环境卫士控制面板">
+      <span class="orb-halo" aria-hidden="true"></span>
+      <span class="orb-body" id="orbBody" aria-hidden="true">
+        <span class="orb-ring"></span>
+        <span class="orb-glow"></span>
+        <span class="orb-lighting"></span>
+        <span class="orb-rotor" id="orbRotor">
+          <svg class="orb-shield" id="orbShieldSvg" viewBox="0 0 24 24">
+            <path class="shield-outline" d="M12 21.35c5.2-2.65 7.5-6.25 7.5-10.6V5.6L12 2.75 4.5 5.6v5.15c0 4.35 2.3 7.95 7.5 10.6Z"/>
+            <path class="shield-mark" id="orbMarkPath" d="m9.2 12.1 2 2.05 3.85-3.95"/>
+          </svg>
+        </span>
+      </span>
+      <span class="orb-combo" id="orbComboBadge" aria-hidden="true" hidden>×2</span>
     </button>
 
     <!-- Compact 单行胶囊 (480×64, R=999px round) ⇄ Expanded 同心控制面板 (480×auto, R=28px squircle) -->
     <div class="pod" id="podCard">
 
-      <!-- Compact 主岛单行（.js-drag-surface 4px 位移死区拖动；轻点左侧摘要直接展开/收起面板） -->
+      <!-- Compact 主岛单行（.js-drag-surface 4px 位移死区拖动；轻点左侧摘要直接展开/收起面板；双击左侧圆环进入重力球） -->
       <div class="pod-main js-drag-surface">
-        <button type="button" class="pod-summary-trigger" id="btnSummaryToggle" aria-expanded="false" aria-controls="expandedSheet" title="点击展开详情 · 按住可拖动">
-          <span class="ring-gauge auditing" id="ringGauge" aria-hidden="true">
+        <button type="button" class="pod-summary-trigger" id="btnSummaryToggle" aria-expanded="false" aria-controls="expandedSheet" title="点击展开详情 · 按住可拖动 · 双击圆环可玩重力球">
+          <span class="ring-gauge auditing" id="ringGauge" title="双击进入重力解压球模式" aria-hidden="true">
             <svg class="ring-svg" viewBox="0 0 36 36">
               <circle class="ring-halo" cx="18" cy="18" r="13.5"/>
               <circle class="ring-track" cx="18" cy="18" r="15.5" pathLength="100"/>

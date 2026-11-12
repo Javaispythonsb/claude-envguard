@@ -168,10 +168,10 @@ input:focus-visible {
   width: 480px;
   background: transparent;
 }
-/* 60×60 stage centers the 56×56 ceramic orb with a 2px transparent anti-clip buffer */
+/* 72×72 stage centers the 56×56 ceramic orb with an 8px transparent anti-clip buffer for breathing halo & bounce squash */
 :root[data-orb="true"] .pod-stage {
-  width: 60px;
-  height: 60px;
+  width: 72px;
+  height: 72px;
   display: grid;
   place-items: center;
 }
@@ -285,8 +285,36 @@ input:focus-visible {
   right: 0;
 }
 
-/* ================= MINIMAL MODE 2: 56×56 CERAMIC OBSIDIAN ORB ================= */
+/* ================= MINIMAL MODE 2: 56×56 LUMINOUS BREATHING CERAMIC ORB ================= */
+@keyframes orbHaloBreathe {
+  0%, 100% {
+    opacity: 0.34;
+    transform: scale3d(0.93, 0.93, 1);
+  }
+  50% {
+    opacity: 0.92;
+    transform: scale3d(1.03, 1.03, 1);
+  }
+}
+
+@keyframes orbCoreBreathe {
+  0%, 100% {
+    opacity: 0.42;
+    transform: scale3d(0.92, 0.92, 1);
+  }
+  50% {
+    opacity: 0.88;
+    transform: scale3d(1.08, 1.08, 1);
+  }
+}
+
+@keyframes orbRingSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .shield-orb {
+  --orb-breathe-dur: 3.6s;
   position: relative;
   display: none;
   width: 56px;
@@ -294,42 +322,146 @@ input:focus-visible {
   padding: 0;
   border: none;
   border-radius: 50%;
-  background:
-    radial-gradient(76% 42% at 50% 8%, rgba(255, 255, 255, 0.25) 0%, rgba(255, 255, 255, 0.04) 58%, transparent 100%),
-    linear-gradient(180deg, #161922 0%, #090b10 54%, #050609 100%);
-  box-shadow:
-    0 1px 2.5px rgba(0, 0, 0, 0.52),
-    inset 0 0 0 1px rgba(0, 0, 0, 0.94),
-    inset 0 1.5px 1px rgba(255, 255, 255, 0.34),
-    inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.10);
+  background: transparent;
   color: var(--sys-green);
   place-items: center;
-  cursor: pointer;
-  overflow: hidden;
-  transition: transform 150ms var(--ease-out), box-shadow 200ms ease, color 200ms ease;
+  cursor: grab;
+  overflow: visible;
+  transition: transform 160ms var(--ease-out), color 200ms ease;
 }
+.shield-orb:active {
+  cursor: grabbing;
+}
+.shield-orb.auditing {
+  --orb-breathe-dur: 2.3s;
+  color: var(--sys-amber);
+}
+.shield-orb.blocked {
+  --orb-breathe-dur: 1.75s;
+  color: var(--sys-red);
+}
+:root[data-play="true"] .shield-orb {
+  --orb-breathe-dur: 2.1s;
+}
+
+/* Outer soft breathing aura (fades to 0% alpha well inside 72×72 stage so zero square edge ever shows) */
+.shield-orb .orb-halo {
+  position: absolute;
+  inset: -7px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, currentColor 46%, transparent) 58%,
+    color-mix(in srgb, currentColor 20%, transparent) 78%,
+    transparent 94%
+  );
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: orbHaloBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
+}
+
+/* 3D Obsidian Ceramic Sphere Body (receives GPU squash/stretch on bounce impacts) */
+.shield-orb .orb-body {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #1b202c 0%, #0a0d14 54%, #040508 100%);
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.38),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.96),
+    inset 0 1.5px 1px rgba(255, 255, 255, 0.34),
+    inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.08);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  pointer-events: none;
+  will-change: transform;
+}
+.shield-orb.blocked .orb-body {
+  box-shadow:
+    0 2px 4.5px rgba(0, 0, 0, 0.44),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.96),
+    inset 0 1.5px 1px rgba(255, 145, 140, 0.40),
+    inset 0 -1.5px 2px rgba(255, 69, 58, 0.28);
+}
+
+/* Inner luminous breathing ring (high contrast against dark obsidian on both white & black wallpapers) */
+.shield-orb .orb-ring {
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  padding: 1.5px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, currentColor 68%, #ffffff) 0%,
+    color-mix(in srgb, currentColor 32%, transparent) 52%,
+    color-mix(in srgb, currentColor 76%, transparent) 100%
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0.62;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: orbCoreBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
+}
+
+/* Gravity Play Mode: kinetic orbital specular ring */
+:root[data-play="true"] .shield-orb .orb-ring {
+  padding: 2px;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    color-mix(in srgb, currentColor 88%, #ffffff) 75deg,
+    color-mix(in srgb, currentColor 28%, transparent) 160deg,
+    transparent 230deg,
+    color-mix(in srgb, currentColor 72%, #ffffff) 315deg,
+    transparent 360deg
+  );
+  opacity: 0.92;
+  animation: orbRingSpin 2.6s linear infinite;
+}
+
+/* Volumetric inner core breathing light */
 .shield-orb .orb-glow {
   position: absolute;
-  inset: 14px;
+  inset: 8px;
   border-radius: 50%;
-  background: radial-gradient(circle, currentColor 0%, transparent 72%);
-  opacity: 0.16;
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, currentColor 42%, transparent) 0%,
+    color-mix(in srgb, currentColor 14%, transparent) 56%,
+    transparent 78%
+  );
   pointer-events: none;
-  transition: opacity 200ms ease, transform 200ms var(--ease-out);
+  will-change: transform, opacity;
+  animation: orbCoreBreathe var(--orb-breathe-dur) var(--ease-in-out) infinite;
 }
-.shield-orb.auditing { color: var(--sys-amber); }
-.shield-orb.blocked {
-  color: var(--sys-red);
-  box-shadow:
-    0 1px 2.5px rgba(0, 0, 0, 0.55),
-    inset 0 0 0 1px rgba(0, 0, 0, 0.94),
-    inset 0 1.5px 1px rgba(255, 130, 130, 0.36),
-    inset 0 -1.5px 1.5px rgba(255, 69, 58, 0.24);
+
+/* World-space zenith glass specular + bottom colored fresnel bounce (stays top-lit even while emblem spins!) */
+.shield-orb .orb-lighting {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(72% 40% at 50% 9%, rgba(255, 255, 255, 0.28) 0%, rgba(255, 255, 255, 0.04) 58%, transparent 100%),
+    radial-gradient(68% 34% at 50% 95%, color-mix(in srgb, currentColor 30%, transparent) 0%, transparent 100%);
+  pointer-events: none;
+}
+
+.shield-orb .orb-rotor {
+  position: relative;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  will-change: transform;
 }
 
 .orb-shield {
-  position: relative;
-  z-index: 1;
   width: 26px;
   height: 26px;
   fill: none;
@@ -337,15 +469,41 @@ input:focus-visible {
   stroke-linecap: round;
   stroke-linejoin: round;
   pointer-events: none;
-  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+  filter: drop-shadow(0 0 5px color-mix(in srgb, currentColor 45%, transparent)) drop-shadow(0 1px 2px rgba(0, 0, 0, 0.65));
 }
 .orb-shield .shield-outline {
   stroke-width: 1.85;
   fill: currentColor;
-  fill-opacity: 0.13;
+  fill-opacity: 0.16;
 }
 .orb-shield .shield-mark {
   stroke-width: 2.15;
+}
+
+/* Keepie-uppie juggle combo pill in Gravity Play Mode */
+.orb-combo {
+  position: absolute;
+  top: -4px;
+  right: -5px;
+  z-index: 4;
+  min-width: 22px;
+  height: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #0b0e15;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px color-mix(in srgb, currentColor 65%, rgba(255, 255, 255, 0.25));
+  color: var(--label-1);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+  transition: transform 150ms var(--ease-out), opacity 150ms ease;
+}
+.orb-combo[hidden] {
+  display: none !important;
 }
 
 :root[data-orb="true"] .shield-orb { display: grid; }
@@ -1665,16 +1823,15 @@ input:focus-visible {
 }
 
 @media (hover: hover) and (pointer: fine) {
-  .shield-orb:hover {
-    box-shadow:
-      0 1.5px 3px rgba(0, 0, 0, 0.55),
-      inset 0 0 0 1px rgba(0, 0, 0, 0.94),
-      inset 0 1.5px 1.2px rgba(255, 255, 255, 0.45),
-      inset 0 -1.5px 1.5px rgba(255, 255, 255, 0.16);
+  .shield-orb:hover:not(:active) {
+    transform: scale3d(1.045, 1.045, 1);
   }
-  .shield-orb:hover .orb-glow {
-    opacity: 0.25;
-    transform: scale(1.10);
+  .shield-orb:hover .orb-body {
+    box-shadow:
+      0 2.5px 5px rgba(0, 0, 0, 0.46),
+      inset 0 0 0 1px rgba(0, 0, 0, 0.96),
+      inset 0 1.5px 1.2px rgba(255, 255, 255, 0.48),
+      inset 0 -1.5px 2px color-mix(in srgb, currentColor 38%, rgba(255, 255, 255, 0.14));
   }
   .capsule-secondary:hover:not(:disabled),
   .circle-icon:hover:not(:disabled),
@@ -1765,7 +1922,10 @@ input:focus-visible {
 /* ================= ACCESSIBLE REDUCED MOTION (KEEP COMPREHENSION FADES, DROP MOTION) ================= */
 @media (prefers-reduced-motion: reduce) {
   .ring-gauge.auditing .ring-svg,
-  #btnRecheck.is-spinning svg {
+  #btnRecheck.is-spinning svg,
+  .shield-orb .orb-halo,
+  .shield-orb .orb-ring,
+  .shield-orb .orb-glow {
     animation: none !important;
   }
   .seg-glider,

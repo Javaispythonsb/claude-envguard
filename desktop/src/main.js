@@ -17,7 +17,9 @@ import {
   summarizeMatrixCounts,
   normalizeSafeUrl,
   computePrimaryIslandAction,
-  formatUpdateCheckReport
+  formatUpdateCheckReport,
+  describeOrbModeMeta,
+  computeImpactSquash
 } from './hig-model.js';
 
 const EASE_OUT = 'cubic-bezier(0.23, 1, 0.32, 1)';
@@ -64,10 +66,14 @@ let lastPodHeight = 0;
 let isPinned = false;
 let isTucked = false;
 let isOrb = false;
+let isPlayMode = false;
+let standbyTone = '';
 let standbyMode = 'edge';
 let hasFocusWithin = false;
 let popupOpen = false;
 let shieldArmed = false;
+let orbSquashAnim = null;
+let orbComboPopAnim = null;
 
 // Overview progressive disclosure state
 let matrixOpen = false;
@@ -101,19 +107,23 @@ function setSubStatus(text, isErr = false, autoRevertMs = 0) {
   }
 }
 
+function syncOrbA11yMeta() {
+  const orb = document.getElementById('shieldOrb');
+  if (!orb) return;
+  const meta = describeOrbModeMeta({ tone: standbyTone, playMode: isPlayMode });
+  orb.setAttribute('aria-label', meta.ariaLabel);
+  orb.title = meta.title;
+}
+
 function setStandbyTone(tone) {
+  standbyTone = tone || '';
   const bar = document.getElementById('edgeStatusBar');
   if (bar) bar.className = tone ? `edge-bar ${tone}` : 'edge-bar';
 
   const orb = document.getElementById('shieldOrb');
   if (orb) {
     orb.className = tone ? `shield-orb ${tone}` : 'shield-orb';
-    const label = tone === 'blocked'
-      ? '环境存在阻断项，按回车或点击展开控制面板'
-      : tone === 'auditing'
-        ? '正在审计环境，按回车或点击展开控制面板'
-        : '环境安全，按回车或点击展开控制面板';
-    orb.setAttribute('aria-label', label);
+    syncOrbA11yMeta();
   }
 
   const mark = document.getElementById('orbMarkPath');
@@ -129,6 +139,58 @@ function setStandbyTone(tone) {
     } else {
       pod.removeAttribute('data-alert');
     }
+  }
+}
+
+function applyOrbFxPayload(fx) {
+  if (!fx) return;
+  const rotor = document.getElementById('orbRotor');
+  const body = document.getElementById('orbBody');
+  const badge = document.getElementById('orbComboBadge');
+  const reduced = prefersReducedMotion();
+
+  if (rotor) {
+    const deg = reduced || !fx.angle ? 0 : Number(fx.angle.toFixed(1));
+    rotor.style.transform = deg ? `rotate(${deg}deg)` : '';
+  }
+
+  if (badge) {
+    const combo = Number(fx.combo) || 0;
+    if (isPlayMode && combo >= 2) {
+      badge.textContent = `×${combo}`;
+      badge.hidden = false;
+      if (!reduced && typeof badge.animate === 'function') {
+        if (orbComboPopAnim) {
+          try { orbComboPopAnim.cancel(); } catch {}
+        }
+        orbComboPopAnim = badge.animate(
+          [
+            { transform: 'scale3d(0.86, 0.86, 1)' },
+            { transform: 'scale3d(1.18, 1.18, 1)' },
+            { transform: 'scale3d(1, 1, 1)' }
+          ],
+          { duration: 210, easing: EASE_OUT }
+        );
+      }
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  if (!reduced && body && fx.impact_axis && fx.impact_speed >= 95 && typeof body.animate === 'function') {
+    const sq = computeImpactSquash(fx.impact_speed, fx.impact_axis);
+    if (orbSquashAnim) {
+      try { orbSquashAnim.cancel(); } catch {}
+    }
+    orbSquashAnim = body.animate(
+      [
+        { transform: 'scale3d(1, 1, 1)' },
+        { transform: `scale3d(${sq.compress.sx}, ${sq.compress.sy}, 1)`, offset: 0.28 },
+        { transform: `scale3d(${sq.rebound.sx}, ${sq.rebound.sy}, 1)`, offset: 0.66 },
+        { transform: 'scale3d(1, 1, 1)' }
+      ],
+      { duration: 230, easing: EASE_OUT }
+    );
   }
 }
 
@@ -495,6 +557,7 @@ function applyDockPayload(payload) {
   const prevOrb = isOrb;
   isTucked = Boolean(payload.tucked);
   isOrb = Boolean(payload.orb);
+  isPlayMode = Boolean(payload.play);
   standbyMode = payload.standby_mode || 'edge';
   const seam = Boolean(payload.seam);
   const idle = Boolean(payload.idle);
@@ -504,10 +567,16 @@ function applyDockPayload(payload) {
   root.setAttribute('data-dock', edge);
   root.setAttribute('data-standby', standbyMode);
   root.setAttribute('data-orb', String(isOrb));
+  root.setAttribute('data-play', String(isPlayMode));
   root.setAttribute('data-tucked', String(isTucked));
   root.setAttribute('data-seam', String(seam));
   root.setAttribute('data-idle', String(idle));
   root.setAttribute('data-preview', preview);
+  syncOrbA11yMeta();
+  if (!isPlayMode) {
+    const badge = document.getElementById('orbComboBadge');
+    if (badge) badge.hidden = true;
+  }
 
   document.querySelectorAll('[data-standby-pick]').forEach((btn) => {
     const on = btn.dataset.standbyPick === standbyMode;
@@ -1301,7 +1370,7 @@ function wireDeadzoneDragSurfaces() {
       dragged = true;
       suppressSummaryClick = true;
       downSurface = null;
-      if (isTauri) getCurrentWindow().startDragging().catch(() => {});
+      if (isTauri) invoke('begin_window_drag').catch(() => {});
       setTimeout(() => { suppressSummaryClick = false; }, 320);
     }
   });
@@ -1312,13 +1381,47 @@ function wireDeadzoneDragSurfaces() {
 
   const sumBtn = document.getElementById('btnSummaryToggle');
   if (sumBtn) {
+    let ringClickTimer = null;
     sumBtn.onclick = (e) => {
       if (suppressSummaryClick) {
         e.preventDefault();
         suppressSummaryClick = false;
         return;
       }
-      envelopeCtrl.setExpanded(!isExpanded, { source: e.detail === 0 ? 'keyboard' : 'pointer' });
+      if (e.detail === 0) {
+        envelopeCtrl.setExpanded(!isExpanded, { source: 'keyboard' });
+        return;
+      }
+
+      // Double-clicking the left activity ring morphs the Island directly into the Stress-Relief Gravity Orb!
+      const ringEl = document.getElementById('ringGauge');
+      let hitRing = false;
+      if (ringEl) {
+        const rect = ringEl.getBoundingClientRect();
+        hitRing = e.clientX >= rect.left - 4
+          && e.clientX <= rect.right + 4
+          && e.clientY >= rect.top - 4
+          && e.clientY <= rect.bottom + 4;
+      }
+
+      if (hitRing && isTauri) {
+        if (e.detail >= 2) {
+          clearTimeout(ringClickTimer);
+          ringClickTimer = null;
+          invoke('toggle_orb_play_mode')
+            .then((st) => applyDockPayload(st))
+            .catch(() => {});
+          return;
+        }
+        clearTimeout(ringClickTimer);
+        ringClickTimer = setTimeout(() => {
+          ringClickTimer = null;
+          envelopeCtrl.setExpanded(!isExpanded, { source: 'pointer' });
+        }, 210);
+        return;
+      }
+
+      envelopeCtrl.setExpanded(!isExpanded, { source: 'pointer' });
     };
   }
 }
@@ -1442,28 +1545,40 @@ function wireDesktopEvents() {
     };
   });
 
-  // Minimal Ceramic Orb: supports keyboard Enter/Space, short click (<4px) expand, and press-drag (>4px)
+  // Luminous Ceramic Orb: Hover-to-expand (260ms in Rust), Live 120Hz Drag (>4px), Double-click Gravity Play Mode, Single-click Bounce
   const orbEl = document.getElementById('shieldOrb');
   if (orbEl) {
     let orbDown = false;
     let startX = 0;
     let startY = 0;
     let orbDragged = false;
+    let tapBounceTimer = null;
+
     orbEl.addEventListener('mousedown', (e) => {
       if (e.button !== 0) return;
       orbDown = true;
       orbDragged = false;
       startX = e.screenX;
       startY = e.screenY;
+      // Immediately cancel any pending hover-to-expand so drag & double-click never get preempted!
+      if (isTauri) invoke('suppress_orb_hover', { ms: 620 }).catch(() => {});
     });
+
     window.addEventListener('mousemove', (e) => {
       if (!orbDown || orbDragged) return;
       if (Math.hypot(e.screenX - startX, e.screenY - startY) > 4) {
         orbDragged = true;
         orbDown = false;
-        if (isTauri) getCurrentWindow().startDragging().catch(() => {});
+        clearTimeout(tapBounceTimer);
+        tapBounceTimer = null;
+        if (isTauri) invoke('begin_window_drag').catch(() => {});
       }
     });
+
+    window.addEventListener('mouseup', () => {
+      orbDown = false;
+    });
+
     orbEl.addEventListener('click', (e) => {
       if (orbDragged) {
         e.preventDefault();
@@ -1471,7 +1586,35 @@ function wireDesktopEvents() {
         return;
       }
       orbDown = false;
-      if (isTauri) invoke('expand_from_orb').catch(() => {});
+      if (!isTauri) return;
+
+      // Keyboard Enter / Space accessibility: always expand immediately
+      if (e.detail === 0) {
+        invoke('expand_from_orb').catch(() => {});
+        return;
+      }
+
+      // Double-click (<300ms): Toggle Stress-Relief Gravity Play Mode!
+      if (e.detail >= 2) {
+        clearTimeout(tapBounceTimer);
+        tapBounceTimer = null;
+        invoke('toggle_orb_play_mode')
+          .then((st) => applyDockPayload(st))
+          .catch(() => {});
+        return;
+      }
+
+      // Single-click inside Gravity Play Mode: bouncy upward tap impulse (delayed slightly to yield to dblclick)
+      if (isPlayMode) {
+        clearTimeout(tapBounceTimer);
+        tapBounceTimer = setTimeout(() => {
+          tapBounceTimer = null;
+          if (isPlayMode) invoke('orb_tap_impulse').catch(() => {});
+        }, 190);
+      } else {
+        // In normal Orb standby, hover (260ms) already expands; pause briefly on single click so 2nd click can trigger Play Mode
+        invoke('suppress_orb_hover', { ms: 420 }).catch(() => {});
+      }
     });
   }
 
@@ -1778,6 +1921,10 @@ function wireDesktopEvents() {
 
   listen('dock-state', (event) => {
     applyDockPayload(event?.payload);
+  }).catch(() => {});
+
+  listen('orb-fx', (event) => {
+    applyOrbFxPayload(event?.payload);
   }).catch(() => {});
 
   listen('tray-action', (event) => {

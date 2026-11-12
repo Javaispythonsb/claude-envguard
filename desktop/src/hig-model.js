@@ -3,6 +3,8 @@
 
 export const POD_WIDTH = 480;
 export const POD_COMPACT_HEIGHT = 64;
+export const ORB_STAGE_SIZE = 72;
+export const ORB_VISUAL_SIZE = 56;
 
 export const FIXABLE_OPTIONAL = new Set(['时区', '地区', 'DNS', 'WebRTC', '生态可达性']);
 export const HARD_FIXABLE = new Set(['代理内核', 'TUN网卡', 'IPv6', '保镖', '规则置顶']);
@@ -527,5 +529,49 @@ export function formatUpdateCheckReport(info) {
     canHotUpdate: false,
     summary: info.message || '无法连接 GitHub 更新源',
     body: `${info.message || '检查更新失败'}\n开源仓库：https://github.com/${repo}`
+  };
+}
+
+/**
+ * Computes accessible label and tooltip copy for the Ceramic Shield Orb across standby & gravity play modes.
+ */
+export function describeOrbModeMeta({ tone = '', playMode = false } = {}) {
+  const statusPrefix = tone === 'blocked'
+    ? '环境存在阻断项'
+    : tone === 'auditing'
+      ? '正在审计环境'
+      : '环境安全';
+
+  if (playMode) {
+    return {
+      ariaLabel: `${statusPrefix}，重力解压球模式运行中，单击弹跳，双击或按 Esc 退出`,
+      title: `${statusPrefix} · 重力解压模式（抓甩 / 挥鼠颠球 / 单击弹跳 · 双击退出）`
+    };
+  }
+
+  return {
+    ariaLabel: `${statusPrefix}，鼠标悬停或按回车展开控制面板，双击进入重力解压模式`,
+    title: `${statusPrefix} · 悬停展开 · 按住拖动 · 双击进入重力解压球`
+  };
+}
+
+/**
+ * Computes GPU-only elastic squash & stretch scale factors from normal impact velocity (px/s).
+ */
+export function computeImpactSquash(normalSpeed, axis = 'y') {
+  const speed = Math.max(0, Number(normalSpeed) || 0);
+  const deform = Math.min(0.22, Math.max(0.04, speed / 2500));
+  const rebound = Number((deform * 0.38).toFixed(3));
+  const d = Number(deform.toFixed(3));
+
+  if (axis === 'x') {
+    return {
+      compress: { sx: Number((1 - d).toFixed(3)), sy: Number((1 + d).toFixed(3)) },
+      rebound: { sx: Number((1 + rebound).toFixed(3)), sy: Number((1 - rebound).toFixed(3)) }
+    };
+  }
+  return {
+    compress: { sx: Number((1 + d).toFixed(3)), sy: Number((1 - d).toFixed(3)) },
+    rebound: { sx: Number((1 - rebound).toFixed(3)), sy: Number((1 + rebound).toFixed(3)) }
   };
 }
