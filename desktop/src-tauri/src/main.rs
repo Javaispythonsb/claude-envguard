@@ -73,6 +73,7 @@ struct SavedDock {
 struct DockStatePayload {
     edge: DockEdge,
     tucked: bool,
+    seam: bool,
     idle: bool,
     pinned: bool,
     preview: DockEdge,
@@ -80,17 +81,24 @@ struct DockStatePayload {
 
 struct DockInner {
     edge: DockEdge,
+    dock_x: i32,
+    dock_y: i32,
+    work_area: WorkRect,
     tucked: bool,
+    seam_mode: bool,
     idle: bool,
     pinned: bool,
     ui_hold: bool,
     preview: DockEdge,
-    user_dragging: bool,
-    hover_ticks: u8,
+    pending_user_move: bool,
+    animating: bool,
+    force_tuck: bool,
+    force_untuck: bool,
+    last_programmatic_target: Option<(i32, i32)>,
     last_move_at: Instant,
     last_hover_at: Instant,
     grace_until: Instant,
-    programmatic_move_until: Instant,
+    ignore_moves_until: Instant,
 }
 
 impl DockInner {
@@ -98,17 +106,29 @@ impl DockInner {
         let now = Instant::now();
         Self {
             edge: DockEdge::Top,
+            dock_x: 0,
+            dock_y: 0,
+            work_area: WorkRect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
             tucked: false,
+            seam_mode: false,
             idle: false,
             pinned: false,
             ui_hold: false,
             preview: DockEdge::None,
-            user_dragging: false,
-            hover_ticks: 0,
+            pending_user_move: false,
+            animating: false,
+            force_tuck: false,
+            force_untuck: false,
+            last_programmatic_target: None,
             last_move_at: now,
             last_hover_at: now,
             grace_until: now + Duration::from_millis(2600),
-            programmatic_move_until: now,
+            ignore_moves_until: now,
         }
     }
 
@@ -116,6 +136,7 @@ impl DockInner {
         DockStatePayload {
             edge: self.edge,
             tucked: self.tucked,
+            seam: self.seam_mode,
             idle: self.idle,
             pinned: self.pinned,
             preview: self.preview,
@@ -557,6 +578,9 @@ fn is_primary_mouse_down() -> bool {
     false
 }
 
+const PEEK_LOGICAL_PX: f64 = 10.0;
+const SNAP_THRESHOLD_LOGICAL_PX: f64 = 48.0;
+
 fn detect_snap_edge(wx: i32, wy: i32, ww: i32, _wh: i32, area: WorkRect, threshold: i32) -> DockEdge {
     let d_top = wy - area.y;
     let d_left = wx - area.x;
@@ -598,36 +622,63 @@ fn snap_window_rect(
     }
 }
 
-fn is_cursor_in_edge_handle(
+fn tucked_window_pos(
+    dock_x: i32,
+    dock_y: i32,
+    ww: i32,
+    wh: i32,
+    area: WorkRect,
+    peek: i32,
+    edge: DockEdge,
+    seam: bool,
+) -> (i32, i32) {
+    if seam {
+        return (dock_x, dock_y);
+    }
+    match edge {
+        DockEdge::Top => (dock_x, area.y - wh + peek),
+        DockEdge::Left => (area.x - ww + peek, dock_y),
+        DockEdge::Right => (area.right() - peek, dock_y),
+        DockEdge::None => (dock_x, dock_y),
+    }
+}
+
+fn is_cursor_in_tucked_handle(
     cx: i32,
     cy: i32,
-    wx: i32,
-    wy: i32,
+    dock_x: i32,
+    dock_y: i32,
     ww: i32,
-    _wh: i32,
+    wh: i32,
+    area: WorkRect,
     scale: f64,
     edge: DockEdge,
 ) -> bool {
-    let depth = (18.0 * scale).round() as i32;
+    let depth = (14.0 * scale).round() as i32;
     match edge {
         DockEdge::Top => {
-            let center_x = wx + ww / 2;
-            let half_w = (104.0 * scale).round() as i32;
+            let center_x = dock_x + ww / 2;
+            let half_w = (84.0 * scale).round() as i32;
             cx >= center_x - half_w
                 && cx <= center_x + half_w
-                && cy >= wy - 4
-                && cy <= wy + depth
+                && cy >= area.y - 4
+                && cy <= area.y + depth
         }
         DockEdge::Left => {
-            let top_y = wy + (16.0 * scale).round() as i32;
-            let bot_y = wy + (148.0 * scale).round() as i32;
-            cx >= wx - 4 && cx <= wx + depth && cy >= top_y && cy <= bot_y
+            let center_y = dock_y + wh / 2;
+            let half_h = (54.0 * scale).round() as i32;
+            cx >= area.x - 4
+                && cx <= area.x + depth
+                && cy >= center_y - half_h
+                && cy <= center_y + half_h
         }
         DockEdge::Right => {
-            let top_y = wy + (16.0 * scale).round() as i32;
-            let bot_y = wy + (148.0 * scale).round() as i32;
-            let right_x = wx + ww;
-            cx >= right_x - depth && cx <= right_x + 4 && cy >= top_y && cy <= bot_y
+            let center_y = dock_y + wh / 2;
+            let half_h = (54.0 * scale).round() as i32;
+            cx >= area.right() - depth
+                && cx <= area.right() + 4
+                && cy >= center_y - half_h
+                && cy <= center_y + half_h
         }
         DockEdge::None => false,
     }
@@ -635,6 +686,37 @@ fn is_cursor_in_edge_handle(
 
 fn is_cursor_in_pod(cx: i32, cy: i32, wx: i32, wy: i32, ww: i32, wh: i32, pad: i32) -> bool {
     cx >= wx - pad && cx <= wx + ww + pad && cy >= wy - pad && cy <= wy + wh + pad
+}
+
+fn has_adjacent_monitor_beyond_edge(
+    window: &WebviewWindow,
+    dock_x: i32,
+    dock_y: i32,
+    ww: i32,
+    wh: i32,
+    area: WorkRect,
+    edge: DockEdge,
+) -> bool {
+    let probe = match edge {
+        DockEdge::Top => (dock_x + ww / 2, area.y - 24),
+        DockEdge::Left => (area.x - 24, dock_y + wh / 2),
+        DockEdge::Right => (area.right() + 24, dock_y + wh / 2),
+        DockEdge::None => return false,
+    };
+    let Ok(monitors) = window.available_monitors() else {
+        return false;
+    };
+    monitors.iter().any(|m| {
+        let p = m.position();
+        let s = m.size();
+        let rect = WorkRect {
+            x: p.x,
+            y: p.y,
+            w: s.width as i32,
+            h: s.height as i32,
+        };
+        rect.contains_point(probe.0, probe.1)
+    })
 }
 
 fn dock_state_file_path() -> Option<PathBuf> {
@@ -685,8 +767,52 @@ fn monitor_work_rect(window: &WebviewWindow, ref_x: i32, ref_y: i32) -> Option<W
     })
 }
 
+fn set_programmatic_pos(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, x: i32, y: i32) {
+    {
+        let mut st = dock.lock().unwrap();
+        st.last_programmatic_target = Some((x, y));
+        st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+}
+
+fn glide_window(
+    window: &WebviewWindow,
+    dock: &Arc<Mutex<DockInner>>,
+    from: (i32, i32),
+    to: (i32, i32),
+    steps: u32,
+    step_ms: u64,
+) {
+    if from == to {
+        return;
+    }
+    {
+        let mut st = dock.lock().unwrap();
+        st.animating = true;
+    }
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let x = (from.0 as f64 + (to.0 - from.0) as f64 * eased).round() as i32;
+        let y = (from.1 as f64 + (to.1 - from.1) as f64 * eased).round() as i32;
+        set_programmatic_pos(window, dock, x, y);
+        if i < steps {
+            std::thread::sleep(Duration::from_millis(step_ms));
+        }
+    }
+    let mut st = dock.lock().unwrap();
+    st.animating = false;
+    st.last_programmatic_target = Some(to);
+    st.ignore_moves_until = Instant::now() + Duration::from_millis(280);
+}
+
 fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persist: bool) {
-    let ww = window.outer_size().map(|s| s.width as i32).unwrap_or(588);
+    let size = window
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(540, 128));
+    let ww = size.width as i32;
+    let wh = size.height as i32;
     let mon = window
         .primary_monitor()
         .ok()
@@ -694,23 +820,35 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
         .or_else(|| window.current_monitor().ok().flatten());
     if let Some(m) = mon {
         let wa = m.work_area();
-        let x = wa.position.x + ((wa.size.width as i32 - ww) / 2).max(0);
-        let y = wa.position.y;
+        let area = WorkRect {
+            x: wa.position.x,
+            y: wa.position.y,
+            w: wa.size.width as i32,
+            h: wa.size.height as i32,
+        };
+        let x = area.x + ((area.w - ww) / 2).max(0);
+        let y = area.y;
+        let seam = has_adjacent_monitor_beyond_edge(window, x, y, ww, wh, area, DockEdge::Top);
         let now = Instant::now();
         let payload = {
             let mut st = dock.lock().unwrap();
             st.edge = DockEdge::Top;
+            st.dock_x = x;
+            st.dock_y = y;
+            st.work_area = area;
+            st.seam_mode = seam;
             st.tucked = false;
             st.idle = false;
             st.preview = DockEdge::None;
-            st.hover_ticks = 0;
+            st.pending_user_move = false;
+            st.force_tuck = false;
+            st.force_untuck = false;
             st.last_hover_at = now;
             st.grace_until = now + Duration::from_millis(2800);
-            st.programmatic_move_until = now + Duration::from_millis(300);
             st.payload()
         };
         let _ = window.set_ignore_cursor_events(false);
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+        set_programmatic_pos(window, dock, x, y);
         if persist {
             persist_saved_dock(&SavedDock {
                 x,
@@ -724,7 +862,9 @@ fn place_top_center(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>, persis
 
 fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
     let _ = window.set_always_on_top(true);
-    let size = window.outer_size().unwrap_or(tauri::PhysicalSize::new(588, 176));
+    let size = window
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(540, 128));
     let ww = size.width as i32;
     let wh = size.height as i32;
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -743,24 +883,56 @@ fn init_window_dock(window: &WebviewWindow, dock: &Arc<Mutex<DockInner>>) {
                     DockEdge::Right => (area.right() - ww, saved.y.clamp(min_y, max_y)),
                     DockEdge::None => (saved.x.clamp(min_x, max_x), saved.y.clamp(min_y, max_y)),
                 };
+                let seam =
+                    has_adjacent_monitor_beyond_edge(window, x, y, ww, wh, area, saved.edge);
                 let now = Instant::now();
                 {
                     let mut st = dock.lock().unwrap();
                     st.edge = saved.edge;
+                    st.dock_x = x;
+                    st.dock_y = y;
+                    st.work_area = area;
+                    st.seam_mode = seam;
                     st.tucked = false;
                     st.idle = false;
                     st.last_hover_at = now;
                     st.grace_until = now + Duration::from_millis(2600);
-                    st.programmatic_move_until = now + Duration::from_millis(300);
                 }
                 let _ = window.set_ignore_cursor_events(false);
-                let _ = window.set_position(PhysicalPosition::new(x, y));
+                set_programmatic_pos(window, dock, x, y);
                 return;
             }
         }
     }
 
     place_top_center(window, dock, false);
+}
+
+enum WatcherAction {
+    None,
+    Snap {
+        to: (i32, i32),
+        saved: SavedDock,
+        payload: DockStatePayload,
+    },
+    AdjustOnScreen {
+        to: (i32, i32),
+    },
+    Tuck {
+        from: (i32, i32),
+        edge: DockEdge,
+        dock_x: i32,
+        dock_y: i32,
+        area: WorkRect,
+        seam: bool,
+        peek: i32,
+    },
+    Untuck {
+        from: (i32, i32),
+        to: (i32, i32),
+        payload: DockStatePayload,
+    },
+    EmitOnly(DockStatePayload),
 }
 
 fn start_dock_watcher(
@@ -770,7 +942,7 @@ fn start_dock_watcher(
 ) {
     std::thread::spawn(move || {
         while !quitting.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(Duration::from_millis(35));
             if quitting.load(Ordering::SeqCst) {
                 break;
             }
@@ -791,115 +963,165 @@ fn start_dock_watcher(
             let ww = wsize.width as i32;
             let wh = wsize.height as i32;
             let scale = window.scale_factor().unwrap_or(1.0);
-            let mouse_down = is_primary_mouse_down();
-
-            let Some(area) = monitor_work_rect(&window, wx + ww / 2, wy + (wh.min(180)) / 2) else {
-                continue;
-            };
-            let threshold = (38.0 * scale).round() as i32;
+            let peek = (PEEK_LOGICAL_PX * scale).round() as i32;
+            let threshold = (SNAP_THRESHOLD_LOGICAL_PX * scale).round() as i32;
             let margin = (8.0 * scale).round() as i32;
+            let mouse_down = is_primary_mouse_down();
             let now = Instant::now();
 
-            let mut emit_payload: Option<DockStatePayload> = None;
-            let mut move_to: Option<(i32, i32)> = None;
-            let mut ignore_cursor: Option<bool> = None;
-            let mut save_dock: Option<SavedDock> = None;
+            let mut action = WatcherAction::None;
 
             {
                 let mut st = dock.lock().unwrap();
-                if st.user_dragging {
+                if st.animating {
+                    continue;
+                }
+
+                if st.force_untuck && st.tucked {
+                    st.force_untuck = false;
+                    st.force_tuck = false;
+                    st.tucked = false;
+                    st.idle = false;
+                    st.last_hover_at = now;
+                    st.grace_until = now + Duration::from_millis(2400);
+                    let to = (st.dock_x, st.dock_y);
+                    action = WatcherAction::Untuck {
+                        from: (wx, wy),
+                        to,
+                        payload: st.payload(),
+                    };
+                } else if st.force_tuck && !st.tucked && st.edge != DockEdge::None {
+                    st.force_tuck = false;
+                    st.pinned = false;
+                    st.ui_hold = false;
+                    action = WatcherAction::Tuck {
+                        from: (wx, wy),
+                        edge: st.edge,
+                        dock_x: st.dock_x,
+                        dock_y: st.dock_y,
+                        area: st.work_area,
+                        seam: st.seam_mode,
+                        peek,
+                    };
+                } else if st.pending_user_move {
+                    let live_area = monitor_work_rect(&window, wx + ww / 2, wy + (wh.min(160)) / 2)
+                        .unwrap_or(st.work_area);
                     if mouse_down {
-                        let prev = detect_snap_edge(wx, wy, ww, wh, area, threshold);
+                        let prev = detect_snap_edge(wx, wy, ww, wh, live_area, threshold);
                         if prev != st.preview {
                             st.preview = prev;
-                            emit_payload = Some(st.payload());
+                            action = WatcherAction::EmitOnly(st.payload());
                         }
-                    } else if now.duration_since(st.last_move_at) >= Duration::from_millis(70) {
-                        st.user_dragging = false;
+                    } else {
+                        st.pending_user_move = false;
                         st.preview = DockEdge::None;
                         let (sx, sy, new_edge) =
-                            snap_window_rect(wx, wy, ww, wh, area, threshold, margin);
+                            snap_window_rect(wx, wy, ww, wh, live_area, threshold, margin);
+                        let seam = has_adjacent_monitor_beyond_edge(
+                            &window, sx, sy, ww, wh, live_area, new_edge,
+                        );
                         st.edge = new_edge;
+                        st.dock_x = sx;
+                        st.dock_y = sy;
+                        st.work_area = live_area;
+                        st.seam_mode = seam;
                         st.tucked = false;
                         st.idle = false;
-                        st.hover_ticks = 0;
                         st.last_hover_at = now;
-                        st.grace_until = now + Duration::from_millis(1500);
-                        if (sx, sy) != (wx, wy) {
-                            st.programmatic_move_until = now + Duration::from_millis(260);
-                            move_to = Some((sx, sy));
-                        }
-                        ignore_cursor = Some(false);
-                        save_dock = Some(SavedDock {
-                            x: sx,
-                            y: sy,
-                            edge: new_edge,
-                        });
-                        emit_payload = Some(st.payload());
+                        st.grace_until = now + Duration::from_millis(1400);
+                        action = WatcherAction::Snap {
+                            to: (sx, sy),
+                            saved: SavedDock {
+                                x: sx,
+                                y: sy,
+                                edge: new_edge,
+                            },
+                            payload: st.payload(),
+                        };
                     }
                 } else {
-                    // Keep Right edge pixel-flush and prevent tall drawers from clipping below taskbar
-                    if !st.tucked && now >= st.programmatic_move_until {
-                        let mut target_x = wx;
-                        let mut target_y = wy;
-                        if st.edge == DockEdge::Right && (wx + ww - area.right()).abs() > 2 {
-                            target_x = area.right() - ww;
-                        }
-                        if st.edge != DockEdge::Top && wy + wh > area.bottom() - margin {
-                            target_y = (area.bottom() - wh - margin).max(area.y);
-                        }
-                        if (target_x, target_y) != (wx, wy) {
-                            st.programmatic_move_until = now + Duration::from_millis(220);
-                            move_to = Some((target_x, target_y));
-                        }
-                    }
-
                     match st.edge {
                         DockEdge::Top | DockEdge::Left | DockEdge::Right => {
                             if st.tucked {
                                 if !mouse_down
-                                    && is_cursor_in_edge_handle(
-                                        cx, cy, wx, wy, ww, wh, scale, st.edge,
+                                    && is_cursor_in_tucked_handle(
+                                        cx,
+                                        cy,
+                                        st.dock_x,
+                                        st.dock_y,
+                                        ww,
+                                        wh,
+                                        st.work_area,
+                                        scale,
+                                        st.edge,
                                     )
                                 {
                                     st.tucked = false;
                                     st.idle = false;
-                                    st.hover_ticks = 0;
                                     st.last_hover_at = now;
                                     st.grace_until = now + Duration::from_millis(900);
-                                    ignore_cursor = Some(false);
-                                    emit_payload = Some(st.payload());
+                                    let to = (st.dock_x, st.dock_y);
+                                    action = WatcherAction::Untuck {
+                                        from: (wx, wy),
+                                        to,
+                                        payload: st.payload(),
+                                    };
                                 }
                             } else {
-                                let pad = (8.0 * scale).round() as i32;
-                                let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                                if inside || st.pinned || st.ui_hold {
-                                    st.last_hover_at = now;
-                                } else if now >= st.grace_until
-                                    && now.duration_since(st.last_hover_at)
-                                        >= Duration::from_millis(1350)
+                                // Keep docked edge flush and prevent tall drawers from overflowing taskbar
+                                let area = st.work_area;
+                                let mut target_x = wx;
+                                let mut target_y = wy;
+                                if st.edge == DockEdge::Right && (wx + ww - area.right()).abs() > 2
                                 {
-                                    st.tucked = true;
-                                    st.idle = true;
-                                    st.hover_ticks = 0;
-                                    ignore_cursor = Some(true);
-                                    emit_payload = Some(st.payload());
+                                    target_x = area.right() - ww;
+                                    st.dock_x = target_x;
+                                } else if st.edge == DockEdge::Left && (wx - area.x).abs() > 2 {
+                                    target_x = area.x;
+                                    st.dock_x = target_x;
+                                } else if st.edge == DockEdge::Top && (wy - area.y).abs() > 2 {
+                                    target_y = area.y;
+                                    st.dock_y = target_y;
+                                }
+                                if st.edge != DockEdge::Top && wy + wh > area.bottom() - margin {
+                                    target_y = (area.bottom() - wh - margin).max(area.y);
+                                }
+                                if (target_x, target_y) != (wx, wy)
+                                    && now >= st.ignore_moves_until
+                                {
+                                    action = WatcherAction::AdjustOnScreen {
+                                        to: (target_x, target_y),
+                                    };
+                                } else {
+                                    let pad = (8.0 * scale).round() as i32;
+                                    let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
+                                    if inside || st.pinned || st.ui_hold || mouse_down {
+                                        st.last_hover_at = now;
+                                    } else if now >= st.grace_until
+                                        && now.duration_since(st.last_hover_at)
+                                            >= Duration::from_millis(1200)
+                                    {
+                                        action = WatcherAction::Tuck {
+                                            from: (wx, wy),
+                                            edge: st.edge,
+                                            dock_x: st.dock_x,
+                                            dock_y: st.dock_y,
+                                            area: st.work_area,
+                                            seam: st.seam_mode,
+                                            peek,
+                                        };
+                                    }
                                 }
                             }
                         }
                         DockEdge::None => {
-                            if st.tucked {
-                                st.tucked = false;
-                                ignore_cursor = Some(false);
-                                emit_payload = Some(st.payload());
-                            }
                             let pad = (6.0 * scale).round() as i32;
                             let inside = is_cursor_in_pod(cx, cy, wx, wy, ww, wh, pad);
-                            if inside || st.pinned || st.ui_hold {
+                            if inside || st.pinned || st.ui_hold || mouse_down {
                                 st.last_hover_at = now;
                                 if st.idle {
                                     st.idle = false;
-                                    emit_payload = Some(st.payload());
+                                    action = WatcherAction::EmitOnly(st.payload());
                                 }
                             } else if !st.idle
                                 && now >= st.grace_until
@@ -907,24 +1129,67 @@ fn start_dock_watcher(
                                     >= Duration::from_millis(2200)
                             {
                                 st.idle = true;
-                                emit_payload = Some(st.payload());
+                                action = WatcherAction::EmitOnly(st.payload());
                             }
                         }
                     }
                 }
             }
 
-            if let Some((tx, ty)) = move_to {
-                let _ = window.set_position(PhysicalPosition::new(tx, ty));
-            }
-            if let Some(ig) = ignore_cursor {
-                let _ = window.set_ignore_cursor_events(ig);
-            }
-            if let Some(saved) = save_dock {
-                persist_saved_dock(&saved);
-            }
-            if let Some(payload) = emit_payload {
-                let _ = window.emit("dock-state", payload);
+            match action {
+                WatcherAction::None => {}
+                WatcherAction::EmitOnly(payload) => {
+                    let _ = window.emit("dock-state", payload);
+                }
+                WatcherAction::AdjustOnScreen { to } => {
+                    set_programmatic_pos(&window, &dock, to.0, to.1);
+                }
+                WatcherAction::Snap { to, saved, payload } => {
+                    let _ = window.set_ignore_cursor_events(false);
+                    if let Ok(cur_pos) = window.outer_position() {
+                        if (cur_pos.x, cur_pos.y) != to {
+                            glide_window(&window, &dock, (cur_pos.x, cur_pos.y), to, 6, 14);
+                        }
+                    }
+                    persist_saved_dock(&saved);
+                    let _ = window.emit("dock-state", payload);
+                }
+                WatcherAction::Tuck {
+                    from,
+                    edge,
+                    dock_x,
+                    dock_y,
+                    area,
+                    seam,
+                    peek,
+                } => {
+                    // Collapse any open drawer first so collapsed capsule dimensions are cleanly used
+                    let _ = window.emit("collapse-drawers", ());
+                    std::thread::sleep(Duration::from_millis(45));
+                    let fresh_size = window.outer_size().unwrap_or(wsize);
+                    let f_ww = fresh_size.width as i32;
+                    let f_wh = fresh_size.height as i32;
+                    let cur_from = window
+                        .outer_position()
+                        .map(|p| (p.x, p.y))
+                        .unwrap_or(from);
+                    let target =
+                        tucked_window_pos(dock_x, dock_y, f_ww, f_wh, area, peek, edge, seam);
+                    glide_window(&window, &dock, cur_from, target, 10, 15);
+                    let payload = {
+                        let mut st = dock.lock().unwrap();
+                        st.tucked = true;
+                        st.idle = true;
+                        st.payload()
+                    };
+                    let _ = window.set_ignore_cursor_events(true);
+                    let _ = window.emit("dock-state", payload);
+                }
+                WatcherAction::Untuck { from, to, payload } => {
+                    let _ = window.set_ignore_cursor_events(false);
+                    let _ = window.emit("dock-state", payload);
+                    glide_window(&window, &dock, from, to, 10, 14);
+                }
             }
         }
     });
@@ -946,21 +1211,25 @@ fn set_dock_hold(dock: State<'_, DockController>, hold: bool) {
 
 #[tauri::command]
 fn set_dock_pinned(app: AppHandle, dock: State<'_, DockController>, pinned: bool) -> DockStatePayload {
-    let payload = {
+    let (was_tucked, payload) = {
         let mut st = dock.inner.lock().unwrap();
+        let prev_tucked = st.tucked;
         st.pinned = pinned;
         st.last_hover_at = Instant::now();
-        if pinned {
-            st.tucked = false;
+        if pinned && prev_tucked {
+            st.force_untuck = true;
+        } else if pinned {
             st.idle = false;
         }
-        st.payload()
+        (prev_tucked, st.payload())
     };
-    if let Some(window) = app.get_webview_window("main") {
-        if pinned {
-            let _ = window.set_ignore_cursor_events(false);
+    if !was_tucked {
+        if let Some(window) = app.get_webview_window("main") {
+            if pinned {
+                let _ = window.set_ignore_cursor_events(false);
+            }
+            let _ = window.emit("dock-state", payload.clone());
         }
-        let _ = window.emit("dock-state", payload.clone());
     }
     payload
 }
@@ -970,44 +1239,43 @@ fn tuck_or_hide(app: AppHandle, dock: State<'_, DockController>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
-    let mut tuck_payload: Option<DockStatePayload> = None;
-    {
+    let should_hide = {
         let mut st = dock.inner.lock().unwrap();
         if st.edge != DockEdge::None {
-            st.pinned = false;
-            st.ui_hold = false;
-            st.tucked = true;
-            st.idle = true;
-            st.hover_ticks = 0;
-            tuck_payload = Some(st.payload());
+            st.force_tuck = true;
+            false
+        } else {
+            true
         }
-    }
-    if let Some(payload) = tuck_payload {
-        let _ = window.set_ignore_cursor_events(true);
-        let _ = window.emit("dock-state", payload);
-    } else {
+    };
+    if should_hide {
         let _ = window.hide();
     }
 }
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let payload = {
+        let mut immediate_payload: Option<DockStatePayload> = None;
+        {
             let dock = app.state::<DockController>();
             let mut st = dock.inner.lock().unwrap();
             let now = Instant::now();
-            st.tucked = false;
-            st.idle = false;
-            st.hover_ticks = 0;
             st.last_hover_at = now;
             st.grace_until = now + Duration::from_millis(3200);
-            st.payload()
-        };
+            if st.tucked {
+                st.force_untuck = true;
+            } else {
+                st.idle = false;
+                immediate_payload = Some(st.payload());
+            }
+        }
         let _ = window.set_ignore_cursor_events(false);
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        let _ = window.emit("dock-state", payload);
+        if let Some(payload) = immediate_payload {
+            let _ = window.emit("dock-state", payload);
+        }
     }
 }
 
@@ -1119,26 +1387,27 @@ fn main() {
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 match event {
-                    WindowEvent::Moved(_) => {
-                        if is_primary_mouse_down() {
-                            let dock = window.app_handle().state::<DockController>();
-                            let now = Instant::now();
-                            let mut untuck = false;
-                            {
-                                let mut st = dock.inner.lock().unwrap();
-                                if now >= st.programmatic_move_until {
-                                    st.user_dragging = true;
-                                    st.last_move_at = now;
-                                    st.last_hover_at = now;
-                                    if st.tucked {
-                                        st.tucked = false;
-                                        untuck = true;
-                                    }
+                    WindowEvent::Moved(pos) => {
+                        let dock = window.app_handle().state::<DockController>();
+                        let now = Instant::now();
+                        let mut untuck = false;
+                        {
+                            let mut st = dock.inner.lock().unwrap();
+                            let is_prog = st.animating
+                                || now < st.ignore_moves_until
+                                || st.last_programmatic_target == Some((pos.x, pos.y));
+                            if !is_prog {
+                                st.pending_user_move = true;
+                                st.last_move_at = now;
+                                st.last_hover_at = now;
+                                if st.tucked {
+                                    st.tucked = false;
+                                    untuck = true;
                                 }
                             }
-                            if untuck {
-                                let _ = window.set_ignore_cursor_events(false);
-                            }
+                        }
+                        if untuck {
+                            let _ = window.set_ignore_cursor_events(false);
                         }
                     }
                     WindowEvent::CloseRequested { api, .. } => {
@@ -1268,44 +1537,83 @@ mod tests {
     }
 
     #[test]
-    fn edge_snap_and_clamp_geometry() {
+    fn edge_snap_and_tuck_positions_for_all_three_edges() {
         let area = WorkRect {
             x: 0,
             y: 0,
-            w: 1920,
-            h: 1040,
+            w: 2560,
+            h: 1400,
         };
-        // Dragged near top-center -> snaps flush to Top (y = 0)
+        // Dragged near top -> snaps flush to Top (y = 0) and tucks upward leaving 10px peek
         assert_eq!(
-            snap_window_rect(650, 22, 588, 176, area, 38, 8),
-            (650, 0, DockEdge::Top)
+            snap_window_rect(1010, 26, 540, 128, area, 48, 8),
+            (1010, 0, DockEdge::Top)
         );
-        // Dragged near right edge -> snaps flush to Right (x = 1920 - 588 = 1332)
         assert_eq!(
-            snap_window_rect(1355, 320, 588, 176, area, 38, 8),
-            (1332, 320, DockEdge::Right)
+            tucked_window_pos(1010, 0, 540, 128, area, 10, DockEdge::Top, false),
+            (1010, -118)
         );
-        // Dragged near left edge -> snaps flush to Left (x = 0)
+
+        // Dragged near right edge -> snaps flush to Right (x = 2560 - 540 = 2020) and tucks rightward to x = 2550
         assert_eq!(
-            snap_window_rect(-12, 400, 588, 176, area, 38, 8),
-            (0, 400, DockEdge::Left)
+            snap_window_rect(2005, 520, 540, 128, area, 48, 8),
+            (2020, 520, DockEdge::Right)
         );
+        assert_eq!(
+            tucked_window_pos(2020, 520, 540, 128, area, 10, DockEdge::Right, false),
+            (2550, 520)
+        );
+
+        // Dragged near left edge -> snaps flush to Left (x = 0) and tucks leftward to x = -530
+        assert_eq!(
+            snap_window_rect(18, 480, 540, 128, area, 48, 8),
+            (0, 480, DockEdge::Left)
+        );
+        assert_eq!(
+            tucked_window_pos(0, 480, 540, 128, area, 10, DockEdge::Left, false),
+            (-530, 480)
+        );
+
         // Dragged to center -> stays free-floating (DockEdge::None)
         assert_eq!(
-            snap_window_rect(600, 300, 588, 176, area, 38, 8),
-            (600, 300, DockEdge::None)
+            snap_window_rect(800, 450, 540, 128, area, 48, 8),
+            (800, 450, DockEdge::None)
         );
     }
 
     #[test]
-    fn edge_handle_trigger_zones() {
-        // Top docked at (666, 0), width 588 -> center_x = 960, handle trigger x in [856..1064], y in [-4..18]
-        assert!(is_cursor_in_edge_handle(960, 2, 666, 0, 588, 176, 1.0, DockEdge::Top));
-        assert!(!is_cursor_in_edge_handle(1910, 2, 666, 0, 588, 176, 1.0, DockEdge::Top));
-        assert!(!is_cursor_in_edge_handle(960, 40, 666, 0, 588, 176, 1.0, DockEdge::Top));
+    fn edge_handle_trigger_zones_top_left_right() {
+        let area = WorkRect {
+            x: 0,
+            y: 0,
+            w: 2560,
+            h: 1400,
+        };
+        // Top docked at (1010, 0), width 540 -> center_x = 1280
+        assert!(is_cursor_in_tucked_handle(
+            1280, 2, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+        ));
+        assert!(!is_cursor_in_tucked_handle(
+            2400, 2, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+        ));
+        assert!(!is_cursor_in_tucked_handle(
+            1280, 35, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+        ));
 
-        // Right docked at (1332, 200), width 588 -> right_x = 1920, y in [216..348]
-        assert!(is_cursor_in_edge_handle(1918, 260, 1332, 200, 588, 176, 1.0, DockEdge::Right));
-        assert!(!is_cursor_in_edge_handle(1918, 500, 1332, 200, 588, 176, 1.0, DockEdge::Right));
+        // Left docked at (0, 500), height 128 -> center_y = 564, x in [-4..14]
+        assert!(is_cursor_in_tucked_handle(
+            3, 560, 0, 500, 540, 128, area, 1.0, DockEdge::Left
+        ));
+        assert!(!is_cursor_in_tucked_handle(
+            3, 900, 0, 500, 540, 128, area, 1.0, DockEdge::Left
+        ));
+
+        // Right docked at (2020, 500), height 128 -> center_y = 564, x in [2546..2564]
+        assert!(is_cursor_in_tucked_handle(
+            2557, 560, 2020, 500, 540, 128, area, 1.0, DockEdge::Right
+        ));
+        assert!(!is_cursor_in_tucked_handle(
+            2557, 200, 2020, 500, 540, 128, area, 1.0, DockEdge::Right
+        ));
     }
 }

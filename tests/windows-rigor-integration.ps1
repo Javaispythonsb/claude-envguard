@@ -142,14 +142,17 @@ try {
     $out = (@(Invoke-Check) -join "`n")
     Assert '时区开关打开且判 fail 时门禁仍阻断' ($script:exitCode -eq 1 -and $out -eq 'FAIL:时区') "输出=$out"
 
-    # 同时核验 uistate.ready 与 Invoke-Check 门禁完全一致
+    # 同时核验 uistate.ready / uistate.needs_fix 与 Invoke-Check 门禁完全一致
     $lastCheckFile = Join-Path $BASE 'last-check.txt'
     [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -eq '保镖') { "$_=warn:旧策略" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
     $uiBlocked = (Invoke-UiState $false) | ConvertFrom-Json
-    Assert '硬性项 warn 时 uistate.ready 为 false' ($uiBlocked.ready -eq $false)
-    [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -in @('时区', '地区')) { "$_=skip:用户已禁用" } elseif ($_ -eq 'WebRTC') { "$_=warn:未确认" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
+    Assert '硬性项 warn 时 uistate.ready 为 false 且 needs_fix 为 true' ($uiBlocked.ready -eq $false -and $uiBlocked.needs_fix -eq $true)
+    [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -in @('时区', '地区')) { "$_=skip:用户已禁用" } elseif ($_ -in @('客户端语言', 'ASN属性')) { "$_=warn:提示信息" } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
     $uiReady = (Invoke-UiState $false) | ConvertFrom-Json
-    Assert '时区与地区 skip 且 6 项硬性全 ok 时 uistate.ready 为 true' ($uiReady.ready -eq $true)
+    Assert '时区与地区 skip 且仅含纯提示 warn 时 ready=true 且 needs_fix=false' ($uiReady.ready -eq $true -and $uiReady.needs_fix -eq $false)
+    [System.IO.File]::WriteAllLines($lastCheckFile, [string[]]@($allChecks | ForEach-Object { if ($_ -eq 'DNS') { 'DNS=warn:非关键失败已忽略(经国内解析器)' } else { "$_=ok" } }), (New-Object System.Text.UTF8Encoding($true)))
+    $uiSoftFail = (Invoke-UiState $false) | ConvertFrom-Json
+    Assert '可修复可选项被降级为 warn 时 ready=true 但 needs_fix 仍为 true' ($uiSoftFail.ready -eq $true -and $uiSoftFail.needs_fix -eq $true)
 
     Set-Item -Path function:Invoke-CheckDetail -Value $realCheckDetail
 

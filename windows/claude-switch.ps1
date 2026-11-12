@@ -3623,10 +3623,18 @@ function Invoke-UiState([bool]$Fresh = $false) {
     $ready = ($checks.Count -eq 14) -and
         (-not @($checks | Where-Object { $_.state -eq 'fail' }).Count) -and
         (-not @($HARD_CHECKS | Where-Object { $stateMap[$_] -ne 'ok' }).Count)
+    $fixableOpt = @('时区','地区','DNS','WebRTC','生态可达性')
+    $needsFix = ($checks.Count -eq 14) -and (
+        (-not $ready) -or
+        [bool](@($checks | Where-Object {
+            ($fixableOpt -contains $_.name) -and $_.state -eq 'warn' -and ([string]$_.detail).StartsWith('非关键失败已忽略')
+        }).Count)
+    )
     $stateObj = [ordered]@{
         schema_version = 1
         version        = (Get-AppVersion)
         ready          = [bool]$ready
+        needs_fix      = [bool]$needsFix
         hard_checks    = $HARD_CHECKS
         proxy_mode     = $PROXY_MODE
         clients        = @('clash-verge','flclash','sing-box','clashx','surge','wireguard','other','auto')

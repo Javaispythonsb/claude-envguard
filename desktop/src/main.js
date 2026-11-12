@@ -3,7 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { runMobileSelfCheck } from './mobile-check.js';
 
-const POD_WIDTH = 588;
+const POD_WIDTH = 540;
+const FIXABLE_OPTIONAL = new Set(['时区', '地区', 'DNS', 'WebRTC', '生态可达性']);
 
 const CHECK_SPECS = [
   { key: '代理内核', label: '代理内核', hard: true },
@@ -55,9 +56,9 @@ let defaultSubLine = '检测网络与保镖状态';
 let activeDrawer = null;
 let lastPodHeight = 0;
 let isPinned = false;
+let isTucked = false;
 let focusHoldCount = 0;
 let shieldArmed = false;
-let tuckFoldTimer = null;
 
 function maskDisplayIp(text) {
   return String(text || '').replace(/\b(?!198\.1[89]\.)(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b/g, '$1.$2.*.*');
@@ -86,13 +87,15 @@ function applyDockPayload(payload) {
   if (!payload) return;
   const root = document.documentElement;
   const edge = payload.edge || 'none';
-  const tucked = Boolean(payload.tucked);
+  isTucked = Boolean(payload.tucked);
+  const seam = Boolean(payload.seam);
   const idle = Boolean(payload.idle);
   const preview = payload.preview || 'none';
   isPinned = Boolean(payload.pinned);
 
   root.setAttribute('data-dock', edge);
-  root.setAttribute('data-tucked', String(tucked));
+  root.setAttribute('data-tucked', String(isTucked));
+  root.setAttribute('data-seam', String(seam));
   root.setAttribute('data-idle', String(idle));
   root.setAttribute('data-preview', preview);
 
@@ -109,22 +112,16 @@ function applyDockPayload(payload) {
     closeBtn.title = edge === 'none' ? '隐藏到系统托盘 (Esc)' : '收起至屏幕边缘 (Esc)';
   }
 
-  clearTimeout(tuckFoldTimer);
-  if (tucked && activeDrawer) {
-    // Collapse any open drawer invisibly after the retract transition finishes
-    tuckFoldTimer = setTimeout(() => {
-      if (document.documentElement.getAttribute('data-tucked') === 'true' && activeDrawer) {
-        toggleDrawer(null);
-      }
-    }, 260);
+  if (!isTucked) {
+    requestAnimationFrame(syncPodHeight);
   }
 }
 
 function syncPodHeight() {
-  if (!isTauri) return;
+  if (!isTauri || isTucked) return;
   const stage = document.getElementById('pcApp');
   if (!stage) return;
-  const h = Math.max(148, Math.ceil(stage.offsetHeight));
+  const h = Math.max(114, Math.ceil(stage.offsetHeight));
   if (Math.abs(h - lastPodHeight) < 2) return;
   lastPodHeight = h;
   getCurrentWindow().setSize(new LogicalSize(POD_WIDTH, h)).catch(() => {});
@@ -156,12 +153,27 @@ function syncPortVisibility(mode) {
 
 function setBusyState(busy, label = '') {
   isBusy = busy;
-  for (const id of ['btnRecheck', 'btnFix', 'btnShieldRestore', 'proxyClientSelect', 'btnSavePort', 'btnSaveSettings', 'btnOpenSafe']) {
+  for (const id of ['btnRecheck', 'btnShieldRestore', 'proxyClientSelect', 'btnSavePort', 'btnSaveSettings', 'btnOpenSafe']) {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
+
   const complete = (currentState?.checks || []).length === CHECK_SPECS.length;
   const ready = Boolean(currentState?.environmentReady);
+  const needsFix = Boolean(currentState?.needsFix);
+
+  const fixBtn = document.getElementById('btnFix');
+  if (fixBtn) {
+    const canFix = !busy && needsFix;
+    fixBtn.disabled = !canFix;
+    fixBtn.classList.toggle('attention', canFix);
+    fixBtn.title = busy
+      ? '操作进行中…'
+      : canFix
+        ? '一键自动修复异常项'
+        : '当前环境正常，无需修复';
+  }
+
   const canLaunch = !busy && ready;
   const dBtn = document.getElementById('btnLaunchDesktop');
   const cBtn = document.getElementById('btnLaunchCli');
@@ -257,6 +269,7 @@ function applyUiState(data) {
   }
 
   const blockedNames = [];
+  let downgradedFixable = false;
   CHECK_SPECS.forEach((spec) => {
     const chip = document.querySelector(`.pod-chip[data-ck="${spec.key}"]`);
     const found = map.get(spec.key);
@@ -271,11 +284,18 @@ function applyUiState(data) {
     if (st === 'fail' || (spec.hard && st !== 'ok')) {
       blockedNames.push(spec.label);
     }
+    if (FIXABLE_OPTIONAL.has(spec.key) && st === 'warn' && String(found?.detail || '').startsWith('非关键失败已忽略')) {
+      downgradedFixable = true;
+    }
   });
 
   const complete = (data.checks || []).length === CHECK_SPECS.length;
   const ready = typeof data.ready === 'boolean' ? (complete && data.ready) : (complete && blockedNames.length === 0);
-  currentState = { ...data, environmentReady: ready };
+  const needsFix = typeof data.needs_fix === 'boolean'
+    ? (complete && data.needs_fix)
+    : (complete && (!ready || downgradedFixable));
+
+  currentState = { ...data, environmentReady: ready, needsFix };
 
   const gauge = document.getElementById('ringGauge');
   const rIcon = document.getElementById('ringIcon');
@@ -306,6 +326,7 @@ function applyUiState(data) {
     defaultSubLine = `${cc} · ${clientName} · ${guardState}`;
   }
   setSubStatus(defaultSubLine, false);
+  setBusyState(isBusy);
   requestAnimationFrame(syncPodHeight);
 }
 
@@ -420,8 +441,10 @@ function wireDesktopEvents() {
   });
 
   document.getElementById('btnRecheck').onclick = () => refreshDesktopState(true);
-  document.getElementById('btnFix').onclick = () =>
+  document.getElementById('btnFix').onclick = () => {
+    if (isBusy || !currentState?.needsFix) return;
     handleAction('修复', () => invoke('run_fix'), true);
+  };
   document.getElementById('btnLaunchDesktop').onclick = () =>
     handleAction('启动 Claude', () => invoke('safe_launch', { target: 'desktop' }), false);
   document.getElementById('btnLaunchCli').onclick = () =>
@@ -540,6 +563,10 @@ function wireDesktopEvents() {
       toggleDrawer(null);
     }
   };
+
+  listen('collapse-drawers', () => {
+    if (activeDrawer) toggleDrawer(null);
+  }).catch(() => {});
 
   listen('dock-state', (event) => {
     applyDockPayload(event?.payload);
