@@ -58,9 +58,9 @@ jobs:
         working-directory: desktop
         run: pnpm tauri build
 
-      - name: 组装热更新固件包与 SHA-256 校验清单
+      - name: Package Hot-Update Bundle & SHA-256 Manifest
         if: github.event_name != 'pull_request'
-        shell: powershell
+        shell: pwsh
         env:
           GH_REPO_SLUG: ${{ github.repository }}
         run: |
@@ -99,8 +99,12 @@ jobs:
           $zipPath = Join-Path $outDir 'claude-envguard-windows-x64.zip'
           Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
 
-          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\nsis\*-setup.exe' | Copy-Item -Destination $outDir -Force
-          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\msi\*.msi' | Copy-Item -Destination $outDir -Force
+          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\nsis\*-setup.exe' | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $outDir "Claude-EnvGuard-$ver-x64-setup.exe") -Force
+          }
+          Get-ChildItem -Path 'desktop\src-tauri\target\release\bundle\msi\*.msi' | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $outDir "Claude-EnvGuard-$ver-x64-zh-CN.msi") -Force
+          }
 
           $sumLines = @()
           foreach ($f in Get-ChildItem -LiteralPath $outDir -File | Where-Object { $_.Name -ne 'SHA256SUMS-release.txt' } | Sort-Object Name) {
@@ -118,9 +122,9 @@ jobs:
             desktop/src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
 
-      - name: 自动发布 GitHub 热更新 Release
+      - name: Publish Rolling GitHub Release
         if: github.event_name != 'pull_request'
-        shell: powershell
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REF: ${{ github.ref }}
@@ -134,9 +138,9 @@ jobs:
           $notes = @(
             "### Claude 环境卫士 · EnvGuard v$($info.version) ($($info.short_commit))",
             "",
-            "- **构建提交**: ``$($info.commit)``",
-            "- **提交说明**: $($info.notes)",
-            "- **构建时间**: ``$($info.built_at)``",
+            "- **Commit**: ``$($info.commit)``",
+            "- **Summary**: $($info.notes)",
+            "- **Built At**: ``$($info.built_at)``",
             "",
             "已安装用户可直接在桌面悬浮窗 **「工具 → 检查更新 → 立即热更新」** 一键完成 SHA-256 校验与无缝热替换重启。"
           ) -join "`n"
@@ -150,28 +154,22 @@ jobs:
             git tag -f latest $env:GH_SHA
             git push origin refs/tags/latest --force
 
-            $ErrorActionPreference = 'Continue'
-            gh release view latest *> $null
-            $exists = ($LASTEXITCODE -eq 0)
-            $ErrorActionPreference = 'Stop'
-            if (-not $exists) {
-              gh release create latest @assets --title "Claude 环境卫士 · Latest ($($info.short_commit))" --notes-file $notesFile
+            & gh release view latest *> $null
+            if ($LASTEXITCODE -ne 0) {
+              & gh release create latest @assets --title "Claude EnvGuard · Latest ($($info.short_commit))" --notes-file $notesFile
             } else {
-              gh release upload latest @assets --clobber
-              gh release edit latest --title "Claude 环境卫士 · Latest ($($info.short_commit))" --notes-file $notesFile
+              & gh release upload latest @assets --clobber
+              & gh release edit latest --title "Claude EnvGuard · Latest ($($info.short_commit))" --notes-file $notesFile
             }
           }
 
           if ($env:GH_REF.StartsWith('refs/tags/v')) {
             $tagName = $env:GH_REF_NAME
-            $ErrorActionPreference = 'Continue'
-            gh release view $tagName *> $null
-            $exists = ($LASTEXITCODE -eq 0)
-            $ErrorActionPreference = 'Stop'
-            if (-not $exists) {
-              gh release create $tagName @assets --title "Claude 环境卫士 $tagName" --notes-file $notesFile
+            & gh release view $tagName *> $null
+            if ($LASTEXITCODE -ne 0) {
+              & gh release create $tagName @assets --title "Claude EnvGuard $tagName" --notes-file $notesFile
             } else {
-              gh release upload $tagName @assets --clobber
-              gh release edit $tagName --title "Claude 环境卫士 $tagName" --notes-file $notesFile
+              & gh release upload $tagName @assets --clobber
+              & gh release edit $tagName --title "Claude EnvGuard $tagName" --notes-file $notesFile
             }
           }
