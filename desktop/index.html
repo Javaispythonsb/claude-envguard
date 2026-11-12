@@ -11,300 +11,255 @@
 </head>
 <body>
 
-  <!-- ================= PC DESKTOP TAURI CONSOLE ================= -->
+  <!-- ================= PC DESKTOP CONSOLE ================= -->
   <div class="app" id="pcApp">
     <header class="topbar">
-      <div class="topbar-l">
-        <span class="pulse-dot" id="topDot"></span>
-        <span class="tbar"><b>envguard</b> — launch gate &amp; runtime kill-switch</span>
+      <div class="topbar-brand">
+        <div class="logo">EG</div>
+        <span class="app-title">环境卫士</span>
+        <span class="guard-pill" id="guardPill" title="保镖状态检测中">
+          <span class="dot" id="guardDot"></span>
+          <span id="guardText">保镖检测中</span>
+        </span>
       </div>
+
+      <nav class="nav-tabs" role="tablist" aria-label="主导航">
+        <button type="button" class="tab active" role="tab" aria-selected="true" data-view="overview">总览</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-view="tools">工具</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-view="settings">设置</button>
+      </nav>
+
       <div class="topbar-r">
-        <button class="chip-btn" id="btnSwitchMobileView" title="打开浏览器侧 5 项防漏自检 + 硬件摘要">📱 浏览器侧自检</button>
-        <div class="theme-seg">
-          <button class="tbtn on" data-theme-pick="terminal">终端绿</button>
-          <button class="tbtn" data-theme-pick="cyber">赛博</button>
+        <button type="button" class="chip-btn" id="btnSwitchMobileView" title="浏览器侧防漏自检">
+          <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg>
+          <span>浏览器自检</span>
+        </button>
+        <div class="theme-seg" role="group" aria-label="主题切换">
+          <button type="button" class="tbtn on" data-theme-pick="terminal">绿</button>
+          <button type="button" class="tbtn" data-theme-pick="cyber">霓虹</button>
         </div>
         <span class="ver-tag" id="appVersionTag">v2.0</span>
       </div>
     </header>
 
-    <div class="shell">
-      <aside class="side">
-        <div class="brand">
-          <div class="logo">EG</div>
-          <div>
-            <h1>Claude 环境卫士</h1>
-            <span>ENVGUARD // 启动门禁 · 掉线急停</span>
+    <main class="main">
+
+      <!-- [总览] -->
+      <section class="view active" data-view="overview">
+        <div class="card hero-card">
+          <div class="hero-row">
+            <div class="sicon warn" id="heroIcon" aria-hidden="true">…</div>
+            <div class="hero-info">
+              <div class="hero-line">
+                <h2 id="heroTitle">正在审计…</h2>
+                <span class="pill warn" id="heroPill">WAIT</span>
+              </div>
+              <div class="hero-meta">
+                <span id="heroDesc">检测 14 项环境指标</span>
+                <span class="sep">·</span>
+                <span>目标 <b id="chipCountry">--</b></span>
+                <span class="sep">·</span>
+                <span>时区 <b id="chipSystemTz">--</b></span>
+                <span class="sep">·</span>
+                <span id="auditMeta">读取中</span>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button type="button" class="btn ghost" id="btnRecheck" title="重新执行 14 项检查">
+                <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+                <span>重检</span>
+              </button>
+              <button type="button" class="btn" id="btnFix" title="自动修复规则、IPv6、DNS 防漏与保镖">
+                <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+                <span>修复</span>
+              </button>
+              <button type="button" class="btn" id="btnLaunchCli" disabled>
+                <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+                <span>CLI</span>
+              </button>
+              <button type="button" class="btn launch" id="btnLaunchDesktop" disabled>审计中…</button>
+            </div>
+          </div>
+          <div class="meter" id="heroMeter" aria-hidden="true"></div>
+        </div>
+
+        <div class="card check-card">
+          <div class="clist" id="checkListGrid"></div>
+        </div>
+
+        <footer class="ctrl-bar">
+          <div class="ctrl-left">
+            <label class="ctrl-label" for="proxyClientSelect">客户端</label>
+            <select class="select-sm" id="proxyClientSelect">
+              <option value="clash-verge">Clash Verge</option>
+              <option value="flclash">FlClash</option>
+              <option value="sing-box">sing-box</option>
+              <option value="clashx">ClashX</option>
+              <option value="surge">Surge</option>
+              <option value="wireguard">WireGuard</option>
+              <option value="other">其他 TUN</option>
+              <option value="auto">自动识别</option>
+            </select>
+
+            <div class="port-inline" id="flclashPortWrap" hidden>
+              <label class="ctrl-label" for="flclashPortInput">端口</label>
+              <input class="input-sm" id="flclashPortInput" placeholder="auto">
+              <button type="button" class="btn ghost sm" id="btnSavePort">保存</button>
+            </div>
+
+            <button type="button" class="btn ghost sm" id="btnShieldRestore" title="关闭 Claude/CLI 后暂停保镖并还原网络设置">退出护盾</button>
+          </div>
+
+          <span class="toast" id="statusBanner">就绪</span>
+        </footer>
+      </section>
+
+      <!-- [工具] -->
+      <section class="view" data-view="tools">
+        <div class="card tools-bar">
+          <div class="urlbox">
+            <label class="ctrl-label" for="safeUrlInput">隔离浏览器</label>
+            <input class="input-el" id="safeUrlInput" placeholder="https://...（独立临时目录，关窗即毁）">
+            <button type="button" class="btn launch sm" id="btnOpenSafe">隔离打开</button>
+          </div>
+
+          <div class="tool-strip">
+            <button type="button" class="toolcard" data-tool="set-region">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/></svg>
+              <span>重锁地区</span>
+            </button>
+            <button type="button" class="toolcard" data-tool="rules-status">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>
+              <span>规则透视</span>
+            </button>
+            <button type="button" class="toolcard" data-tool="fingerprint">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>
+              <span>硬件指纹</span>
+            </button>
+            <button type="button" class="toolcard" data-tool="export-diagnostics">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>导出诊断</span>
+            </button>
+            <button type="button" class="toolcard" data-tool="upstream-status">
+              <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+              <span>检查更新</span>
+            </button>
           </div>
         </div>
 
-        <nav class="nav">
-          <a class="active" data-view="overview"><span class="k">[01]</span> 环境与启动</a>
-          <a data-view="tools"><span class="k">[02]</span> 实用工具</a>
-          <a data-view="settings"><span class="k">[03]</span> 护盾与设置</a>
-        </nav>
-
-        <div class="guard">
-          <div class="row">
-            <span class="row-l"><span class="dot" id="guardDot"></span> 保镖 / 进程级急停</span>
-            <span class="badge" id="guardBadge">检测中</span>
+        <div class="console">
+          <div class="cbar">
+            <span id="consoleBar">OUTPUT</span>
           </div>
-          <p id="guardDesc">10s 双因子巡检（内核 × TUN），掉线终止 Claude 桌面版与 CLI（进程级急停，存在巡检周期窗口，非防火墙级阻断）。</p>
+          <pre id="consoleOut">选择上方工具查看输出。</pre>
         </div>
-      </aside>
+      </section>
 
-      <main class="main">
+      <!-- [设置] -->
+      <section class="view" data-view="settings">
+        <div class="set-head">
+          <span class="sec-title">检查策略</span>
+          <div class="actions">
+            <span class="set-msg" id="settingsMsg"></span>
+            <button type="button" class="btn ghost sm" id="btnResetDefaults">恢复默认</button>
+            <button type="button" class="btn launch sm" id="btnSaveSettings">保存并重检</button>
+          </div>
+        </div>
 
-        <!-- [01] 环境与启动 -->
-        <section class="view active" data-view="overview">
-          <div class="head">
-            <div>
-              <div class="kicker">PRE-LAUNCH AUDIT GATE</div>
-              <h2>环境安全总览<span class="blink"></span></h2>
-            </div>
-            <div class="actions">
-              <button class="btn ghost" id="btnRecheck">↻ 重新检查</button>
-              <button class="btn" id="btnFix">⚡ 一键修复</button>
-              <button class="btn" id="btnLaunchCli" disabled>❯_ 启动 CLI</button>
-              <button class="btn launch" id="btnLaunchDesktop" disabled>⏳ 正在审计…</button>
-            </div>
+        <div class="setgrid">
+          <div class="card">
+            <div class="ct"><span>可选检查（8 项）</span></div>
+            <div class="opt-grid" id="optionalChecksContainer"></div>
           </div>
 
-          <div class="grid-top">
-            <div class="card">
-              <div class="ct">
-                <span>// ENVIRONMENT AUDIT</span>
-                <span id="auditMeta">等待首次审计…</span>
+          <div class="card">
+            <div class="ct"><span>全局选项</span></div>
+            <div class="optrow">
+              <div class="opt-txt">
+                <span class="ol">可选项失败降为警告</span>
+                <span class="ohint">不阻断启动</span>
               </div>
-              <div class="status">
-                <div class="sicon warn" id="heroIcon">…</div>
-                <div>
-                  <h3 id="heroTitle">正在执行 14 项环境安全审计…</h3>
-                  <p id="heroDesc">6 项硬性防漏红线全部通过且无失败项后，自动解锁启动入口。</p>
-                </div>
-                <div class="pill warn" id="heroPill">AUDITING</div>
+              <button class="tg" type="button" role="switch" aria-checked="false" id="tgAllowOptional">OFF</button>
+            </div>
+            <div class="optrow">
+              <div class="opt-txt">
+                <span class="ol">记录脱敏日志</span>
+                <span class="ohint">不含 IP 与凭据</span>
               </div>
-              <div class="meter" id="heroMeter"></div>
-              <div class="quick">
-                <span class="chip">目标国家<b id="chipCountry">--</b></span>
-                <span class="chip">系统时区<b id="chipSystemTz">--</b></span>
-                <span class="chip">目标 IANA<b id="chipIanaTz">--</b></span>
-                <span class="chip">代理模式<b id="chipProxy">--</b></span>
-              </div>
+              <button class="tg on" type="button" role="switch" aria-checked="true" id="tgLogging">ON</button>
             </div>
 
-            <div class="card">
-              <div class="ct">
-                <span>// PROXY &amp; SHIELD</span>
-                <span id="flclashHint">无侵入护盾</span>
-              </div>
-              <div class="field">
-                <label for="proxyClientSelect">监控代理客户端</label>
-                <select class="select-el" id="proxyClientSelect">
-                  <option value="clash-verge">Clash Verge (verge-mihomo)</option>
-                  <option value="flclash">FlClash (FlClashCore)</option>
-                  <option value="sing-box">sing-box</option>
-                  <option value="clashx">ClashX</option>
-                  <option value="surge">Surge</option>
-                  <option value="wireguard">WireGuard</option>
-                  <option value="other">其他 TUN 客户端</option>
-                  <option value="auto">自动识别 (auto)</option>
-                </select>
-              </div>
-              <div class="field" id="flclashPortWrap">
-                <label for="flclashPortInput">FlClash 本机控制端口（留空自动发现）</label>
-                <div class="inline-row">
-                  <input class="input-el" id="flclashPortInput" placeholder="auto（如 9090 或 127.0.0.1:9090）">
-                  <button class="btn ghost" id="btnSavePort" style="padding:8px 12px">保存</button>
-                </div>
-              </div>
-              <div class="shield-bar">
-                <span>收工还原已记录的网卡 IPv6 与原时区</span>
-                <button class="btn ghost sm" id="btnShieldRestore">退出护盾</button>
-              </div>
+            <div class="ct" style="margin-top:20px"><span>硬性必检（6 项锁定）</span></div>
+            <div class="locked-tags">
+              <span>代理内核</span>
+              <span>TUN 网卡</span>
+              <span>出口地区</span>
+              <span>IPv6 关闭</span>
+              <span>常驻保镖</span>
+              <span>置顶规则</span>
             </div>
           </div>
+        </div>
+      </section>
 
-          <div class="card checkcard">
-            <div class="ct" style="margin-bottom:10px">
-              <span>// 14 SECURITY CHECKS</span>
-              <span id="checkSummary">6 项硬性防漏红线 + 8 项可选检查</span>
-            </div>
-            <div class="clist" id="checkListGrid"></div>
-          </div>
-
-          <div class="foot">
-            <span class="toast" id="statusBanner">● 初始化环境状态中…</span>
-            <span id="updateHint">关闭窗口驻留系统托盘 · 右键托盘可快捷操作</span>
-          </div>
-        </section>
-
-        <!-- [02] 实用工具（精简 4 项干货） -->
-        <section class="view" data-view="tools">
-          <div class="head">
-            <div>
-              <div class="kicker">ESSENTIAL UTILITIES</div>
-              <h2>防漏实用工具<span class="blink"></span></h2>
-            </div>
-          </div>
-
-          <div class="card" style="margin-bottom:18px">
-            <div class="ct">
-              <span>// SAFE ISOLATED BROWSER (open-safe)</span>
-              <span>禁用插件与非代理 UDP · 关窗自动销毁目录</span>
-            </div>
-            <div class="urlbox">
-              <input class="input-el" id="safeUrlInput" placeholder="粘贴邮件验证链接 / Magic Link（仅允许 https:// 或 http://）">
-              <button class="btn launch" id="btnOpenSafe">⊗ 隔离窗口打开</button>
-            </div>
-          </div>
-
-          <div class="toolsgrid">
-            <div class="toolcard" data-tool="set-region">
-              <div class="ti">◉</div>
-              <h4>换节点重锁地区 (set-region)</h4>
-              <small>切换不同国家节点后，重新识别出口国家并同步更新目标国家、时区与语言基线。</small>
-            </div>
-            <div class="toolcard" data-tool="rules-status">
-              <div class="ti">⟐</div>
-              <h4>Clash 置顶规则透视 (rules-status)</h4>
-              <small>只读核查 Mihomo 控制接口与内核前 16 条 Claude + STUN 规则是否真实加载。</small>
-            </div>
-            <div class="toolcard" data-tool="fingerprint">
-              <div class="ti">◈</div>
-              <h4>硬件与虚拟化指纹 (fingerprint)</h4>
-              <small>只读检查显卡渲染器、分辨率与虚拟机特征（系统自带中文字体不报焦虑黄牌）。</small>
-            </div>
-            <div class="toolcard" data-tool="export-diagnostics">
-              <div class="ti">⇩</div>
-              <h4>导出诊断包 (export-diagnostics)</h4>
-              <small>在桌面生成脱敏 zip：只含检查状态、检查设置与客户端日志，不含 IP、凭据、账号或代理配置。</small>
-            </div>
-            <div class="toolcard" data-tool="upstream-status">
-              <div class="ti">⇅</div>
-              <h4>检查上游更新 (upstream-status)</h4>
-              <small>对比 claude-switcher 上游 main 与本引擎已合并的提交，列出还没合并的新提交。</small>
-            </div>
-          </div>
-
-          <div class="console">
-            <div class="cbar">
-              <span id="consoleBar">OUTPUT // READY</span>
-              <span>受控白名单调用 · 不记录敏感信息</span>
-            </div>
-            <pre id="consoleOut">点击上方任意工具卡片，或在输入框粘贴链接后点击「隔离窗口打开」。</pre>
-          </div>
-        </section>
-
-        <!-- [03] 护盾与设置 -->
-        <section class="view" data-view="settings">
-          <div class="head">
-            <div>
-              <div class="kicker">SHIELD &amp; POLICY</div>
-              <h2>护盾与检查策略<span class="blink"></span></h2>
-            </div>
-            <div class="actions">
-              <button class="btn ghost" id="btnResetDefaults">恢复默认</button>
-              <button class="btn launch" id="btnSaveSettings">保存策略并重新检查</button>
-            </div>
-          </div>
-
-          <div class="setgrid">
-            <div class="card">
-              <div class="ct"><span>// 检查与日志</span></div>
-              <div class="optrow">
-                <div>
-                  <div class="ol">允许可选检查项失败降级为警告</div>
-                  <div class="od">仅作用于右侧 8 项可选检查，绝不放宽代理内核、TUN、出口国家、IPv6、保镖与置顶规则 6 项硬性红线</div>
-                </div>
-                <button class="tg" type="button" id="tgAllowOptional">OFF</button>
-              </div>
-              <div class="optrow">
-                <div>
-                  <div class="ol">记录本地脱敏客户端日志</div>
-                  <div class="od">仅记录命令、退出码、耗时与状态摘要，绝不写入公网 IP 或凭据</div>
-                </div>
-                <button class="tg on" type="button" id="tgLogging">ON</button>
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="ct"><span>// 8 项可选检查开关 &amp; 6 项硬性防漏红线</span></div>
-              <div id="optionalChecksContainer"></div>
-              <div class="optrow">
-                <div><div class="ol">代理内核 · TUN 网卡 · 出口国家与 IP</div></div>
-                <span class="locked">硬性锁定</span>
-              </div>
-              <div class="optrow">
-                <div><div class="ol">IPv6 关闭 · 保镖存活 · 置顶规则 / 隧道接管</div></div>
-                <span class="locked">硬性锁定</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="note" id="settingsMsg">
-            <b>日常收工还原：</b>不用 Claude 时点击首页「退出护盾」并在 5 秒内再次点击确认：会先关闭 Claude 桌面版与所有 Claude Code CLI 会话，全部退出后才暂停保镖、按护盾开启前的快照恢复各网卡 IPv6，并还原已记录的原系统时区（若时区由旧版安装器修改而无快照，会明确提示手动调整）；任一进程未退出则不撤防。
-          </div>
-        </section>
-
-      </main>
-    </div>
+    </main>
   </div>
 
-  <!-- ================= MOBILE / WEB 6-POINT SELF-CHECK PWA ================= -->
+  <!-- ================= BROWSER / MOBILE SELF-CHECK ================= -->
   <div class="mapp" id="mobileApp">
     <div class="mhead">
       <div class="mbrand">
         <div class="logo sm">EG</div>
-        <div>
-          <h2>Claude 环境卫士</h2>
-          <span>WEB / PWA // 5 项防漏信号 + 1 项硬件摘要</span>
-        </div>
+        <h2>浏览器自检</h2>
       </div>
       <div class="mhead-r">
-        <button class="chip-btn" id="btnBackToPc" style="display:none">← 返回桌面端</button>
+        <button type="button" class="chip-btn" id="btnBackToPc" style="display:none">← 返回</button>
         <div class="theme-seg">
-          <button class="tbtn on" data-theme-pick="terminal">绿</button>
-          <button class="tbtn" data-theme-pick="cyber">霓虹</button>
+          <button type="button" class="tbtn on" data-theme-pick="terminal">绿</button>
+          <button type="button" class="tbtn" data-theme-pick="cyber">霓虹</button>
         </div>
       </div>
     </div>
 
     <div class="mhero">
-      <div class="tag">// BROWSER SIGNAL PRE-FLIGHT</div>
-      <h3 id="mHeroTitle">准备就绪 · 点击开始自检</h3>
-      <p id="mHeroDesc">评估当前浏览器侧 5 项网络信号（出口、时区、WebRTC、IPv6、DNS）与 1 项硬件渲染摘要；仅代表当前设备浏览器，不替代电脑桌面端的 14 项启动审计。</p>
-      <button class="btn launch full" id="btnRunMobileCheck">▶ 立即检测浏览器信号</button>
+      <div class="mhero-top">
+        <div>
+          <h3 id="mHeroTitle">准备就绪</h3>
+          <p id="mHeroDesc">5 项网络防漏信号 + 1 项硬件参考</p>
+        </div>
+        <button type="button" class="btn launch sm" id="btnRunMobileCheck">重新检测</button>
+      </div>
     </div>
 
     <div class="mlist" id="mobileCheckList">
       <div class="mcard" data-mkey="egress">
-        <div><b>01 · 出口 IP 与归属国</b><small>等待检测（核对非 CN 出口）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>出口归属</b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
       <div class="mcard" data-mkey="region">
-        <div><b>02 · 浏览器时区与语言一致性</b><small>等待检测（比对出口国家与本地时区偏移）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>时区与语言</b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
       <div class="mcard" data-mkey="webrtc">
-        <div><b>03 · WebRTC STUN 候选泄漏</b><small>等待检测（ICE 候选比对出口 IP）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>WebRTC 候选</b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
       <div class="mcard" data-mkey="ipv6">
-        <div><b>04 · IPv6 双栈暴露检测</b><small>等待检测（排查 IPv6 旁路裸连）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>IPv6 暴露</b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
       <div class="mcard" data-mkey="dns">
-        <div><b>05 · DNS 泄漏检测</b><small>等待检测（查明实际 DNS 解析器的归属）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>DNS 归属</b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
       <div class="mcard" data-mkey="fp">
-        <div><b>06 · WebGL / Canvas 硬件摘要（仅参考）</b><small>等待检测（GPU 渲染器与 Canvas 哈希，非泄漏指标）</small></div>
-        <span class="st skip">[WAIT]</span>
+        <div><b>硬件摘要 <span class="ref-tag">参考</span></b><small>等待检测</small></div>
+        <span class="st skip">WAIT</span>
       </div>
     </div>
 
-    <div class="mfoot">纯浏览器实时探测 · 会向 ipinfo / Cloudflare / ipify / ipleak 发起检测请求 · 本工具不设服务端、不存储或上传结果</div>
+    <div class="mfoot">经 ipinfo / Cloudflare / ipify / ipleak 实时检测 · 本地不上传</div>
   </div>
 
   <script type="module" src="/src/main.js"></script>

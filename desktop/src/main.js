@@ -5,30 +5,46 @@ import { runMobileSelfCheck } from './mobile-check.js';
 const CHECK_SPECS = [
   { key: '代理内核', label: '代理内核', hard: true },
   { key: 'TUN网卡', label: 'TUN 网卡', hard: true },
-  { key: '出口IP', label: '出口国家与 IP', hard: true },
-  { key: 'IPv6', label: 'IPv6 旁路防护', hard: true },
-  { key: '保镖', label: '保镖进程急停', hard: true },
-  { key: '规则置顶', label: '置顶规则 / 隧道接管', hard: true },
-  { key: '时区', label: '时区对齐', hard: false },
-  { key: '地区', label: '区域格式 Locale', hard: false },
-  { key: 'IP一致', label: 'IP 稳定性 (48h)', hard: false },
-  { key: 'DNS', label: 'DNS 隧道与解析器归属', hard: false },
-  { key: 'WebRTC', label: 'WebRTC STUN 探针', hard: false },
+  { key: '出口IP', label: '出口地区', hard: true },
+  { key: 'IPv6', label: 'IPv6 关闭', hard: true },
+  { key: '保镖', label: '常驻保镖', hard: true },
+  { key: '规则置顶', label: '置顶规则', hard: true },
+  { key: '时区', label: '系统时区', hard: false },
+  { key: '地区', label: '区域格式', hard: false },
+  { key: 'IP一致', label: 'IP 稳定性', hard: false },
+  { key: 'DNS', label: 'DNS 归属', hard: false },
+  { key: 'WebRTC', label: 'WebRTC', hard: false },
   { key: '客户端语言', label: '客户端语言', hard: false },
-  { key: 'ASN属性', label: 'ASN 网络属性', hard: false },
-  { key: '生态可达性', label: 'Claude 生态可达性', hard: false }
+  { key: 'ASN属性', label: 'ASN 属性', hard: false },
+  { key: '生态可达性', label: '服务连通', hard: false }
 ];
 
 const OPTIONAL_ITEMS = [
-  { key: '时区', title: '系统时区对齐（关掉则保留本机时钟，一键修复不改时间）' },
-  { key: '地区', title: '区域格式 Locale 对齐（关掉则保留中文日期/数字格式）' },
-  { key: 'WebRTC', title: 'WebRTC 国内外 STUN 交叉探针' },
-  { key: 'DNS', title: 'DNS 隧道与实际解析器归属校验' },
-  { key: 'IP一致', title: '出口 IP 48 小时跳变提醒' },
-  { key: 'ASN属性', title: 'ASN 运营商类型核对' },
-  { key: '客户端语言', title: 'Claude 客户端语言比对' },
-  { key: '生态可达性', title: 'claude.ai / API 连通性探测' }
+  { key: '时区', title: '系统时区', hint: '关 = 保留本机时间' },
+  { key: '地区', title: '区域格式', hint: '关 = 保留日期格式' },
+  { key: 'DNS', title: 'DNS 归属', hint: '校验上游解析器' },
+  { key: 'WebRTC', title: 'WebRTC', hint: 'STUN 候选探测' },
+  { key: 'IP一致', title: 'IP 稳定性', hint: '48h 跳变提醒' },
+  { key: 'ASN属性', title: 'ASN 属性', hint: '运营商网络类型' },
+  { key: '客户端语言', title: '客户端语言', hint: '比对配置语言' },
+  { key: '生态可达性', title: '服务连通', hint: '网页与 API 可达' }
 ];
+
+const SHORT_TZ_MAP = {
+  'China Standard Time': 'UTC+8 北京',
+  'Pacific Standard Time': 'UTC-8 美西',
+  'Mountain Standard Time': 'UTC-7 美山',
+  'Central Standard Time': 'UTC-6 美中',
+  'Eastern Standard Time': 'UTC-5 美东',
+  'Tokyo Standard Time': 'UTC+9 东京',
+  'Korea Standard Time': 'UTC+9 首尔',
+  'Taipei Standard Time': 'UTC+8 台北',
+  'Singapore Standard Time': 'UTC+8 新加坡',
+  'GMT Standard Time': 'UTC+0 伦敦',
+  'W. Europe Standard Time': 'UTC+1 柏林',
+  'Romance Standard Time': 'UTC+1 巴黎',
+  'AUS Eastern Standard Time': 'UTC+10 悉尼'
+};
 
 const isTauri = Boolean(window.__TAURI_INTERNALS__);
 let isBusy = false;
@@ -53,8 +69,10 @@ function setView(viewName) {
   document.querySelectorAll('.view').forEach((sec) => {
     sec.classList.toggle('active', sec.dataset.view === viewName);
   });
-  document.querySelectorAll('.nav a').forEach((a) => {
-    a.classList.toggle('active', a.dataset.view === viewName);
+  document.querySelectorAll('.nav-tabs .tab').forEach((tab) => {
+    const active = tab.dataset.view === viewName;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', String(active));
   });
 }
 
@@ -62,7 +80,13 @@ function setBanner(text, isErr = false) {
   const el = document.getElementById('statusBanner');
   if (!el) return;
   el.textContent = text;
+  el.title = text;
   el.classList.toggle('err', isErr);
+}
+
+function syncPortVisibility(mode) {
+  const wrap = document.getElementById('flclashPortWrap');
+  if (wrap) wrap.hidden = !(mode === 'flclash' || mode === 'auto');
 }
 
 function setBusyState(busy, label = '') {
@@ -71,43 +95,85 @@ function setBusyState(busy, label = '') {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
-  const canLaunch = !busy && Boolean(currentState?.environmentReady);
+  const complete = (currentState?.checks || []).length === CHECK_SPECS.length;
+  const ready = Boolean(currentState?.environmentReady);
+  const canLaunch = !busy && ready;
   const dBtn = document.getElementById('btnLaunchDesktop');
   const cBtn = document.getElementById('btnLaunchCli');
   if (dBtn) {
     dBtn.disabled = !canLaunch;
+    dBtn.classList.toggle('blocked', !busy && complete && !ready);
     if (busy && label) {
-      dBtn.textContent = `⏳ ${label}`;
+      dBtn.textContent = label;
     } else if (canLaunch) {
-      dBtn.textContent = '▶ 安全启动 Claude';
+      dBtn.textContent = '启动 Claude';
+    } else if (complete && !ready) {
+      dBtn.textContent = '门禁锁定';
     } else {
-      dBtn.textContent = '🔒 未过检已阻断启动';
+      dBtn.textContent = '等待审计';
     }
   }
   if (cBtn) cBtn.disabled = !canLaunch;
 }
 
 function stateBadgeText(st) {
-  if (st === 'ok') return '[ OK ]';
-  if (st === 'warn') return '[WARN]';
-  if (st === 'skip') return '[SKIP]';
-  if (st === 'fail') return '[FAIL]';
-  return '[WAIT]';
+  if (st === 'ok') return 'OK';
+  if (st === 'warn') return 'WARN';
+  if (st === 'skip') return 'SKIP';
+  if (st === 'fail') return 'FAIL';
+  return 'WAIT';
+}
+
+function maskDisplayIp(text) {
+  return String(text || '').replace(/\b(?!198\.1[89]\.)(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b/g, '$1.$2.*.*');
+}
+
+function compactDetail(key, st, raw, countryTarget = '') {
+  const s = maskDisplayIp(String(raw || '').trim());
+  if (!s) return st === 'ok' ? '正常' : st === 'skip' ? '已跳过' : '--';
+  if (s === '用户已禁用') return '已跳过';
+  if (s === '仅暴露代理IP') return '与代理一致';
+  if (s === '在线(10s巡检)') return '10s 巡检';
+  if (s.endsWith(' 运行中')) return s.slice(0, -4);
+  if (key === '出口IP' && st === 'ok') {
+    return countryTarget ? `${countryTarget} · ${s}` : s;
+  }
+  if (s.startsWith('Fake-IP走隧道 · 解析器位于 ')) {
+    return `Fake-IP · ${s.replace('Fake-IP走隧道 · 解析器位于 ', '')}`;
+  }
+  const asnMatch = s.match(/^([A-Za-z/]+)\((AS\d+\s+[^;)]+)/);
+  if (asnMatch) {
+    const org = asnMatch[2].replace(/,?\s*(Inc\.|LLC|Ltd\.?|Corp\.?)$/i, '').trim();
+    return `${org} · ${asnMatch[1]}`;
+  }
+  if (s.startsWith('Claude=')) {
+    return s.replace(/^Claude=/, '').replace(/,期望\s*/, ' · 期望 ');
+  }
+  if (s.startsWith('在线(含72h')) return '旧策略 · 需点修复';
+  return s;
 }
 
 function renderCheckSkeleton() {
   const grid = document.getElementById('checkListGrid');
   const meter = document.getElementById('heroMeter');
   if (!grid || !meter) return;
-  grid.innerHTML = CHECK_SPECS.map((spec, idx) => `
+  grid.innerHTML = CHECK_SPECS.map((spec) => `
     <div class="citem" data-ck="${spec.key}">
-      <span class="idx">${String(idx + 1).padStart(2, '0')}</span>
-      <span class="nm">${spec.label}${spec.hard ? ' <span class="hard">硬性</span>' : ''}</span>
-      <span class="dt">等待检查…</span>
-      <span class="st skip">[WAIT]</span>
+      <span class="nm">${spec.label}${spec.hard ? '<span class="hard">必检</span>' : ''}</span>
+      <span class="dt">--</span>
+      <span class="st skip">WAIT</span>
     </div>
   `).join('');
   meter.innerHTML = CHECK_SPECS.map(() => '<i class="seg"></i>').join('');
+}
+
+function setToggle(id, isOn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const on = Boolean(isOn);
+  el.classList.toggle('on', on);
+  el.setAttribute('aria-checked', String(on));
+  el.textContent = on ? 'ON' : 'OFF';
 }
 
 function renderOptionalToggles(disabledList = []) {
@@ -118,47 +184,50 @@ function renderOptionalToggles(disabledList = []) {
     const on = !disabled.has(item.key);
     return `
       <div class="optrow">
-        <div><div class="ol">${item.title}</div></div>
-        <button class="tg ${on ? 'on' : ''}" type="button" data-opt-key="${item.key}">${on ? 'ON' : 'OFF'}</button>
+        <div class="opt-txt">
+          <span class="ol">${item.title}</span>
+          <span class="ohint">${item.hint}</span>
+        </div>
+        <button class="tg ${on ? 'on' : ''}" type="button" role="switch" aria-checked="${on}" data-opt-key="${item.key}">${on ? 'ON' : 'OFF'}</button>
       </div>
     `;
   }).join('');
   box.querySelectorAll('[data-opt-key]').forEach((btn) => {
     btn.onclick = () => {
-      btn.classList.toggle('on');
-      btn.textContent = btn.classList.contains('on') ? 'ON' : 'OFF';
+      const next = !btn.classList.contains('on');
+      btn.classList.toggle('on', next);
+      btn.setAttribute('aria-checked', String(next));
+      btn.textContent = next ? 'ON' : 'OFF';
     };
   });
-}
-
-function setToggle(id, isOn) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.classList.toggle('on', Boolean(isOn));
-  el.textContent = isOn ? 'ON' : 'OFF';
 }
 
 function applyUiState(data, elapsedMs = 0) {
   if (!data) return;
   document.getElementById('appVersionTag').textContent = data.version && data.version !== 'unknown' ? `v${data.version}` : 'v2.0';
   document.getElementById('chipCountry').textContent = data.country_target || '--';
-  document.getElementById('chipSystemTz').textContent = data.system_tz || '--';
-  document.getElementById('chipIanaTz').textContent = data.iana_tz_target || '--';
-  document.getElementById('chipProxy').textContent = data.proxy_mode || '--';
+
+  const tzEl = document.getElementById('chipSystemTz');
+  const rawTz = data.system_tz || '';
+  tzEl.textContent = SHORT_TZ_MAP[rawTz] || rawTz || '--';
+  tzEl.title = rawTz ? `系统时区: ${rawTz} | 目标: ${data.iana_tz_target || '--'}` : '';
 
   const sel = document.getElementById('proxyClientSelect');
-  if (sel && data.proxy_mode) sel.value = data.proxy_mode;
+  if (sel && data.proxy_mode) {
+    sel.value = data.proxy_mode;
+    syncPortVisibility(data.proxy_mode);
+  }
   const portInput = document.getElementById('flclashPortInput');
   if (portInput) portInput.value = data.flclash_port && data.flclash_port !== 'auto' ? data.flclash_port : '';
 
-  // Bodyguard sidebar card
+  // Topbar bodyguard pill
   const bg = data.bodyguard || {};
   const gDot = document.getElementById('guardDot');
-  const gBadge = document.getElementById('guardBadge');
-  const gDesc = document.getElementById('guardDesc');
+  const gText = document.getElementById('guardText');
+  const gPill = document.getElementById('guardPill');
   gDot.className = 'dot ' + (bg.state === 'ok' ? '' : bg.state === 'warn' ? 'warn' : 'fail');
-  gBadge.textContent = bg.state === 'ok' ? 'ACTIVE' : bg.state === 'warn' ? 'LEGACY' : 'OFFLINE';
-  gDesc.textContent = bg.detail ? `状态：${bg.detail}。10s 巡检进程级急停（非防火墙级阻断）。` : '状态以环境审计为准。';
+  gText.textContent = bg.state === 'ok' ? '保镖在线' : bg.state === 'warn' ? '保镖待升级' : '保镖离线';
+  gPill.title = bg.detail ? `保镖状态：${bg.detail}（10s 进程级急停）` : '保镖状态';
 
   // Settings sync
   const cfg = data.check_config || {};
@@ -182,10 +251,12 @@ function applyUiState(data, elapsedMs = 0) {
     const row = document.querySelector(`.citem[data-ck="${spec.key}"]`);
     const found = map.get(spec.key);
     const st = found ? found.state : 'skip';
-    const detail = found ? found.detail || (st === 'ok' ? '通过' : '') : '尚未执行';
+    const rawDetail = found ? found.detail || '' : '';
+    const shortDetail = found ? compactDetail(spec.key, st, rawDetail, data.country_target) : '待检';
     if (row) {
-      row.querySelector('.dt').textContent = detail;
-      row.querySelector('.dt').title = detail;
+      const dtEl = row.querySelector('.dt');
+      dtEl.textContent = shortDetail;
+      dtEl.title = maskDisplayIp(rawDetail) || shortDetail;
       const badge = row.querySelector('.st');
       badge.className = `st ${st}`;
       badge.textContent = stateBadgeText(st);
@@ -209,50 +280,53 @@ function applyUiState(data, elapsedMs = 0) {
   const heroPill = document.getElementById('heroPill');
   const auditMeta = document.getElementById('auditMeta');
 
-  auditMeta.textContent = elapsedMs > 0 ? `耗时 ${(elapsedMs / 1000).toFixed(1)}s · 单次 JSON 聚合` : '已载入最近快照';
+  auditMeta.textContent = elapsedMs > 0 ? `${(elapsedMs / 1000).toFixed(1)}s` : '缓存';
 
   if (!complete) {
     heroIcon.className = 'sicon warn';
     heroIcon.textContent = '…';
-    heroTitle.textContent = '尚未完成完整 14 项环境审计';
-    heroDesc.textContent = '请点击右上角「重新检查」完成实时审计后再启动 Claude。';
+    heroTitle.textContent = '等待审计';
+    heroDesc.textContent = '点击右侧「重检」完成检查';
     heroPill.className = 'pill warn';
-    heroPill.textContent = 'INCOMPLETE';
+    heroPill.textContent = 'WAIT';
   } else if (!ready) {
     heroIcon.className = 'sicon blocked';
     heroIcon.textContent = '✕';
-    heroTitle.textContent = `启动门禁已阻断（${blockedNames.slice(0, 3).join('、')}）`;
-    heroDesc.textContent = '6 项硬性防漏红线必须全部为 [ OK ] 且无失败项：可点「一键修复」处理，或在「护盾与设置」中关闭时区/区域格式等可选项。';
+    heroTitle.textContent = `未通过：${blockedNames.slice(0, 3).join('、')}`;
+    heroDesc.textContent = '点「修复」自动处理，或在「设置」关闭可选项';
     heroPill.className = 'pill blocked';
-    heroPill.textContent = `BLOCKED · ${blockedNames.length}`;
+    heroPill.textContent = `${blockedNames.length} 阻断`;
   } else if (warnCount > 0 || skipCount > 0) {
-    heroIcon.className = 'sicon warn';
-    heroIcon.textContent = '!';
-    heroTitle.textContent = '6 项硬性防漏红线已全部通过 · 允许启动（可选项含提示/跳过）';
-    heroDesc.textContent = `通过 ${okCount} 项，提示 ${warnCount} 项${skipCount ? `，跳过 ${skipCount} 项` : ''}；保镖以 10s 周期执行进程级急停。`;
-    heroPill.className = 'pill warn';
-    heroPill.textContent = `READY · ${okCount}/14 OK`;
+    heroIcon.className = 'sicon';
+    heroIcon.textContent = '✓';
+    heroTitle.textContent = '环境就绪';
+    const parts = [`${okCount} 通过`];
+    if (warnCount) parts.push(`${warnCount} 提示`);
+    if (skipCount) parts.push(`${skipCount} 跳过`);
+    heroDesc.textContent = parts.join(' · ');
+    heroPill.className = 'pill';
+    heroPill.textContent = `READY · ${okCount}/14`;
   } else {
     heroIcon.className = 'sicon';
     heroIcon.textContent = '✓';
-    heroTitle.textContent = '14 项检查全部通过 · 允许安全启动';
-    heroDesc.textContent = '启动门禁已放行 Claude 桌面版与 CLI；运行期由保镖按 10s 周期监控内核与 TUN。';
+    heroTitle.textContent = '环境就绪';
+    heroDesc.textContent = '14 项全部通过';
     heroPill.className = 'pill';
-    heroPill.textContent = `PASS · ${okCount}/14 OK`;
+    heroPill.textContent = 'PASS · 14/14';
   }
 }
 
 async function refreshDesktopState(fresh = true) {
   if (isBusy) return;
   setBusyState(true, fresh ? '审计中…' : '读取中…');
-  setBanner(fresh ? '● 正在执行完整 14 项环境安全审计…' : '● 正在读取本地缓存状态…');
+  setBanner(fresh ? '正在审计…' : '读取缓存…');
   const t0 = performance.now();
   try {
     const res = await invoke('get_ui_state', { fresh });
     applyUiState(res, fresh ? performance.now() - t0 : 0);
-    setBanner(res.checks?.length === 14 ? '● 环境审计已完成' : '● 已读取状态，正在准备实时复检…');
+    setBanner(res.checks?.length === 14 ? '审计完成' : '准备实时复检…');
   } catch (err) {
-    setBanner(`✕ 审计调用失败: ${err}`, true);
+    setBanner(`审计失败: ${err}`, true);
   } finally {
     setBusyState(false);
   }
@@ -260,14 +334,14 @@ async function refreshDesktopState(fresh = true) {
 
 async function handleAction(label, fn, recheckAfter = false) {
   if (isBusy) return;
-  setBusyState(true, label);
-  setBanner(`● 正在执行: ${label}…`);
+  setBusyState(true, `${label}…`);
+  setBanner(`执行中: ${label}…`);
   try {
     const out = await fn();
     const text = String(out?.output || '').trim();
     const ok = out?.exit_code === 0 && !/^FAIL:/m.test(text);
     const lastLine = text.split(/\r?\n/).filter(Boolean).pop() || `${label}完成`;
-    setBanner(`${ok ? '✓' : '✕'} ${lastLine}`, !ok);
+    setBanner(`${ok ? '✓' : '✕'} ${lastLine.replace(/^(OK|WARN|FAIL|INFO):/, '')}`, !ok);
     setBusyState(false);
     if (recheckAfter) await refreshDesktopState(true);
     return out;
@@ -279,16 +353,16 @@ async function handleAction(label, fn, recheckAfter = false) {
 }
 
 function wireDesktopEvents() {
-  document.querySelectorAll('.nav a').forEach((a) => {
-    a.onclick = () => setView(a.dataset.view);
+  document.querySelectorAll('.nav-tabs .tab').forEach((tab) => {
+    tab.onclick = () => setView(tab.dataset.view);
   });
 
   ['tgAllowOptional', 'tgLogging'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) {
       el.onclick = () => {
-        el.classList.toggle('on');
-        el.textContent = el.classList.contains('on') ? 'ON' : 'OFF';
+        const next = !el.classList.contains('on');
+        setToggle(id, next);
       };
     }
   });
@@ -300,6 +374,7 @@ function wireDesktopEvents() {
     handleAction('启动 Claude', () => invoke('safe_launch', { target: 'desktop' }), false);
   document.getElementById('btnLaunchCli').onclick = () =>
     handleAction('启动 CLI', () => invoke('safe_launch', { target: 'cli' }), false);
+
   const shieldBtn = document.getElementById('btnShieldRestore');
   let shieldArmTimer = null;
   const disarmShield = () => {
@@ -310,11 +385,11 @@ function wireDesktopEvents() {
   shieldBtn.onclick = () => {
     if (!shieldBtn.classList.contains('armed')) {
       shieldBtn.classList.add('armed');
-      shieldBtn.textContent = '再次点击确认';
-      setBanner('! 退出护盾会关闭 Claude 桌面版和所有 Claude Code CLI 会话；5 秒内再次点击确认', true);
+      shieldBtn.textContent = '确认退出?';
+      setBanner('将关闭 Claude/CLI 并还原网络，5s 内再点确认', true);
       shieldArmTimer = setTimeout(() => {
         disarmShield();
-        setBanner('● 已取消退出护盾');
+        setBanner('已取消');
       }, 5000);
       return;
     }
@@ -324,12 +399,13 @@ function wireDesktopEvents() {
 
   document.getElementById('proxyClientSelect').onchange = (e) => {
     const mode = e.target.value;
-    handleAction(`切换客户端 (${mode})`, () => invoke('set_client_mode', { mode }), true);
+    syncPortVisibility(mode);
+    handleAction(`切换客户端`, () => invoke('set_client_mode', { mode }), true);
   };
 
   document.getElementById('btnSavePort').onclick = () => {
     const raw = document.getElementById('flclashPortInput').value.trim() || 'auto';
-    handleAction('保存 FlClash 端口', () => invoke('set_flclash_port', { port: raw }), true);
+    handleAction('保存端口', () => invoke('set_flclash_port', { port: raw }), true);
   };
 
   document.querySelectorAll('.toolcard').forEach((card) => {
@@ -354,20 +430,20 @@ function wireDesktopEvents() {
     const url = document.getElementById('safeUrlInput').value.trim();
     if (!/^https?:\/\/\S+$/i.test(url)) {
       document.getElementById('consoleBar').textContent = 'OUTPUT // open-safe';
-      document.getElementById('consoleOut').textContent = 'FAIL: 请输入完整的 https:// 或 http:// 链接';
+      document.getElementById('consoleOut').textContent = '请输入完整的 https:// 或 http:// 链接';
       return;
     }
     document.getElementById('consoleBar').textContent = 'OUTPUT // open-safe';
-    document.getElementById('consoleOut').textContent = '正在核查隧道并启动一次性隔离浏览器…';
-    const res = await handleAction('隔离打开链接', () => invoke('run_tool', { tool: 'open-safe', arg: url }), false);
+    document.getElementById('consoleOut').textContent = '正在启动隔离浏览器…';
+    const res = await handleAction('隔离打开', () => invoke('run_tool', { tool: 'open-safe', arg: url }), false);
     if (res) document.getElementById('consoleOut').textContent = res.output || '';
   };
 
   document.getElementById('btnResetDefaults').onclick = () => {
     setToggle('tgAllowOptional', false);
     setToggle('tgLogging', true);
-    renderOptionalToggles([]);
-    document.getElementById('settingsMsg').textContent = '已恢复默认选项，点击「保存策略并重新检查」生效。';
+    renderOptionalToggles(['时区', '地区']);
+    document.getElementById('settingsMsg').textContent = '已恢复推荐默认，点「保存并重检」生效';
   };
 
   document.getElementById('btnSaveSettings').onclick = async () => {
@@ -381,12 +457,12 @@ function wireDesktopEvents() {
       logging: document.getElementById('tgLogging').classList.contains('on')
     };
     const res = await handleAction(
-      '保存检查策略',
+      '保存策略',
       () => invoke('save_check_config', { configJson: JSON.stringify(payload) }),
       true
     );
     if (res?.exit_code === 0) {
-      document.getElementById('settingsMsg').textContent = '✓ 策略已保存，正在按新策略重新检查环境。';
+      document.getElementById('settingsMsg').textContent = '';
       setView('overview');
     }
   };
@@ -414,14 +490,14 @@ function wireMobileEvents() {
   if (!runBtn) return;
   runBtn.onclick = async () => {
     runBtn.disabled = true;
-    runBtn.textContent = '⏳ 正在实时探测 5 项防漏信号与硬件摘要…';
-    document.getElementById('mHeroTitle').textContent = '正在执行浏览器侧实时自检…';
+    runBtn.textContent = '检测中…';
+    document.getElementById('mHeroTitle').textContent = '正在检测…';
 
     document.querySelectorAll('#mobileCheckList .mcard').forEach((card) => {
-      card.querySelector('small').textContent = '探测中…';
+      card.querySelector('small').textContent = '检测中…';
       const st = card.querySelector('.st');
       st.className = 'st skip';
-      st.textContent = '[....]';
+      st.textContent = '....';
     });
 
     const summary = await runMobileSelfCheck((key, res) => {
@@ -434,17 +510,17 @@ function wireMobileEvents() {
     });
 
     if (summary.fails > 0) {
-      document.getElementById('mHeroTitle').textContent = `发现 ${summary.fails} 项浏览器侧泄漏风险`;
-      document.getElementById('mHeroDesc').textContent = '请先检查当前设备代理工具的全局/TUN 与分流规则，消除红项后再复测。';
+      document.getElementById('mHeroTitle').textContent = `发现 ${summary.fails} 项风险`;
+      document.getElementById('mHeroDesc').textContent = '请检查代理全局/TUN 与分流规则';
     } else if (summary.warns > 0) {
-      document.getElementById('mHeroTitle').textContent = `5 项防漏无红项 · 含 ${summary.warns} 项提示`;
-      document.getElementById('mHeroDesc').textContent = '未发现浏览器侧国内出口或 DNS 泄漏，请留意下方黄色提示项（不代表电脑端进程级状态）。';
+      document.getElementById('mHeroTitle').textContent = `通过 · 含 ${summary.warns} 项提示`;
+      document.getElementById('mHeroDesc').textContent = '未见国内出口或 DNS 泄漏';
     } else {
-      document.getElementById('mHeroTitle').textContent = '5/5 浏览器防漏信号通过（附硬件摘要）';
-      document.getElementById('mHeroDesc').textContent = '当前浏览器出口、DNS、WebRTC、IPv6 与时区均无异常暴露；电脑端启动仍须通过桌面版 14 项审计。';
+      document.getElementById('mHeroTitle').textContent = '5/5 防漏信号通过';
+      document.getElementById('mHeroDesc').textContent = '出口、DNS、WebRTC 与 IPv6 无异常暴露';
     }
     runBtn.disabled = false;
-    runBtn.textContent = '↻ 重新检测浏览器信号';
+    runBtn.textContent = '重新检测';
   };
 }
 
@@ -468,12 +544,10 @@ function init() {
     renderCheckSkeleton();
     renderOptionalToggles([]);
     wireDesktopEvents();
-    // Instant cached load (<40ms) followed by fresh background 14-point audit
     refreshDesktopState(false).then(() => refreshDesktopState(true));
   } else {
     document.documentElement.setAttribute('data-runtime', 'web');
     setDeviceMode('mobile');
-    // Auto-run mobile check when opened in browser
     document.getElementById('btnRunMobileCheck').click();
   }
 }
