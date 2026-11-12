@@ -140,8 +140,8 @@ impl DockInner {
             dock_y: 0,
             orb_x: None,
             orb_y: None,
-            pod_w_phys: 540,
-            pod_h_phys: 122,
+            pod_w_phys: 480,
+            pod_h_phys: 64,
             work_area: WorkRect {
                 x: 0,
                 y: 0,
@@ -626,11 +626,11 @@ fn is_primary_mouse_down() -> bool {
     false
 }
 
-const PEEK_LOGICAL_PX: f64 = 10.0;
+const PEEK_LOGICAL_PX: f64 = 9.0;
 const SNAP_THRESHOLD_LOGICAL_PX: f64 = 48.0;
-const POD_WIDTH_LOGICAL_PX: f64 = 540.0;
-const POD_BASE_HEIGHT_LOGICAL_PX: f64 = 122.0;
-const ORB_SIZE_LOGICAL_PX: f64 = 72.0;
+const POD_WIDTH_LOGICAL_PX: f64 = 480.0;
+const POD_BASE_HEIGHT_LOGICAL_PX: f64 = 64.0;
+const ORB_SIZE_LOGICAL_PX: f64 = 60.0;
 
 fn compute_visible_pod_pos(
     dock_x: i32,
@@ -823,7 +823,7 @@ fn is_cursor_in_tucked_handle(
     match edge {
         DockEdge::Top => {
             let center_x = dock_x + ww / 2;
-            let half_w = (84.0 * scale).round() as i32;
+            let half_w = (76.0 * scale).round() as i32;
             cx >= center_x - half_w
                 && cx <= center_x + half_w
                 && cy >= area.y - 4
@@ -831,7 +831,7 @@ fn is_cursor_in_tucked_handle(
         }
         DockEdge::Left => {
             let center_y = dock_y + wh / 2;
-            let half_h = (54.0 * scale).round() as i32;
+            let half_h = (28.0 * scale).round() as i32;
             cx >= area.x - 4
                 && cx <= area.x + depth
                 && cy >= center_y - half_h
@@ -839,7 +839,7 @@ fn is_cursor_in_tucked_handle(
         }
         DockEdge::Right => {
             let center_y = dock_y + wh / 2;
-            let half_h = (54.0 * scale).round() as i32;
+            let half_h = (28.0 * scale).round() as i32;
             cx >= area.right() - depth
                 && cx <= area.right() + 4
                 && cy >= center_y - half_h
@@ -1938,39 +1938,39 @@ mod tests {
             w: 2560,
             h: 1400,
         };
-        // Dragged near top -> snaps flush to Top (y = 0) and tucks upward leaving 10px peek
+        // Dragged near top -> snaps flush to Top (y = 0) and tucks upward leaving 9px peek
         assert_eq!(
-            snap_window_rect(1010, 26, 540, 128, area, 48, 8),
-            (1010, 0, DockEdge::Top)
+            snap_window_rect(1040, 26, 480, 64, area, 48, 8),
+            (1040, 0, DockEdge::Top)
         );
         assert_eq!(
-            tucked_window_pos(1010, 0, 540, 128, area, 10, DockEdge::Top, false),
-            (1010, -118)
-        );
-
-        // Dragged near right edge -> snaps flush to Right (x = 2560 - 540 = 2020) and tucks rightward to x = 2550
-        assert_eq!(
-            snap_window_rect(2005, 520, 540, 128, area, 48, 8),
-            (2020, 520, DockEdge::Right)
-        );
-        assert_eq!(
-            tucked_window_pos(2020, 520, 540, 128, area, 10, DockEdge::Right, false),
-            (2550, 520)
+            tucked_window_pos(1040, 0, 480, 64, area, 9, DockEdge::Top, false),
+            (1040, -55)
         );
 
-        // Dragged near left edge -> snaps flush to Left (x = 0) and tucks leftward to x = -530
+        // Dragged near right edge -> snaps flush to Right (x = 2560 - 480 = 2080) and tucks rightward to x = 2551
         assert_eq!(
-            snap_window_rect(18, 480, 540, 128, area, 48, 8),
+            snap_window_rect(2065, 520, 480, 64, area, 48, 8),
+            (2080, 520, DockEdge::Right)
+        );
+        assert_eq!(
+            tucked_window_pos(2080, 520, 480, 64, area, 9, DockEdge::Right, false),
+            (2551, 520)
+        );
+
+        // Dragged near left edge -> snaps flush to Left (x = 0) and tucks leftward to x = -471
+        assert_eq!(
+            snap_window_rect(18, 480, 480, 64, area, 48, 8),
             (0, 480, DockEdge::Left)
         );
         assert_eq!(
-            tucked_window_pos(0, 480, 540, 128, area, 10, DockEdge::Left, false),
-            (-530, 480)
+            tucked_window_pos(0, 480, 480, 64, area, 9, DockEdge::Left, false),
+            (-471, 480)
         );
 
         // Dragged to center -> stays free-floating (DockEdge::None)
         assert_eq!(
-            snap_window_rect(800, 450, 540, 128, area, 48, 8),
+            snap_window_rect(800, 450, 480, 64, area, 48, 8),
             (800, 450, DockEdge::None)
         );
     }
@@ -1983,31 +1983,31 @@ mod tests {
             w: 2560,
             h: 1400,
         };
-        // Top docked at (1010, 0), width 540 -> center_x = 1280
+        // Top docked at (1040, 0), width 480 -> center_x = 1280
         assert!(is_cursor_in_tucked_handle(
-            1280, 2, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+            1280, 2, 1040, 0, 480, 64, area, 1.0, DockEdge::Top
         ));
         assert!(!is_cursor_in_tucked_handle(
-            2400, 2, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+            2400, 2, 1040, 0, 480, 64, area, 1.0, DockEdge::Top
         ));
         assert!(!is_cursor_in_tucked_handle(
-            1280, 35, 1010, 0, 540, 128, area, 1.0, DockEdge::Top
+            1280, 35, 1040, 0, 480, 64, area, 1.0, DockEdge::Top
         ));
 
-        // Left docked at (0, 500), height 128 -> center_y = 564, x in [-4..14]
+        // Left docked at (0, 500), height 64 -> center_y = 532, x in [-4..14]
         assert!(is_cursor_in_tucked_handle(
-            3, 560, 0, 500, 540, 128, area, 1.0, DockEdge::Left
+            3, 530, 0, 500, 480, 64, area, 1.0, DockEdge::Left
         ));
         assert!(!is_cursor_in_tucked_handle(
-            3, 900, 0, 500, 540, 128, area, 1.0, DockEdge::Left
+            3, 900, 0, 500, 480, 64, area, 1.0, DockEdge::Left
         ));
 
-        // Right docked at (2020, 500), height 128 -> center_y = 564, x in [2546..2564]
+        // Right docked at (2080, 500), height 64 -> center_y = 532, x in [2546..2564]
         assert!(is_cursor_in_tucked_handle(
-            2557, 560, 2020, 500, 540, 128, area, 1.0, DockEdge::Right
+            2557, 530, 2080, 500, 480, 64, area, 1.0, DockEdge::Right
         ));
         assert!(!is_cursor_in_tucked_handle(
-            2557, 200, 2020, 500, 540, 128, area, 1.0, DockEdge::Right
+            2557, 200, 2080, 500, 480, 64, area, 1.0, DockEdge::Right
         ));
     }
 
@@ -2020,21 +2020,21 @@ mod tests {
             h: 1400,
         };
         let home_x = 1800;
-        let home_y = 1220;
-        // Collapsed height (122px): stays at exact home_y = 1220
+        let home_y = 1280;
+        // Collapsed single-row height (64px): stays at exact home_y = 1280
         assert_eq!(
-            compute_visible_pod_pos(home_x, home_y, 540, 122, area, DockEdge::None, 8),
-            (1800, 1220)
+            compute_visible_pod_pos(home_x, home_y, 480, 64, area, DockEdge::None, 8),
+            (1800, 1280)
         );
-        // Expanded drawer height (360px): temporarily pushed up to 1400 - 360 - 8 = 1032 so it doesn't go behind taskbar
+        // Expanded platter height (380px): temporarily pushed up to 1400 - 380 - 8 = 1012
         assert_eq!(
-            compute_visible_pod_pos(home_x, home_y, 540, 360, area, DockEdge::None, 8),
-            (1800, 1032)
+            compute_visible_pod_pos(home_x, home_y, 480, 380, area, DockEdge::None, 8),
+            (1800, 1012)
         );
-        // Closing drawer back to 122px: returns pixel-perfectly to original home_y = 1220!
+        // Closing platter back to 64px: returns pixel-perfectly to original home_y = 1280!
         assert_eq!(
-            compute_visible_pod_pos(home_x, home_y, 540, 122, area, DockEdge::None, 8),
-            (1800, 1220)
+            compute_visible_pod_pos(home_x, home_y, 480, 64, area, DockEdge::None, 8),
+            (1800, 1280)
         );
     }
 
@@ -2046,16 +2046,16 @@ mod tests {
             w: 2560,
             h: 1400,
         };
-        // Pod docked at Right edge (2020, 600) -> Orb parks near right edge at (2560 - 72 - 8 = 2480, 625)
-        let (ox, oy) = compute_orb_pos_from_pod(2020, 600, 540, 122, 72, area, DockEdge::Right, 8);
-        assert_eq!((ox, oy), (2480, 625));
+        // Pod docked at Right edge (2080, 600) -> 60x60 Orb parks near right edge at (2560 - 60 - 8 = 2492, 602)
+        let (ox, oy) = compute_orb_pos_from_pod(2080, 600, 480, 64, 60, area, DockEdge::Right, 8);
+        assert_eq!((ox, oy), (2492, 602));
 
-        // Dragging the Orb to right edge (2480, 800) updates pod home to Right-docked (2020, 775)
-        let (px, py, edge) = compute_pod_pos_from_orb(2480, 800, 72, 540, 122, area, 8);
-        assert_eq!((px, py, edge), (2020, 775, DockEdge::Right));
+        // Dragging the Orb to right edge (2492, 800) updates pod home to Right-docked (2080, 798)
+        let (px, py, edge) = compute_pod_pos_from_orb(2492, 800, 60, 480, 64, area, 8);
+        assert_eq!((px, py, edge), (2080, 798, DockEdge::Right));
 
         // Dragging the Orb to middle of screen (1200, 500) updates pod home to Free-floating centered on the orb
-        let (px2, py2, edge2) = compute_pod_pos_from_orb(1200, 500, 72, 540, 122, area, 8);
-        assert_eq!((px2, py2, edge2), (966, 475, DockEdge::None));
+        let (px2, py2, edge2) = compute_pod_pos_from_orb(1200, 500, 60, 480, 64, area, 8);
+        assert_eq!((px2, py2, edge2), (990, 498, DockEdge::None));
     }
 }

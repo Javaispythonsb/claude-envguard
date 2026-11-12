@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-runtime="web" data-dock="top" data-standby="edge" data-orb="false" data-tucked="false" data-seam="false" data-idle="false" data-preview="none">
+<html lang="zh-CN" data-runtime="web" data-dock="top" data-standby="edge" data-orb="false" data-tucked="false" data-seam="false" data-idle="false" data-preview="none" data-expanded="false">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#050507">
+  <meta name="theme-color" content="#07080a">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
   <link rel="manifest" href="./manifest.webmanifest">
   <title>Claude 环境卫士 · EnvGuard</title>
@@ -11,166 +11,254 @@
 </head>
 <body>
 
-  <!-- ================= PC FLOATING SPOTLIGHT POD ================= -->
+  <!-- ================= DESKTOP DYNAMIC ISLAND & PLATTER STAGE ================= -->
   <div class="pod-stage" id="pcApp">
 
     <!-- 拖拽贴边磁吸光带预览 -->
     <div class="snap-guide" aria-hidden="true"></div>
 
-    <!-- 贴边隐藏态：灵动微光边缘感应条 -->
+    <!-- Minimal 待机态 ①：灵动微光贴边感应条 (9px) -->
     <div class="edge-handle" id="edgeHandle" aria-hidden="true">
       <i class="edge-bar" id="edgeStatusBar"></i>
     </div>
 
-    <!-- 呼吸盾圆球待机态（设置中选择「盾牌圆球」时启用：支持按住拖拽、点击展开） -->
+    <!-- Minimal 待机态 ②：60×60 陶瓷黑高光微球（按住可拖动 · 点击展开） -->
     <div class="shield-orb" id="shieldOrb" title="点击展开 · 按住可拖动">
-      <svg class="orb-shield" viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+      <span class="orb-glow" aria-hidden="true"></span>
+      <svg class="orb-shield" id="orbShieldSvg" viewBox="0 0 24 24" aria-hidden="true">
+        <path class="shield-outline" d="M12 21.35c5.2-2.65 7.5-6.25 7.5-10.6V5.6L12 2.75 4.5 5.6v5.15c0 4.35 2.3 7.95 7.5 10.6Z"/>
+        <path class="shield-mark" id="orbMarkPath" d="m9.2 12.1 2 2.05 3.85-3.95"/>
       </svg>
     </div>
 
-    <div class="pod obsidian" id="podCard" data-tauri-drag-region="deep">
+    <!-- Compact 单行胶囊 (480×64) ⇄ Expanded 同心控制面板 (480×auto) -->
+    <div class="pod" id="podCard" data-tauri-drag-region="deep">
 
-      <!-- 主舱行（按住任意空白处自由拖拽悬浮窗） -->
+      <!-- Compact 主岛单行（Leading 状态环 · Center 双行摘要 · Trailing 同心胶囊组） -->
       <div class="pod-main">
         <div class="ring-gauge" id="ringGauge">
           <div class="ring-inner" id="ringIcon">
-            <svg class="ico lg" viewBox="0 0 24 24" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+            <svg class="ico md" viewBox="0 0 24 24" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
           </div>
         </div>
 
         <div class="pod-text">
           <h1 id="heroTitle">正在审计…</h1>
-          <p id="heroSub">检测网络与保镖状态</p>
+          <p id="heroSub">检测网络隧道与常驻保镖</p>
         </div>
 
         <div class="pod-actions">
-          <button type="button" class="pill-btn cli-btn" id="btnLaunchCli" disabled>CLI</button>
-          <button type="button" class="cta-white" id="btnLaunchDesktop" disabled>审计中…</button>
-          <button type="button" class="close-dot" id="btnHideWin" title="收起至边缘 (Esc)" aria-label="收起悬浮窗">
-            <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <button type="button" class="capsule-secondary" id="btnLaunchCli" disabled title="在安全隔离环境启动 Claude Code CLI">CLI</button>
+          <button type="button" class="capsule-primary" id="btnPrimaryAction" data-tone="muted" disabled>审计中…</button>
+          <button type="button" class="circle-icon expand-btn" id="btnToggleExpand" aria-expanded="false" aria-controls="expandedSheet" title="展开控制面板">
+            <svg class="ico sm chev" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
         </div>
       </div>
 
-      <!-- 按需下拉抽屉 ①：14 项极简状态网格（默认隐藏） -->
-      <section class="drawer" id="drawerDetails" hidden>
-        <div class="chip-grid" id="checkListGrid"></div>
-      </section>
+      <!-- Expanded 展开态控制中心托盘（默认隐藏，保持单行 64px 紧凑灵动岛） -->
+      <div class="expanded-sheet" id="expandedSheet" hidden>
 
-      <!-- 按需下拉抽屉 ②：隔离浏览器 & 实用工具（默认隐藏） -->
-      <section class="drawer" id="drawerTools" hidden>
-        <div class="url-row">
-          <input class="pod-input" id="safeUrlInput" aria-label="隔离打开链接" placeholder="粘贴链接在一次性隔离窗口打开 (https://...)">
-          <button type="button" class="cta-white sm" id="btnOpenSafe">打开</button>
-        </div>
+        <!-- 顶部分段控制器 + 快捷图标栏 -->
+        <div class="sheet-bar">
+          <div class="seg-track" id="mainSegTrack" role="tablist" aria-label="控制面板视图" style="--seg-idx: 0;">
+            <span class="seg-glider" aria-hidden="true"></span>
+            <button type="button" class="seg-tab active" role="tab" aria-selected="true" data-tab="overview">概览</button>
+            <button type="button" class="seg-tab" role="tab" aria-selected="false" data-tab="tools">工具</button>
+            <button type="button" class="seg-tab" role="tab" aria-selected="false" data-tab="settings">设置</button>
+          </div>
 
-        <div class="tool-pills">
-          <button type="button" class="tool-pill" data-tool="set-region">重锁地区</button>
-          <button type="button" class="tool-pill" data-tool="rules-status">规则透视</button>
-          <button type="button" class="tool-pill" data-tool="fingerprint">硬件指纹</button>
-          <button type="button" class="tool-pill" data-tool="export-diagnostics">导出诊断</button>
-          <button type="button" class="tool-pill" data-tool="upstream-status">检查更新</button>
-          <button type="button" class="tool-pill" id="btnInlineBrowserCheck">浏览器自检</button>
-        </div>
-
-        <div class="console-box" id="toolOutputBox" data-tauri-drag-region="false" hidden>
-          <pre id="consoleOut"></pre>
-        </div>
-
-        <div class="inline-bcheck" id="inlineBrowserBox" hidden>
-          <div class="bcheck-grid" id="inlineMobileList">
-            <div class="pod-chip" data-mkey="egress"><span>出口归属</span><b class="mval">…</b></div>
-            <div class="pod-chip" data-mkey="region"><span>浏览器时区</span><b class="mval">…</b></div>
-            <div class="pod-chip" data-mkey="webrtc"><span>WebRTC</span><b class="mval">…</b></div>
-            <div class="pod-chip" data-mkey="ipv6"><span>IPv6 暴露</span><b class="mval">…</b></div>
-            <div class="pod-chip" data-mkey="dns"><span>DNS 归属</span><b class="mval">…</b></div>
-            <div class="pod-chip" data-mkey="fp"><span>硬件摘要</span><b class="mval">…</b></div>
+          <div class="sheet-quick-icons">
+            <button type="button" class="circle-icon sm" id="btnRecheck" title="重新执行 14 项环境审计" aria-label="重新审计">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+            </button>
+            <button type="button" class="circle-icon sm" id="btnPinPod" title="自动待机中（点击固定展开）" aria-label="固定展开">
+              <svg class="ico xs" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
+            </button>
+            <button type="button" class="circle-icon sm" id="btnHideWin" title="收起至待机态 (Esc)" aria-label="收起窗口">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+            </button>
           </div>
         </div>
-      </section>
 
-      <!-- 按需下拉抽屉 ③：检查策略与代理客户端设置（默认隐藏） -->
-      <section class="drawer" id="drawerSettings" hidden>
-        <div class="set-top">
-          <div class="set-client">
-            <label for="proxyClientSelect">内核</label>
-            <select class="pod-select" id="proxyClientSelect">
-              <option value="clash-verge">Clash Verge</option>
-              <option value="flclash">FlClash</option>
-              <option value="sing-box">sing-box</option>
-              <option value="clashx">ClashX</option>
-              <option value="surge">Surge</option>
-              <option value="wireguard">WireGuard</option>
-              <option value="other">其他 TUN</option>
-              <option value="auto">自动识别</option>
-            </select>
-            <div class="port-inline" id="flclashPortWrap" hidden>
-              <input class="pod-input port-in" id="flclashPortInput" aria-label="FlClash 端口" placeholder="端口 auto">
-              <button type="button" class="pod-mini" id="btnSavePort">存</button>
+        <!-- 视图 ①：概览（2×2 控制中心精选磁贴 + 7×2 无空缺内嵌清单 + 底栏角色分离） -->
+        <section class="tab-panel" id="panelOverview" role="tabpanel">
+          <div class="cc-grid" id="ccTileGrid">
+            <div class="cc-tile" data-cc="tunnel">
+              <div class="cc-icon" data-tone="skip">
+                <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14a8 8 0 0 1 16 0"/><path d="M7.5 16.5a4.5 4.5 0 0 1 9 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor"/></svg>
+              </div>
+              <div class="cc-meta">
+                <b class="cc-title">代理内核</b>
+                <span class="cc-sub">等待探测</span>
+              </div>
+            </div>
+
+            <div class="cc-tile" data-cc="egress">
+              <div class="cc-icon" data-tone="skip">
+                <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8"/><path d="M3.6 15h16.8"/><path d="M12 3a14.5 14.5 0 0 0 0 18"/><path d="M12 3a14.5 14.5 0 0 1 0 18"/></svg>
+              </div>
+              <div class="cc-meta">
+                <b class="cc-title">出口地区</b>
+                <span class="cc-sub">等待探测</span>
+              </div>
+            </div>
+
+            <div class="cc-tile" data-cc="leak">
+              <div class="cc-icon" data-tone="skip">
+                <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s7-3.6 7-9.2V5.5L12 3 5 5.5v6.3C5 17.4 12 21 12 21Z"/><path d="m9.5 12 1.8 1.8 3.4-3.5"/></svg>
+              </div>
+              <div class="cc-meta">
+                <b class="cc-title">DNS 与 WebRTC</b>
+                <span class="cc-sub">等待探测</span>
+              </div>
+            </div>
+
+            <div class="cc-tile" data-cc="guard">
+              <div class="cc-icon" data-tone="skip">
+                <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg>
+              </div>
+              <div class="cc-meta">
+                <b class="cc-title">常驻保镖</b>
+                <span class="cc-sub">10s 巡检就绪</span>
+              </div>
             </div>
           </div>
 
-          <div class="standby-switch" role="group" aria-label="待机形态">
-            <span class="st-label">待机</span>
-            <div class="seg-mini">
-              <button type="button" class="seg-btn on" data-standby-pick="edge">贴边光条</button>
-              <button type="button" class="seg-btn" data-standby-pick="orb">盾牌圆球</button>
+          <!-- 14 项对称内嵌分组列表（2列 × 7行 = 14项，0 空缺格） -->
+          <div class="inset-platter">
+            <div class="check-matrix" id="checkListGrid"></div>
+          </div>
+
+          <footer class="sheet-foot">
+            <div class="foot-left">
+              <button type="button" class="pill-action-amber" id="btnFix" disabled title="当前环境正常，无需修复">
+                <svg class="ico xs" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg>
+                <span id="btnFixText">无需修复</span>
+              </button>
+              <span class="ver-note" id="appVersionTag">EnvGuard v2.0</span>
+            </div>
+
+            <button type="button" class="pill-destructive" id="btnShieldRestore" title="关闭 Claude 进程并按快照还原系统网络与区域">退出护盾</button>
+          </footer>
+        </section>
+
+        <!-- 视图 ②：工具（一次性隔离窗口 + 3×2 同心工具磁贴 + 控制台/自检托盘） -->
+        <section class="tab-panel" id="panelTools" role="tabpanel" hidden>
+          <div class="inset-platter pad-sm">
+            <div class="url-row">
+              <svg class="ico sm muted-ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <input class="platter-input" id="safeUrlInput" aria-label="隔离打开链接" placeholder="粘贴链接在一次性无痕隔离窗口打开 (https://...)">
+              <button type="button" class="pill-blue" id="btnOpenSafe">打开</button>
             </div>
           </div>
 
-          <div class="set-btns">
-            <button type="button" class="pod-mini" id="btnResetDefaults">默认</button>
-            <button type="button" class="cta-white sm" id="btnSaveSettings">保存</button>
+          <div class="tool-bento">
+            <button type="button" class="tool-tile" data-tool="set-region">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M3 12h18"/></svg>
+              <span>重锁地区</span>
+            </button>
+            <button type="button" class="tool-tile" data-tool="rules-status">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>
+              <span>规则透视</span>
+            </button>
+            <button type="button" class="tool-tile" data-tool="fingerprint">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg>
+              <span>硬件指纹</span>
+            </button>
+            <button type="button" class="tool-tile" id="btnInlineBrowserCheck">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              <span>浏览器自检</span>
+            </button>
+            <button type="button" class="tool-tile" data-tool="export-diagnostics">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span>导出诊断</span>
+            </button>
+            <button type="button" class="tool-tile" data-tool="upstream-status">
+              <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+              <span>检查更新</span>
+            </button>
           </div>
-        </div>
 
-        <div class="opt-tiles" id="optionalChecksContainer"></div>
+          <div class="console-platter" id="toolOutputBox" data-tauri-drag-region="false" hidden>
+            <pre id="consoleOut"></pre>
+          </div>
 
-        <div class="set-flags">
-          <button type="button" class="flag-chip" role="switch" aria-checked="false" id="tgAllowOptional">
-            <i class="sdot"></i><span>可选项失败仅警告</span>
-          </button>
-          <button type="button" class="flag-chip on" role="switch" aria-checked="true" id="tgLogging">
-            <i class="sdot"></i><span>记录脱敏日志</span>
-          </button>
-          <span class="ver-note" id="appVersionTag">v2.0</span>
-        </div>
-      </section>
+          <div class="inset-platter" id="inlineBrowserBox" hidden>
+            <div class="bcheck-matrix" id="inlineMobileList">
+              <div class="matrix-row" data-mkey="egress"><span class="mname">出口归属</span><b class="mval">…</b></div>
+              <div class="matrix-row" data-mkey="region"><span class="mname">浏览器时区</span><b class="mval">…</b></div>
+              <div class="matrix-row" data-mkey="webrtc"><span class="mname">WebRTC</span><b class="mval">…</b></div>
+              <div class="matrix-row" data-mkey="ipv6"><span class="mname">IPv6 暴露</span><b class="mval">…</b></div>
+              <div class="matrix-row" data-mkey="dns"><span class="mname">DNS 归属</span><b class="mval">…</b></div>
+              <div class="matrix-row" data-mkey="fp"><span class="mname">硬件摘要</span><b class="mval">…</b></div>
+            </div>
+          </div>
+        </section>
 
-      <!-- 底栏微胶囊条 -->
-      <footer class="pod-bar">
-        <div class="pod-pills">
-          <button type="button" class="pod-mini" id="btnRecheck">
-            <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
-            <span>重检</span>
-          </button>
-          <button type="button" class="pod-mini" id="btnFix" disabled title="当前环境正常，无需修复">
-            <svg class="ico sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg>
-            <span>修复</span>
-          </button>
-          <button type="button" class="pod-mini" id="btnTabTools" data-drawer-btn="tools">隔离打开</button>
-          <button type="button" class="pod-mini" id="btnTabSettings" data-drawer-btn="settings">设置</button>
-          <button type="button" class="pod-mini" id="btnShieldRestore">退出护盾</button>
-        </div>
+        <!-- 视图 ③：设置（内嵌分组行 + 原生胶囊拨动开关 Switch） -->
+        <section class="tab-panel" id="panelSettings" role="tabpanel" hidden>
+          <div class="inset-platter">
+            <div class="setting-row">
+              <label class="setting-label" for="proxyClientSelect">代理客户端内核</label>
+              <div class="setting-ctrl">
+                <div class="port-inline" id="flclashPortWrap" hidden>
+                  <input class="port-input" id="flclashPortInput" aria-label="FlClash 控制端口" placeholder="端口 auto">
+                  <button type="button" class="mini-pill" id="btnSavePort">存</button>
+                </div>
+                <select class="platter-select" id="proxyClientSelect">
+                  <option value="clash-verge">Clash Verge</option>
+                  <option value="flclash">FlClash</option>
+                  <option value="sing-box">sing-box</option>
+                  <option value="clashx">ClashX</option>
+                  <option value="surge">Surge</option>
+                  <option value="wireguard">WireGuard</option>
+                  <option value="other">其他 TUN</option>
+                  <option value="auto">自动识别</option>
+                </select>
+              </div>
+            </div>
 
-        <div class="pod-right-pills">
-          <button type="button" class="pod-mini icon-only" id="btnPinPod" title="自动贴边隐藏中（点击固定展开）" aria-label="固定展开">
-            <svg class="ico xs" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
-          </button>
-          <button type="button" class="pod-mini detail-toggle" id="btnTabDetails" data-drawer-btn="details">
-            <span>明细</span>
-            <svg class="ico xs chev" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          </button>
-        </div>
-      </footer>
+            <div class="setting-row">
+              <span class="setting-label">收起后待机形态</span>
+              <div class="seg-mini" role="group" aria-label="待机形态">
+                <button type="button" class="seg-mini-btn on" data-standby-pick="edge">贴边光条</button>
+                <button type="button" class="seg-mini-btn" data-standby-pick="orb">陶瓷盾球</button>
+              </div>
+            </div>
+          </div>
 
+          <!-- 8 项非关键检查原生拨动开关矩阵 (2列 × 4行) -->
+          <div class="inset-platter">
+            <div class="switch-matrix" id="optionalChecksContainer"></div>
+          </div>
+
+          <div class="set-foot-bar">
+            <div class="policy-switches">
+              <button type="button" class="inline-switch-row" role="switch" aria-checked="false" id="tgAllowOptional">
+                <span>失败仅警告</span>
+                <i class="ios-switch" aria-hidden="true"><b class="ios-thumb"></b></i>
+              </button>
+              <button type="button" class="inline-switch-row on" role="switch" aria-checked="true" id="tgLogging">
+                <span>脱敏日志</span>
+                <i class="ios-switch" aria-hidden="true"><b class="ios-thumb"></b></i>
+              </button>
+            </div>
+
+            <div class="set-actions">
+              <button type="button" class="mini-pill" id="btnResetDefaults">恢复默认</button>
+              <button type="button" class="pill-blue" id="btnSaveSettings">保存</button>
+            </div>
+          </div>
+        </section>
+
+      </div>
     </div>
   </div>
 
   <!-- ================= STANDALONE WEB / MOBILE PWA ================= -->
   <div class="web-stage" id="mobileApp">
-    <div class="web-pod obsidian">
+    <div class="web-pod">
       <div class="web-head">
         <div class="ring-gauge sm" id="mRingGauge">
           <div class="ring-inner sm" id="mRingIcon">
@@ -181,19 +269,21 @@
           <h2 id="mHeroTitle">准备就绪</h2>
           <p id="mHeroDesc">5 项浏览器防漏信号 + 1 项硬件参考</p>
         </div>
-        <button type="button" class="cta-white sm" id="btnRunMobileCheck">重测</button>
+        <button type="button" class="capsule-primary" id="btnRunMobileCheck" data-tone="green">重测</button>
       </div>
 
-      <div class="web-list" id="mobileCheckList">
-        <div class="web-row" data-mkey="egress"><span>出口归属</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
-        <div class="web-row" data-mkey="region"><span>时区与语言</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
-        <div class="web-row" data-mkey="webrtc"><span>WebRTC 候选</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
-        <div class="web-row" data-mkey="ipv6"><span>IPv6 暴露</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
-        <div class="web-row" data-mkey="dns"><span>DNS 归属</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
-        <div class="web-row" data-mkey="fp"><span>硬件摘要</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+      <div class="inset-platter">
+        <div class="web-list" id="mobileCheckList">
+          <div class="web-row" data-mkey="egress"><span>出口归属</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+          <div class="web-row" data-mkey="region"><span>时区与语言</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+          <div class="web-row" data-mkey="webrtc"><span>WebRTC 候选</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+          <div class="web-row" data-mkey="ipv6"><span>IPv6 暴露</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+          <div class="web-row" data-mkey="dns"><span>DNS 归属</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+          <div class="web-row" data-mkey="fp"><span>硬件摘要</span><b class="wval">等待检测</b><i class="sdot skip"></i></div>
+        </div>
       </div>
 
-      <div class="web-foot">经 ipinfo / Cloudflare / ipify / ipleak 实时检测 · 本地不上传</div>
+      <div class="web-foot">经 ipinfo / Cloudflare / ipify / ipleak 实时检测 · 本地纯静态执行</div>
     </div>
   </div>
 
