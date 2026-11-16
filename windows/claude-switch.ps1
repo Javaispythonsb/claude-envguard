@@ -1459,11 +1459,22 @@ function Write-ClashScriptRules {
         foreach ($d in $CLAUDE_DOMAINS) { $rules += "DOMAIN-SUFFIX,$d,$PROXY_GROUP" }
         foreach ($p in $CLAUDE_PORTS) { $rules += "DST-PORT,$p,$PROXY_GROUP" }
         $json = ConvertTo-Json -InputObject @($rules) -Compress
+        $domainsJs = ($CLAUDE_DOMAINS | ForEach-Object { "'$_'" }) -join ','
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
             "  const pinnedRules = $json;`r`n" +
             "  config.rules = pinnedRules.concat((config.rules||[]).filter(r=>!pinnedRules.includes(r)));`r`n" +
             "  config.ipv6 = false;`r`n" +
-            "  if (config.dns && typeof config.dns === 'object') { config.dns.ipv6 = false; }`r`n" +
+            "  if (!config.dns || typeof config.dns !== 'object') { config.dns = {}; }`r`n" +
+            "  config.dns.enable = true;`r`n" +
+            "  config.dns.ipv6 = false;`r`n" +
+            "  config.dns['enhanced-mode'] = 'fake-ip';`r`n" +
+            "  config.dns['fake-ip-range'] = '198.18.0.1/16';`r`n" +
+            "  config.dns.nameserver = ['tls://8.8.8.8','tls://1.1.1.1'];`r`n" +
+            "  var _cd = [$domainsJs];`r`n" +
+            "  config.dns['fake-ip-filter'] = (config.dns['fake-ip-filter']||[]).filter(function(f){`r`n" +
+            "    var s = f.replace(/^[+*]\./,'');`r`n" +
+            "    return !_cd.some(function(d){ return s === d || s.endsWith('.'+d); });`r`n" +
+            "  });`r`n" +
             "  if (config.tun && typeof config.tun === 'object') { config.tun['strict-route'] = true; }`r`n" +
             "// <<< claude-switcher managed rules <<<"
 
