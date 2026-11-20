@@ -3,6 +3,16 @@
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
+# 桌面版(Tauri)的 resource_dir() 在 Windows 上给出 \\?\C:\... 扩展长度路径,原样传给 -File 后 $PSScriptRoot/$PSCommandPath
+# 也带该前缀;Join-Path 等 provider cmdlet 无法解析其盘符,会抛"参数 drive 的值为空"并中断整个修复。统一规范为普通路径。
+function ConvertFrom-VerbatimPath([string]$Path) {
+    if ($Path -match '^\\\\\?\\([A-Za-z]:\\.*)$') { return $Matches[1] }
+    if ($Path -match '^\\\\\?\\UNC\\(.+)$') { return '\\' + $Matches[1] }
+    return $Path
+}
+$SCRIPT_PATH = ConvertFrom-VerbatimPath ([string]$PSCommandPath)
+$SCRIPT_DIR = ConvertFrom-VerbatimPath ([string]$PSScriptRoot)
+
 # ============ 安装时可配置项(安装器自动改写) ============
 $PROXY_MODE = "clash-verge"            # 代理客户端: clash-verge|flclash|sing-box|clashx|surge|wireguard|other|auto
 $COUNTRY_TARGET = "US"                 # 目标出口国家(安装时按出口自动识别)
@@ -19,7 +29,7 @@ $IANA_TZ_OVERRIDE = ""
 # 1) 若用户目录已有旧版 $BASE\claude-switch.ps1,只读继承其 5 项锁定配置(绝不覆盖原文件);
 # 2) 若存在 $BASE\envguard-config.json,再叠加其中的最新客户端/地区锁定值。
 function Initialize-RuntimeConfig {
-    $selfFull = if ($PSCommandPath) { try { [IO.Path]::GetFullPath($PSCommandPath) } catch { '' } } else { '' }
+    $selfFull = if ($SCRIPT_PATH) { try { [IO.Path]::GetFullPath($SCRIPT_PATH) } catch { '' } } else { '' }
     $installedCore = Join-Path $BASE 'claude-switch.ps1'
     $installedFull = try { [IO.Path]::GetFullPath($installedCore) } catch { '' }
     if ($selfFull -and $installedFull -and ($selfFull -ine $installedFull) -and (Test-Path -LiteralPath $installedCore -PathType Leaf)) {
@@ -380,7 +390,7 @@ function Set-ClientMode([string]$Mode) {
         "FAIL:用法: claude-switch.ps1 set-client <clash-verge|flclash|sing-box|clashx|surge|wireguard|other|auto>"
         return
     }
-    $selfPath = $PSCommandPath
+    $selfPath = $SCRIPT_PATH
     if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
     if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath)) {
         $script:exitCode = 1
@@ -920,7 +930,7 @@ function Invoke-SetRegion {
     }
     $locale = Get-CountryLocale $country
 
-    $selfPath = $PSCommandPath
+    $selfPath = $SCRIPT_PATH
     if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
     if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath)) {
         "FAIL:无法定位当前脚本,配置未写入"
@@ -1561,7 +1571,7 @@ function Resolve-ClashProxyGroup([switch]$Persist) {
         $script:PROXY_GROUP = $resolved
         if ($Persist) {
             try {
-                $selfPath = $PSCommandPath
+                $selfPath = $SCRIPT_PATH
                 if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
                 if ($selfPath -and (Test-SelfInBase $selfPath) -and (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
                     $oldText = [System.IO.File]::ReadAllText($selfPath)
@@ -1879,6 +1889,67 @@ function Remove-LegacyMergeRules {
         }
         return $result
     }
+}
+
+function Test-CurrentProcessElevated {
+    try {
+        $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        return [bool]$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+# 以管理员权限执行一组命令。当前进程已是管理员(如内置 Administrator、管理员终端)时直接以同一令牌执行,
+# 不经过 RunAs;否则弹 UAC。返回 ok/detail/direct,调用方必须再复查系统实际状态,不能只信退出码。
+function Invoke-AdminScript([string[]]$Lines) {
+    $r = @{ ok = $false; detail = ''; direct = $false }
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-fix-$([guid]::NewGuid().Guid).ps1")
+    $resultFile = "$tmp.result.txt"
+    $resultEsc = $resultFile.Replace("'", "''")
+    $body = @("`$Error.Clear()") + @($Lines) + @(
+        "@(`$Error | Select-Object -First 5 | ForEach-Object { [string]`$_.Exception.Message }) | Set-Content -LiteralPath '$resultEsc' -Encoding UTF8",
+        'exit 0'
+    )
+    try {
+        [System.IO.File]::WriteAllText($tmp, ($body -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+        $code = $null
+        if (Test-CurrentProcessElevated) {
+            $r.direct = $true
+            # 用 Process API 直接启动:不受调用方 $ErrorActionPreference 影响,也不把子进程 stderr 转成错误记录
+            $psi = New-Object System.Diagnostics.ProcessStartInfo 'powershell.exe', "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $child = [System.Diagnostics.Process]::Start($psi)
+            if (-not $child.WaitForExit(180000)) {
+                try { $child.Kill() } catch {}
+                $r.detail = '管理员脚本超时(180 秒)'
+                return $r
+            }
+            $code = $child.ExitCode
+        } else {
+            try {
+                $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" -ErrorAction Stop
+                if ($proc) { $code = $proc.ExitCode }
+            } catch {
+                $r.detail = "管理员授权被取消或无法提权($($_.Exception.Message))"
+                return $r
+            }
+        }
+        $errs = @()
+        if (Test-Path -LiteralPath $resultFile) {
+            $errs = @(Get-Content -LiteralPath $resultFile -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ })
+        }
+        if ($code -eq 0) {
+            $r.ok = $true
+            if ($errs.Count -gt 0) { $r.detail = "部分命令报错: $(($errs | Select-Object -First 2) -join ' / ')" }
+        } else {
+            $r.detail = "管理员脚本退出码=$code$(if ($errs.Count -gt 0) { ': ' + (($errs | Select-Object -First 2) -join ' / ') })"
+        }
+    } catch {
+        $r.detail = "管理员脚本无法执行($($_.Exception.Message))"
+    } finally {
+        Remove-Item -LiteralPath $tmp, $resultFile -Force -ErrorAction SilentlyContinue
+    }
+    return $r
 }
 
 function Get-MihomoKernelPids {
@@ -2501,7 +2572,7 @@ function Invoke-Fix {
         $adminScript += "if (-not (Test-Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient')) { New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Force | Out-Null }; Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DnsClient' -Name 'DisableSmartNameResolution' -Value 1 -Type DWord -Force; `$null = gpupdate /target:computer /force 2>&1"
     }
     $bgFix = Get-BodyguardHealth
-    $siblingBg = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'claude-bodyguard.ps1' } else { '' }
+    $siblingBg = if ($SCRIPT_DIR) { Join-Path $SCRIPT_DIR 'claude-bodyguard.ps1' } else { '' }
     $targetBg  = Join-Path $BASE 'claude-bodyguard.ps1'
     if ($siblingBg -and (Test-Path -LiteralPath $siblingBg -PathType Leaf) -and (-not (Test-Path -LiteralPath $targetBg) -or $bgFix.legacyPolicy)) {
         try {
@@ -2521,20 +2592,27 @@ function Invoke-Fix {
     }
     if ($adminScript.Count -gt 0) {
         $adminScript += "Clear-DnsClientCache"
+        $wantIpv6 = [bool](@($adminScript | Where-Object { $_ -match 'Disable-NetAdapterBinding' }).Count)
+        $wantSmhnr = [bool](@($adminScript | Where-Object { $_ -match 'DisableSmartNameResolution' }).Count)
+        $wantTz = [bool](@($adminScript | Where-Object { $_ -match '^Set-TimeZone ' }).Count)
         "FIX:修复时区/IPv6/DNS防漏/保镖(需要管理员授权)..."
-        $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
-        [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
-        $adminOk = $false
-        try {
-            $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
-            if ($proc -and $proc.ExitCode -eq 0) { $adminOk = $true }
-        } catch {}
-        Remove-Item $tmp -ErrorAction SilentlyContinue
-        if ($adminOk) {
-            "FIX:时区/IPv6/DNS防漏/保镖 ✓"
+        $admin = Invoke-AdminScript $adminScript
+        # 不信任退出码:逐项复查系统实际状态,没改好就如实报告是哪一项
+        $notDone = @()
+        if ($wantIpv6) {
+            $still = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled } | ForEach-Object { [string]$_.Name })
+            if ($still.Count -gt 0) { $notDone += "IPv6 仍开启($($still -join ','))" }
+        }
+        if ($wantSmhnr -and -not (Test-SmhnrDisabled)) { $notDone += 'SMHNR 未关闭' }
+        if ($wantTz -and (Get-TimeZone).Id -ne $TZ_TARGET) { $notDone += "时区未改为 $TZ_TARGET" }
+        if ($admin.ok -and $notDone.Count -eq 0) {
+            "FIX:时区/IPv6/DNS防漏/保镖 ✓$(if ($admin.direct) { '(当前已是管理员,未弹 UAC)' })"
         } else {
-            "FIX:管理员授权被取消或执行失败"
-            $fixFailures += '管理员授权未完成'
+            $why = @()
+            if (-not $admin.ok) { $why += $admin.detail }
+            $why += $notDone
+            "FIX:管理员步骤未完成: $($why -join '；')"
+            $fixFailures += "管理员步骤未完成($($why -join '；'))"
         }
     } else {
         try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
@@ -2545,9 +2623,17 @@ function Invoke-Fix {
     Start-Sleep 2
     for ($i = 0; $i -lt 20 -and -not (Test-ProxyPathAlive); $i++) { Start-Sleep 1 }
     $e = Get-Egress
+    # 刚关 IPv6/清 DNS 缓存后隧道内请求可能短暂无响应:探测"没拿到结果"不是"国家不符",重试几次再下结论
+    for ($i = 0; $i -lt 3 -and -not $e.skipped -and -not $e.loc; $i++) {
+        Start-Sleep 3
+        $e = Get-Egress
+    }
     if ($e.skipped) {
         "FIX:出口IP ✗ 代理路径失效,已跳过探测 — 请先恢复代理/TUN 再复验"
         $fixFailures += '代理路径失效'
+    } elseif (-not $e.loc) {
+        "FIX:出口IP ✗ 出口探测未返回结果(网络短暂不稳),请稍后重新检查"
+        $fixFailures += '出口探测无结果'
     } elseif ($e.loc -eq $COUNTRY_TARGET) {
         "FIX:出口IP ✓ ($($e.ip))"
     } else {
@@ -4627,9 +4713,20 @@ try {
         'check'        { Invoke-Check }
         'status'       { Invoke-Status }
         'fix' {
-            $r = @(Invoke-Fix)
-            $r | Out-File -Encoding utf8 "$BASE\last-fix.txt"
-            $r
+            # 边执行边记录:中途异常时把异常与出错行号作为 FAIL 行返回界面,并且无论成败都落盘 last-fix.txt(IP 打码)
+            $fixLines = New-Object System.Collections.Generic.List[string]
+            try {
+                Invoke-Fix | ForEach-Object { $fixLines.Add([string]$_); $_ }
+            } catch {
+                $exitCode = 1
+                $failLine = "FAIL:修复中途异常(第 $($_.InvocationInfo.ScriptLineNumber) 行): $($_.Exception.Message)"
+                $fixLines.Add($failLine)
+                $failLine
+            } finally {
+                try {
+                    @($fixLines | ForEach-Object { $_ -replace '\b\d{1,3}(\.\d{1,3}){3}\b', 'x.x.x.x' }) | Out-File -Encoding utf8 "$BASE\last-fix.txt"
+                } catch {}
+            }
         }
         'switch'       { Invoke-Switch $args[1] }
         'set-region'   { Invoke-SetRegion }

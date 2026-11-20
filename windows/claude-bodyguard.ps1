@@ -8,7 +8,9 @@ New-Item -ItemType Directory -Force -Path $BASE | Out-Null
 $MY_SESSION = try { (Get-Process -Id $PID -ErrorAction Stop).SessionId } catch { -1 }
 
 # 代理模式:优先读脚本同目录,其次读安装器写入的 proxy-mode.txt;缺失时按旧版 Clash Verge 行为
-$modeFile = if ($PSScriptRoot) { Join-Path $PSScriptRoot "proxy-mode.txt" } else { '' }
+# \\?\C:\... 扩展长度路径会让 Join-Path 抛"参数 drive 的值为空",先规范为普通盘符路径
+$guardDir = ([string]$PSScriptRoot) -replace '^\\\\\?\\(?=[A-Za-z]:\\)', ''
+$modeFile = if ($guardDir) { Join-Path $guardDir "proxy-mode.txt" } else { '' }
 if (-not $modeFile -or -not (Test-Path $modeFile)) { $modeFile = Join-Path $BASE "proxy-mode.txt" }
 $PROXY_MODE = if (Test-Path $modeFile) { Get-Content $modeFile -Raw } else { '' }
 if ($PROXY_MODE) { $PROXY_MODE = $PROXY_MODE.Trim() }

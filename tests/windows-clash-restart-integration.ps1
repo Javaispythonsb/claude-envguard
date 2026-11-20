@@ -109,6 +109,50 @@ try {
 
     function Find-ClashVerge { $null }
     Assert '找不到 Clash Verge 时返回 false' (-not (Restart-ClashVerge))
+
+    # 桌面版经 Tauri resource_dir() 传入 \\?\C:\... 路径:必须规范为普通路径,否则 Join-Path 抛"参数 drive 的值为空"中断修复
+    Assert '\\?\ 盘符路径被规范为普通路径' ((ConvertFrom-VerbatimPath '\\?\C:\Users\a\envguard\resources') -eq 'C:\Users\a\envguard\resources')
+    Assert '\\?\UNC 路径被规范为 \\server\share' ((ConvertFrom-VerbatimPath '\\?\UNC\srv\share\x') -eq '\\srv\share\x')
+    Assert '普通路径保持不变' ((ConvertFrom-VerbatimPath 'D:\repo\windows') -eq 'D:\repo\windows')
+    Assert '规范后的目录可用于 Join-Path' ((Join-Path (ConvertFrom-VerbatimPath '\\?\C:\Users\a\resources') 'claude-bodyguard.ps1') -eq 'C:\Users\a\resources\claude-bodyguard.ps1')
+
+    # 端到端:真的经 \\?\ 路径运行一段脚本,确认核心脚本开头的规范代码让 Join-Path 正常
+    $coreText = [System.IO.File]::ReadAllText($core, [System.Text.Encoding]::UTF8)
+    $from = $coreText.IndexOf('function ConvertFrom-VerbatimPath')
+    $endMarker = '$SCRIPT_DIR = ConvertFrom-VerbatimPath ([string]$PSScriptRoot)'
+    $to = $coreText.IndexOf($endMarker) + $endMarker.Length
+    Assert '核心脚本开头包含路径规范代码' ($from -ge 0 -and $to -gt $from)
+    $probeDir = Join-Path $root 'probe'
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    $probe = Join-Path $probeDir 'p.ps1'
+    $probeBody = $coreText.Substring($from, $to - $from) + "`r`n'DIR=' + `$SCRIPT_DIR`r`n'JOIN=' + (Join-Path `$SCRIPT_DIR 'x.ps1')`r`n"
+    [System.IO.File]::WriteAllText($probe, $probeBody, (New-Object System.Text.UTF8Encoding($true)))
+    $viaVerbatim = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File ('\\?\' + $probe) 2>&1 | Out-String)
+    Assert '经 \\?\ 路径运行时 $SCRIPT_DIR 为普通路径且 Join-Path 正常' ($viaVerbatim -match ('DIR=' + [regex]::Escape($probeDir) + '\s') -and $viaVerbatim -match ('JOIN=' + [regex]::Escape((Join-Path $probeDir 'x.ps1')))) "out=$viaVerbatim"
+
+    # Invoke-AdminScript:只用写沙箱文件等无害命令验证,绝不执行任何系统设置命令
+    $markFile = Join-Path $root 'admin-mark.txt'
+    $markEsc = $markFile.Replace("'", "''")
+    function Test-CurrentProcessElevated { $true }
+    $startedBefore = $script:started.Count
+    $adm = Invoke-AdminScript @("Set-Content -LiteralPath '$markEsc' -Value ok")
+    Assert '已是管理员时直接执行,不走 RunAs' ($adm.ok -and $adm.direct -and $script:started.Count -eq $startedBefore -and (Test-Path -LiteralPath $markFile)) "detail=$($adm.detail) started=$($script:started.Count)"
+    $adm = Invoke-AdminScript @("Get-Item -LiteralPath '$($root.Replace("'", "''"))\no-such-file.txt' -ErrorAction Continue")
+    Assert '命令报错时把错误信息带回调用方' ($adm.ok -and $adm.detail -match '部分命令报错') "detail=$($adm.detail)"
+    $adm = Invoke-AdminScript @('exit 3')
+    Assert '管理员脚本非零退出码时判失败并带回退出码' ((-not $adm.ok) -and $adm.detail -match '退出码=3') "detail=$($adm.detail)"
+    $leftovers = @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetTempPath()) -Filter 'claude-fix-*' -ErrorAction SilentlyContinue)
+    Assert '执行后清理临时脚本与结果文件' ($leftovers.Count -eq 0) "left=$($leftovers.Count)"
+
+    function Test-CurrentProcessElevated { $false }
+    $script:started = @()
+    function Start-Process {
+        [CmdletBinding()]
+        param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, [string]$Verb)
+        if ($Verb -eq 'RunAs') { throw 'The operation was canceled by the user' }
+    }
+    $adm = Invoke-AdminScript @("Set-Content -LiteralPath '$markEsc' -Value again")
+    Assert '非管理员且 UAC 被取消时判失败并说明原因' ((-not $adm.ok) -and (-not $adm.direct) -and $adm.detail -match '管理员授权被取消') "detail=$($adm.detail)"
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }

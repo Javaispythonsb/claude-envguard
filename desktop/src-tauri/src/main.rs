@@ -460,11 +460,29 @@ fn dev_core_script() -> Option<PathBuf> {
     dev_script.is_file().then_some(dev_script)
 }
 
+/// `resource_dir()` on Windows yields extended-length paths such as `\\?\C:\...`.
+/// Handed to `powershell -File`, that prefix leaks into `$PSScriptRoot`, and
+/// `Join-Path` then fails with "the value of argument 'drive' is null", aborting the
+/// whole fix. Convert drive-letter and UNC forms back to ordinary paths.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn resolve_core_script(app: &AppHandle) -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
     {
         if let Some(dev_script) = dev_core_script() {
-            return Ok(dev_script);
+            return Ok(strip_verbatim_prefix(dev_script));
         }
     }
 
@@ -475,7 +493,7 @@ fn resolve_core_script(app: &AppHandle) -> Result<PathBuf, String> {
             res_dir.join("claude-switch.ps1"),
         ] {
             if candidate.is_file() {
-                return Ok(candidate);
+                return Ok(strip_verbatim_prefix(candidate));
             }
         }
     }
@@ -2491,6 +2509,27 @@ mod tests {
         assert!(base.join("evil.txt").exists(), "non-whitelisted names must never be touched");
         assert!(!manifest_path.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_from_script_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\a\.claude-switcher\envguard\resources\claude-switch.ps1")),
+            PathBuf::from(r"C:\Users\a\.claude-switcher\envguard\resources\claude-switch.ps1")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\claude-switch.ps1")),
+            PathBuf::from(r"\\server\share\claude-switch.ps1")
+        );
+        // Ordinary paths and non-drive verbatim forms are left untouched.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\app\claude-switch.ps1")),
+            PathBuf::from(r"C:\app\claude-switch.ps1")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\Volume{abc}\x.ps1")),
+            PathBuf::from(r"\\?\Volume{abc}\x.ps1")
+        );
     }
 
     #[test]

@@ -323,6 +323,8 @@ console.log('NODE_SCRIPT_JS_OK');
         '/configs' = @{ ok = $true; data = [pscustomobject]@{ mode = 'global' } }
     }
     function Get-CheckConfig { $script:CheckConfig }
+    # 开发机终端常是管理员:Invoke-Fix 测试必须强制走打桩的 RunAs 分支,绝不能真的执行提权命令
+    function Test-CurrentProcessElevated { $false }
     function Restart-ClashVerge { $true }
     function Wait-Tun { param([int]$seconds) $true }
     function Start-Sleep { }
@@ -343,12 +345,13 @@ console.log('NODE_SCRIPT_JS_OK');
     Assert 'Invoke-Fix 在 global 模式下仍生成 Script.js 防漏块' (Test-Path -LiteralPath $scriptJsPath)
     Assert 'Invoke-Fix 在 UAC 失败时置 exitCode=1 并报 FAIL 且不误打勾' (
         $script:exitCode -eq 1 -and
-        $fixOut -match '(?m)^FAIL:修复未完全生效\(.*管理员授权未完成' -and
+        $fixOut -match '(?m)^FAIL:修复未完全生效\(.*管理员步骤未完成' -and
         $fixOut -notmatch 'FIX:时区/IPv6/DNS防漏/保镖 ✓'
     ) "exit=$script:exitCode out=$fixOut"
     # 修复重启 Clash 后:新 Meta TUN 网卡晚到且自带 IPv6,出口路径短暂断流 —— 必须等网卡出现后再采样 IPv6,
     # 把它纳入同一次 UAC 关闭,并在出口验证前等路径恢复,而不是一次撞上就判"代理路径失效"
     $script:tick = 0
+    $script:v6Disabled = $false
     $script:adminScripts = @()
     function Start-Sleep { param($Seconds, $Milliseconds) $script:tick++ }
     function Restart-ClashVerge { $script:ClashRestarted = $true; $true }
@@ -356,7 +359,7 @@ console.log('NODE_SCRIPT_JS_OK');
     function Get-NetAdapterBinding {
         param([string]$ComponentID)
         $b = @([pscustomobject]@{ Name = '以太网'; Enabled = $false })
-        if ($script:tick -ge 2) { $b += [pscustomobject]@{ Name = 'Meta'; Enabled = $true } }
+        if ($script:tick -ge 2) { $b += [pscustomobject]@{ Name = 'Meta'; Enabled = (-not $script:v6Disabled) } }
         $b
     }
     function Save-HomeIpv6State { }
@@ -367,6 +370,8 @@ console.log('NODE_SCRIPT_JS_OK');
         param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, [string]$Verb)
         if ($Verb -eq 'RunAs') {
             if ((@($ArgumentList) -join ' ') -match '-File "([^"]+)"') { $script:adminScripts += [System.IO.File]::ReadAllText($Matches[1]) }
+            if ($script:adminScripts[-1] -match 'Disable-NetAdapterBinding') { $script:v6Disabled = $true }
+            if ($script:adminScripts[-1] -match 'DisableSmartNameResolution') { $script:mockSmhnrDisabled = $true }
             return [pscustomobject]@{ ExitCode = 0 }
         }
     }
@@ -375,6 +380,36 @@ console.log('NODE_SCRIPT_JS_OK');
     $fixRace = (@(Invoke-Fix) -join "`n")
     Assert '重启后等新 TUN 网卡出现再采样,其 IPv6 在同一次 UAC 中关闭' ($script:adminScripts.Count -eq 1 -and $script:adminScripts[0] -match 'Disable-NetAdapterBinding') "out=$fixRace"
     Assert '出口验证前等待代理路径恢复,不误判代理路径失效' ($fixRace -match 'FIX:出口IP ✓' -and $fixRace -notmatch '代理路径失效') "out=$fixRace"
+    Assert '提权后复查确认 IPv6 已关闭才打勾' ($fixRace -match 'FIX:时区/IPv6/DNS防漏/保镖 ✓') "out=$fixRace"
+
+    # 提权脚本退出码为 0 但系统状态没变:必须如实报告哪块网卡仍开着 IPv6,不得打勾
+    $script:tick = 5
+    $script:v6Disabled = $false
+    function Start-Process {
+        [CmdletBinding()]
+        param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, [string]$Verb)
+        if ($Verb -eq 'RunAs') { return [pscustomobject]@{ ExitCode = 0 } }
+    }
+    $script:exitCode = 0
+    $fixNoEffect = (@(Invoke-Fix) -join "`n")
+    Assert '出口探测正常时不误报' ($fixNoEffect -match 'FIX:出口IP ✓') "out=$fixNoEffect"
+    Assert '提权脚本未生效时报告仍开启 IPv6 的网卡并判失败' ($script:exitCode -eq 1 -and $fixNoEffect -match 'IPv6 仍开启\(Meta\)' -and $fixNoEffect -notmatch 'FIX:时区/IPv6/DNS防漏/保镖 ✓') "out=$fixNoEffect"
+
+    # 出口探测在关 IPv6/清缓存后短暂返回空:重试后拿到 US 判通过;一直为空时报"无结果",绝不误报"国家不匹配"
+    $script:v6Disabled = $true
+    $script:egressCalls = 0
+    function Get-Egress {
+        $script:egressCalls++
+        if ($script:egressCalls -le 2) { return @{ ip = ''; loc = ''; skipped = $false } }
+        @{ ip = '198.51.100.1'; loc = 'US'; skipped = $false }
+    }
+    $script:exitCode = 0
+    $fixRetry = (@(Invoke-Fix) -join "`n")
+    Assert '出口探测先空后有时重试成功,不误报国家不匹配' ($fixRetry -match 'FIX:出口IP ✓' -and $fixRetry -notmatch '出口国家不匹配' -and $script:egressCalls -eq 3) "calls=$($script:egressCalls) out=$fixRetry"
+    function Get-Egress { @{ ip = ''; loc = ''; skipped = $false } }
+    $script:exitCode = 0
+    $fixEmpty = (@(Invoke-Fix) -join "`n")
+    Assert '出口探测一直无结果时如实报告无结果而非国家不匹配' ($script:exitCode -eq 1 -and $fixEmpty -match '出口探测无结果' -and $fixEmpty -notmatch '出口国家不匹配') "out=$fixEmpty"
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }
