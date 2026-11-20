@@ -346,6 +346,35 @@ console.log('NODE_SCRIPT_JS_OK');
         $fixOut -match '(?m)^FAIL:修复未完全生效\(.*管理员授权未完成' -and
         $fixOut -notmatch 'FIX:时区/IPv6/DNS防漏/保镖 ✓'
     ) "exit=$script:exitCode out=$fixOut"
+    # 修复重启 Clash 后:新 Meta TUN 网卡晚到且自带 IPv6,出口路径短暂断流 —— 必须等网卡出现后再采样 IPv6,
+    # 把它纳入同一次 UAC 关闭,并在出口验证前等路径恢复,而不是一次撞上就判"代理路径失效"
+    $script:tick = 0
+    $script:adminScripts = @()
+    function Start-Sleep { param($Seconds, $Milliseconds) $script:tick++ }
+    function Restart-ClashVerge { $script:ClashRestarted = $true; $true }
+    function Get-MihomoTunNic { if ($script:tick -ge 2) { [pscustomobject]@{ Name = 'Meta'; Status = 'Up' } } }
+    function Get-NetAdapterBinding {
+        param([string]$ComponentID)
+        $b = @([pscustomobject]@{ Name = '以太网'; Enabled = $false })
+        if ($script:tick -ge 2) { $b += [pscustomobject]@{ Name = 'Meta'; Enabled = $true } }
+        $b
+    }
+    function Save-HomeIpv6State { }
+    function Test-TunUp { $script:tick -ge 6 }
+    function Get-Egress { if (Test-ProxyPathAlive) { @{ ip = '198.51.100.1'; loc = 'US'; skipped = $false } } else { @{ skipped = $true } } }
+    function Start-Process {
+        [CmdletBinding()]
+        param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, [string]$Verb)
+        if ($Verb -eq 'RunAs') {
+            if ((@($ArgumentList) -join ' ') -match '-File "([^"]+)"') { $script:adminScripts += [System.IO.File]::ReadAllText($Matches[1]) }
+            return [pscustomobject]@{ ExitCode = 0 }
+        }
+    }
+    Set-Content -LiteralPath $scriptJsPath -Value 'function main(config) { return config; }' -Encoding UTF8
+    $script:exitCode = 0
+    $fixRace = (@(Invoke-Fix) -join "`n")
+    Assert '重启后等新 TUN 网卡出现再采样,其 IPv6 在同一次 UAC 中关闭' ($script:adminScripts.Count -eq 1 -and $script:adminScripts[0] -match 'Disable-NetAdapterBinding') "out=$fixRace"
+    Assert '出口验证前等待代理路径恢复,不误判代理路径失效' ($fixRace -match 'FIX:出口IP ✓' -and $fixRace -notmatch '代理路径失效') "out=$fixRace"
 } finally {
     $ErrorActionPreference = $scriptErrorPreference
     foreach ($name in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnv[$name]) }

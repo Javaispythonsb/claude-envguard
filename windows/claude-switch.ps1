@@ -1881,12 +1881,45 @@ function Remove-LegacyMergeRules {
     }
 }
 
-function Restart-ClashVerge {
+function Get-MihomoKernelPids {
+    return @(Get-Process -Name 'verge-mihomo', 'verge-mihomo-alpha', 'mihomo' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+}
+
+function Get-MihomoTunNic {
+    return @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Status -eq 'Up' -and (
+            $_.Name -match '^(?i)(Mihomo|Meta|Clash|FlClash)' -or
+            $_.InterfaceDescription -match '(?i)(Meta Tunnel|Mihomo|FlClash|Clash)'
+        )
+    }) | Select-Object -First 1
+}
+
+# 重启 Clash Verge 并等到"新"内核与新 TUN 网卡真正就绪才返回。
+# 只杀 GUI 后立刻验证会连上尚未退出的旧内核与旧网卡:规则验证读到旧规则而误判成功,
+# IPv6 步骤又恰好看不到正在重建的 TUN 网卡(重建后其 ms_tcpip6 默认开启),最终出口探测撞上断流误判失败。
+function Restart-ClashVerge([int]$KernelWaitSec = 25, [int]$TunWaitSec = 30) {
     $cv = Find-ClashVerge
     if (-not $cv) { return $false }
+    $oldKernel = Get-MihomoKernelPids
     Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep 2
     try { Start-Process $cv } catch { return $false }
+    $script:ClashRestarted = $true
+    if ($oldKernel.Count -gt 0) {
+        $deadline = (Get-Date).AddSeconds($KernelWaitSec)
+        while ((Get-Date) -lt $deadline) {
+            $fresh = @(Get-MihomoKernelPids | Where-Object { $oldKernel -notcontains $_ })
+            if ($fresh.Count -gt 0) { break }
+            Start-Sleep 1
+        }
+    }
+    $deadline = (Get-Date).AddSeconds($TunWaitSec)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-MihomoTunNic) -and (Test-ProxyAlive)) { break }
+        Start-Sleep 1
+    }
+    # 新 TUN 网卡上线后协议绑定(含 ms_tcpip6)还会再落定一两秒
+    Start-Sleep 2
     return $true
 }
 
@@ -2259,6 +2292,7 @@ function Invoke-Check {
 function Invoke-Fix {
     "FIX:开始一键修复"
     $fixFailures = @()
+    $script:ClashRestarted = $false
     $isClashVerge = ($PROXY_MODE -eq 'clash-verge') -or (
         $PROXY_MODE -eq 'auto' -and
         -not (Test-FlClashClientSelected) -and
@@ -2454,6 +2488,10 @@ function Invoke-Fix {
         $tzEscFix = $TZ_TARGET.Replace("'", "''")
         $adminScript += "Set-TimeZone -Id '$tzEscFix'"
     }
+    if ($script:ClashRestarted) {
+        # 本次修复重启过 Clash:等新 TUN 网卡出现后再采样,确保它的 IPv6 也在这次 UAC 中关闭
+        for ($i = 0; $i -lt 15 -and -not (Get-MihomoTunNic); $i++) { Start-Sleep 1 }
+    }
     if (Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }) {
         Save-HomeIpv6State
         $adminScript += "Get-NetAdapterBinding -ComponentID ms_tcpip6 | Disable-NetAdapterBinding -Confirm:`$false"
@@ -2503,8 +2541,9 @@ function Invoke-Fix {
         "FIX:时区/IPv6/DNS防漏/保镖 无需修复 ✓"
     }
 
-    # C. 出口IP最终验证
+    # C. 出口IP最终验证(TUN 刚重建或刚关闭 IPv6 时会短暂断流,给代理路径最多 20 秒恢复,而不是一次撞上就判失败)
     Start-Sleep 2
+    for ($i = 0; $i -lt 20 -and -not (Test-ProxyPathAlive); $i++) { Start-Sleep 1 }
     $e = Get-Egress
     if ($e.skipped) {
         "FIX:出口IP ✗ 代理路径失效,已跳过探测 — 请先恢复代理/TUN 再复验"
