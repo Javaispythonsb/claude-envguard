@@ -1603,6 +1603,42 @@ function Test-PinnedRules($rules) {
 }
 
 # 只写 profiles\Script.js 托管块,不再碰 Merge.yaml
+# Clash Verge Rev 把「DNS 覆写」页面管理的 dns 字段视为应用自有字段:全局/订阅扩展脚本对这些字段的修改
+# 会在增强流程末尾被丢弃并强制改回 dns_config.yaml。开启时 Script.js 的防漏 DNS 不可能生效,必须如实告知。
+# 只读解析 verge.yaml 与 profiles.yaml,不改动任何 Clash 配置。
+function Get-VergeDnsOverride {
+    $r = @{ active = $false; scope = '' }
+    $vergePath = Join-Path $CLASH_DIR 'verge.yaml'
+    if (-not (Test-Path -LiteralPath $vergePath -PathType Leaf)) { return $r }
+    $lines = @(Get-Content -LiteralPath $vergePath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    foreach ($l in $lines) {
+        if ($l -match '^enable_dns_settings:\s*true\s*(#.*)?$') { $r.active = $true; $r.scope = 'global'; return $r }
+    }
+    $current = ''
+    $profilesPath = Join-Path $CLASH_DIR 'profiles.yaml'
+    if (Test-Path -LiteralPath $profilesPath -PathType Leaf) {
+        foreach ($l in Get-Content -LiteralPath $profilesPath -Encoding UTF8 -ErrorAction SilentlyContinue) {
+            if ($l -match '^current:\s*(\S+)') { $current = $Matches[1].Trim('"', "'"); break }
+        }
+    }
+    if (-not $current) { return $r }
+    $inBlock = $false
+    $inProfile = $false
+    foreach ($l in $lines) {
+        if ($l -match '^profile_dns_settings:') { $inBlock = $true; continue }
+        if (-not $inBlock) { continue }
+        if ($l -match '^\S') { break }
+        if ($l -match '^ {2}["'']?([^"'':\s][^"'':]*)["'']?:\s*$') { $inProfile = ($Matches[1].Trim() -eq $current); continue }
+        if ($inProfile -and $l -match '^\s{4,}enabled:\s*true\s*(#.*)?$') { $r.active = $true; $r.scope = 'profile'; return $r }
+    }
+    return $r
+}
+
+function Get-VergeDnsOverrideHint([hashtable]$Override) {
+    $where = if ($Override.scope -eq 'profile') { '当前订阅' } else { '全局' }
+    return "Clash Verge 已为${where}开启「DNS 覆写」,它会在扩展脚本之后强制改回自己的 DNS 设置,防漏 DNS(境外 DoT、关闭 DNS IPv6)无法生效;请在 Clash Verge 关闭该订阅的「DNS 覆写」,或在 DNS 覆写设置里把 nameserver 改为 tls://8.8.8.8、tls://1.1.1.1 并关闭 IPv6,然后重新一键修复"
+}
+
 function Write-ClashScriptRules([string]$ProxyGroup = $PROXY_GROUP) {
     $result = @{ ok = $false; changed = $false; existed = $false; backup = ''; message = '' }
     $scriptPath = Join-Path $CLASH_DIR 'profiles\Script.js'
@@ -1614,23 +1650,33 @@ function Write-ClashScriptRules([string]$ProxyGroup = $PROXY_GROUP) {
             $result.message = '代理组名为空或包含不安全字符'
             return $result
         }
-        $rules = @()
-        foreach ($d in $CLAUDE_DOMAINS) { $rules += "DOMAIN-SUFFIX,$d,$ProxyGroup" }
-        foreach ($p in $CLAUDE_PORTS) { $rules += "DST-PORT,$p,$ProxyGroup" }
-        $dnsProxyRules = @(
-            "IP-CIDR,8.8.8.8/32,$ProxyGroup,no-resolve",
-            "IP-CIDR,1.1.1.1/32,$ProxyGroup,no-resolve",
-            "DOMAIN-SUFFIX,ipleak.net,$ProxyGroup"
-        )
-        $json = ConvertTo-Json -InputObject @($rules) -Compress
-        $dnsJson = ConvertTo-Json -InputObject @($dnsProxyRules) -Compress
+        # 全局扩展脚本会作用到每一个订阅:代理组名绝不能写死,否则换到没有该组的订阅时
+        # Mihomo 校验报 "proxy [X] not found",Clash Verge 拒绝切换订阅。
+        # 这里只写规则"模板"(类型+载荷),组名由 main() 在运行时按当前订阅的 proxy-groups 选取。
+        $ruleHeads = @()
+        foreach ($d in $CLAUDE_DOMAINS) { $ruleHeads += ,@("DOMAIN-SUFFIX,$d", '') }
+        foreach ($p in $CLAUDE_PORTS) { $ruleHeads += ,@("DST-PORT,$p", '') }
+        $ruleHeads += ,@('IP-CIDR,8.8.8.8/32', ',no-resolve')
+        $ruleHeads += ,@('IP-CIDR,1.1.1.1/32', ',no-resolve')
+        $ruleHeads += ,@('DOMAIN-SUFFIX,ipleak.net', '')
+        $headsJson = ConvertTo-Json -InputObject @($ruleHeads | ForEach-Object { ,@($_[0], $_[1]) }) -Compress -Depth 3
+        $prefJson = ConvertTo-Json -InputObject ([string]$ProxyGroup) -Compress
         $allFilterDomains = @($CLAUDE_DOMAINS) + @('ipleak.net', 'stun.miwifi.com', 'stun.chat.bilibili.com', 'stun.l.google.com', 'stun.cloudflare.com')
         $domainsJs = ($allFilterDomains | ForEach-Object { "'$_'" }) -join ','
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
-            "  const pinnedRules = $json;`r`n" +
-            "  const dnsProxyRules = $dnsJson;`r`n" +
-            "  const managedRules = pinnedRules.concat(dnsProxyRules);`r`n" +
-            "  config.rules = managedRules.concat((Array.isArray(config.rules)?config.rules:[]).filter(function(r){ return !managedRules.includes(r); }));`r`n" +
+            "  var _pref = $prefJson;`r`n" +
+            "  var _builtin = ['GLOBAL','DIRECT','REJECT','REJECT-DROP','PASS','COMPATIBLE'];`r`n" +
+            "  var _groups = (Array.isArray(config['proxy-groups']) ? config['proxy-groups'] : []).filter(function(g){ return g && typeof g.name === 'string' && g.name && _builtin.indexOf(g.name.toUpperCase()) === -1; });`r`n" +
+            "  var _target = null;`r`n" +
+            "  if (_pref && _groups.some(function(g){ return g.name === _pref; })) { _target = _pref; }`r`n" +
+            "  if (!_target) { var _sel = _groups.filter(function(g){ return String(g.type).toLowerCase() === 'select'; }); if (_sel.length) { _target = _sel[0].name; } }`r`n" +
+            "  if (!_target && _groups.length) { _target = _groups[0].name; }`r`n" +
+            "  if (!_target) { _target = 'GLOBAL'; }`r`n" +
+            "  var _heads = $headsJson;`r`n" +
+            "  var managedRules = _heads.map(function(h){ return h[0] + ',' + _target + h[1]; });`r`n" +
+            "  var _headKeys = _heads.map(function(h){ return h[0].toUpperCase(); });`r`n" +
+            "  var _ruleKey = function(r){ return typeof r === 'string' ? r.split(',').slice(0, 2).map(function(x){ return x.trim(); }).join(',').toUpperCase() : ''; };`r`n" +
+            "  config.rules = managedRules.concat((Array.isArray(config.rules)?config.rules:[]).filter(function(r){ return _headKeys.indexOf(_ruleKey(r)) === -1; }));`r`n" +
             "  config.ipv6 = false;`r`n" +
             "  if (!config.dns || typeof config.dns !== 'object') { config.dns = {}; }`r`n" +
             "  config.dns.enable = true;`r`n" +
@@ -2006,6 +2052,13 @@ function Test-DnsCheck {
         }
     } catch {}
     $verdict = Test-DnsResolverVerdict $dns $isFakeIp $resolvers $detectReachable
+    if ($verdict.state -ne 'ok' -and $PROXY_MODE -in @('clash-verge', 'auto')) {
+        $ov = Get-VergeDnsOverride
+        if ($ov.active) {
+            $where = if ($ov.scope -eq 'profile') { '当前订阅' } else { '全局' }
+            return @{ state = $verdict.state; detail = "$($verdict.detail) · Clash Verge ${where}「DNS 覆写」已开启,会覆盖防漏 DNS,请关闭后重新一键修复" }
+        }
+    }
     if ($verdict.state -eq 'ok' -and -not (Test-SmhnrDisabled)) {
         return @{ state = 'warn'; detail = "$($verdict.detail) · Windows 多宿主 DNS 旁路(SMHNR)尚未关闭,建议一键修复" }
     }
@@ -2244,7 +2297,12 @@ function Invoke-Fix {
         "FIX:请在 $(Get-ProxyName) 中自行添加 Claude 域名置顶/直连规则"
     } else {
         $resolvedGroup = Resolve-ClashProxyGroup -Persist
-        "FIX:使用 Clash 代理组=$resolvedGroup"
+        "FIX:使用 Clash 代理组=$resolvedGroup(Script.js 在每个订阅里按其自有代理组自动适配)"
+        $dnsOverride = Get-VergeDnsOverride
+        if ($dnsOverride.active) {
+            "FIX:WARN $(Get-VergeDnsOverrideHint $dnsOverride)"
+            $fixFailures += 'Clash Verge DNS 覆写覆盖了防漏 DNS'
+        }
         $clashMode = Get-ClashMode
         if ($clashMode -eq 'unknown') {
             "FIX:无法确认 Clash 模式，已跳过规则修改"
@@ -4125,6 +4183,8 @@ function Invoke-RulesStatus {
     $api = Get-ClashApi
     "mode=$(Get-ClashMode)"
     "proxy_group=$PROXY_GROUP"
+    $dnsOv = Get-VergeDnsOverride
+    "dns_override=$(if ($dnsOv.active) { "on($($dnsOv.scope))" } else { 'off' })"
     if ($api) {
         $auth = if ($api.headers.Count -gt 0) { 'configured' } else { 'none' }
         "api=source=$($api.source) endpoint=$($api.base) auth=$auth"

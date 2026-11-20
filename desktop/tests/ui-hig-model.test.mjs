@@ -222,6 +222,17 @@ test('escapeHtml 转义危险 HTML 标签与引号字符', () => {
   );
 });
 
+test('describeCheckGuidance 遇到 Clash Verge DNS 覆写时不再引导一键修复', () => {
+  const g = describeCheckGuidance(
+    { key: 'DNS', label: 'DNS', hard: false },
+    'fail',
+    '解析器位于 CN · Clash Verge 当前订阅「DNS 覆写」已开启,会覆盖防漏 DNS,请关闭后重新一键修复',
+    'US'
+  );
+  assert.equal(g.actionType, null);
+  assert.match(g.hint, /关闭当前订阅的「DNS 覆写」/);
+});
+
 test('describeCheckGuidance 覆盖 WebRTC 无响应/分流提示与 DNS SMHNR 一键修复', () => {
   const rtcNoResp = describeCheckGuidance(
     { key: 'WebRTC', label: 'WebRTC', hard: false },

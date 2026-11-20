@@ -309,6 +309,15 @@ export function describeCheckGuidance(spec, st, rawDetail, countryTarget) {
       };
     }
   }
+  if (spec.key === 'DNS' && /DNS 覆写/.test(detail)) {
+    // Clash Verge discards script DNS edits while its DNS override is on; another
+    // one-click fix cannot help, so point the user at the Clash Verge setting instead.
+    return {
+      hint: `${detail.replace(/,?请关闭后重新一键修复$/, '')}。请先在 Clash Verge 中关闭当前订阅的「DNS 覆写」（或把其中的 nameserver 改为境外 DoT 并关闭 IPv6），再回来一键修复。`,
+      actionType: null,
+      actionLabel: ''
+    };
+  }
   if (spec.key === 'DNS' && st === 'warn' && /SMHNR|多宿主/.test(detail)) {
     return {
       hint: `${detail}。建议点击右侧「一键修复」关闭 Windows 多宿主名称解析旁路。`,

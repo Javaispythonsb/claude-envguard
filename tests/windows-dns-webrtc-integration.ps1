@@ -137,6 +137,7 @@ const main = fn();
 
 const cfgA = main({
   ipv6: true,
+  'proxy-groups': [{ name: 'Auto', type: 'url-test' }, { name: 'MyProxy', type: 'select' }],
   rules: ['MATCH,DIRECT'],
   dns: {
     'nameserver-policy': {
@@ -182,6 +183,27 @@ const cfgB = main({
 });
 assert.deepEqual(cfgB.dns['proxy-server-nameserver'], ['1.2.4.8']);
 assert.deepEqual(cfgB.dns['fake-ip-filter'], ['+.claude.ai']);
+// 没有任何代理组时回退到内置且永远存在的 GLOBAL,保证 Mihomo 校验通过
+assert.equal(cfgB.rules[0], 'DOMAIN-SUFFIX,claude.ai,GLOBAL');
+
+// 换到没有 MyProxy 的订阅:必须改用该订阅自己的 select 组,不能引用不存在的组(否则 Clash Verge 拒绝切换订阅)
+const cfgC = main({
+  'proxy-groups': [{ name: 'GLOBAL', type: 'select' }, { name: '♻️ 自动选择', type: 'url-test' }, { name: '🚀 节点选择', type: 'select' }],
+  rules: ['DOMAIN-SUFFIX,claude.ai,旧订阅组', 'DST-PORT,3478,旧订阅组', 'IP-CIDR,8.8.8.8/32,旧订阅组,no-resolve', 'GEOIP,CN,DIRECT', 'MATCH,🚀 节点选择']
+});
+const groupNames = new Set(['GLOBAL', 'DIRECT', 'REJECT', '♻️ 自动选择', '🚀 节点选择']);
+cfgC.rules.forEach(function (r) {
+  const parts = r.split(',');
+  const target = /^(MATCH)$/i.test(parts[0]) ? parts[1] : parts[2];
+  assert.ok(groupNames.has(target), 'rule references missing group: ' + r);
+});
+assert.equal(cfgC.rules[0], 'DOMAIN-SUFFIX,claude.ai,🚀 节点选择');
+assert.equal(cfgC.rules.length, 21, '旧订阅组的托管规则必须被替换而不是残留');
+assert.deepEqual(cfgC.rules.slice(19), ['GEOIP,CN,DIRECT', 'MATCH,🚀 节点选择']);
+
+// 只有非 select 组时取第一个非内置组
+const cfgD = main({ 'proxy-groups': [{ name: 'Auto', type: 'url-test' }] });
+assert.equal(cfgD.rules[0], 'DOMAIN-SUFFIX,claude.ai,Auto');
 console.log('NODE_SCRIPT_JS_OK');
 '@
     $env:TEST_SCRIPT_JS = $scriptJsPath
@@ -216,6 +238,30 @@ console.log('NODE_SCRIPT_JS_OK');
     $script:mockSmhnrDisabled = $true
     $dnsAllOk = Test-DnsCheck
     Assert 'SMHNR 已关闭且海外解析器时 DNS 检查通过' ($dnsAllOk.state -eq 'ok') "detail=$($dnsAllOk.detail)"
+
+    # 5b. Clash Verge「DNS 覆写」识别:开启时脚本 DNS 被覆盖,检查必须说明原因
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $vergeYaml = Join-Path $CLASH_DIR 'verge.yaml'
+    $profilesYaml = Join-Path $CLASH_DIR 'profiles.yaml'
+    [System.IO.File]::WriteAllText($profilesYaml, "# Profiles`ncurrent: SubA`nitems:`n- uid: SubA`n", $utf8)
+    [System.IO.File]::WriteAllText($vergeYaml, "enable_tun_mode: true`nenable_dns_settings: false`nprofile_dns_settings:`n  SubB:`n    enabled: true`n  SubA:`n    enabled: false`n    confirmation: abc`nuse_default_bypass: true`n", $utf8)
+    $ov = Get-VergeDnsOverride
+    Assert '当前订阅未开 DNS 覆写(其他订阅开着)时判为未开启' (-not $ov.active) "scope=$($ov.scope)"
+    [System.IO.File]::WriteAllText($vergeYaml, "enable_dns_settings: false`nprofile_dns_settings:`n  SubA:`n    enabled: true`n    confirmation: abc`n  SubB:`n    enabled: false`nuse_default_bypass: true`n", $utf8)
+    $ov = Get-VergeDnsOverride
+    Assert '当前订阅开启 DNS 覆写时识别为 profile 级' ($ov.active -and $ov.scope -eq 'profile')
+    [System.IO.File]::WriteAllText($vergeYaml, "enable_dns_settings: true`n", $utf8)
+    $ov = Get-VergeDnsOverride
+    Assert '全局 DNS 覆写开启时识别为 global 级' ($ov.active -and $ov.scope -eq 'global')
+    function Invoke-ProbeText {
+        param([string]$Url, [int]$Attempts = 3, [int]$TimeoutSec = 8, [scriptblock]$Valid = { param($b) [bool]$b })
+        if ($Url -match 'ipleak\.net/dnsdetection') { return '{"ip":{"223.5.5.5":1}}' }
+        if ($Url -match 'ipleak\.net/json/') { return '{"country_code":"CN"}' }
+        return ''
+    }
+    $dnsOvFail = Test-DnsCheck
+    Assert 'DNS 泄露且 Verge DNS 覆写开启时检查说明覆写原因' ($dnsOvFail.state -ne 'ok' -and $dnsOvFail.detail -match 'DNS 覆写') "detail=$($dnsOvFail.detail)"
+    Remove-Item -LiteralPath $vergeYaml, $profilesYaml -Force -ErrorAction SilentlyContinue
 
     # 6. ConvertFrom-StunResponse 与 Test-WebRTC
     $txnGood = [byte[]](1..12)
