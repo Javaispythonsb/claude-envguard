@@ -4,17 +4,21 @@ import {
   POD_WIDTH,
   POD_COMPACT_HEIGHT,
   CHECK_SPECS,
+  escapeHtml,
   maskDisplayIp,
   conciseCheckValue,
   buildPlatterTiles,
   buildAnomalyCallouts,
+  describeCheckGuidance,
   summarizeMatrixCounts,
   normalizeSafeUrl,
   computePrimaryIslandAction,
   formatUpdateCheckReport,
   formatBuildTime,
   plainReleaseNote,
-  describeUpdateProgress
+  describeUpdateProgress,
+  classifyUpdateOutcome,
+  DEFAULT_CHECK_CONFIG
 } from '../src/hig-model.js';
 
 test('Compact 灵动岛几何常量与 14 项四域全覆盖无遗漏', () => {
@@ -180,6 +184,25 @@ test('formatUpdateCheckReport 只展示版本与中文说明，不暴露提交�
   }
 });
 
+test('DEFAULT_CHECK_CONFIG 与后端无 checks.json 时的默认值一致', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const core = await readFile(new URL('../../windows/claude-switch.ps1', import.meta.url), 'utf8');
+  const m = core.match(/function Get-CheckConfig \{[\s\S]*?return @\{ disabled = @\(([^)]*)\); allowOptionalFailures = \$(\w+); logging = \$(\w+) \}/);
+  assert.ok(m, '未找到后端 Get-CheckConfig 默认值');
+  assert.deepEqual([...DEFAULT_CHECK_CONFIG.disabled], m[1].trim() ? m[1].split(',').map((s) => s.trim().replace(/'/g, '')) : []);
+  assert.equal(DEFAULT_CHECK_CONFIG.allowOptionalFailures, m[2] === 'true');
+  assert.equal(DEFAULT_CHECK_CONFIG.logging, m[3] === 'true');
+});
+
+test('classifyUpdateOutcome 只在明确重启时宣称更新完成', () => {
+  assert.equal(classifyUpdateOutcome(null), 'failed');
+  assert.equal(classifyUpdateOutcome({ exit_code: 1, output: 'FAIL:x' }), 'failed');
+  assert.equal(classifyUpdateOutcome({ exit_code: 0, output: 'FAIL:半途失败' }), 'failed');
+  assert.equal(classifyUpdateOutcome({ exit_code: 0, output: 'OK:已是最新', restarting: false }), 'up_to_date');
+  assert.equal(classifyUpdateOutcome({ exit_code: 0, output: 'OK:已是最新' }), 'up_to_date');
+  assert.equal(classifyUpdateOutcome({ exit_code: 0, output: 'OK:就绪', restarting: true }), 'restarting');
+});
+
 test('plainReleaseNote 与 describeUpdateProgress', () => {
   assert.equal(plainReleaseNote('feat(desktop): add orb'), '常规维护与稳定性改进');
   assert.equal(plainReleaseNote(''), '常规维护与稳定性改进');
@@ -190,4 +213,41 @@ test('plainReleaseNote 与 describeUpdateProgress', () => {
   assert.equal(describeUpdateProgress('verify', 30, 60).percent, 60, '进度条不能倒退');
   assert.equal(describeUpdateProgress('restart', 180, 0).percent, 100);
   assert.equal(describeUpdateProgress('unknown-stage', 5).label, '正在更新');
+});
+
+test('escapeHtml 转义危险 HTML 标签与引号字符', () => {
+  assert.equal(
+    escapeHtml('<img src=x onerror="alert(1)">&\'test\''),
+    '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&amp;&#39;test&#39;'
+  );
+});
+
+test('describeCheckGuidance 覆盖 WebRTC 无响应/分流提示与 DNS SMHNR 一键修复', () => {
+  const rtcNoResp = describeCheckGuidance(
+    { key: 'WebRTC', label: 'WebRTC', hard: false },
+    'warn',
+    'STUN 无响应,未确认 UDP 出口(不等于零暴露)',
+    'US'
+  );
+  assert.equal(rtcNoResp.actionType, 'mute');
+  assert.match(rtcNoResp.hint, /不等于零暴露/);
+  assert.doesNotMatch(rtcNoResp.hint, /无本机 IP 暴露/);
+
+  const rtcSplit = describeCheckGuidance(
+    { key: 'WebRTC', label: 'WebRTC', hard: false },
+    'warn',
+    'UDP 出口与 HTTP 出口不同(US · 198.51.*.*)',
+    'US'
+  );
+  assert.equal(rtcSplit.actionType, 'mute');
+  assert.match(rtcSplit.hint, /TCP 与 UDP/);
+
+  const dnsSmhnr = describeCheckGuidance(
+    { key: 'DNS', label: 'DNS 归属', hard: false },
+    'warn',
+    'Fake-IP走隧道 · 解析器位于 US · Windows 多宿主 DNS 旁路(SMHNR)尚未关闭,建议一键修复',
+    'US'
+  );
+  assert.equal(dnsSmhnr.actionType, 'fix');
+  assert.equal(dnsSmhnr.actionLabel, '一键修复');
 });

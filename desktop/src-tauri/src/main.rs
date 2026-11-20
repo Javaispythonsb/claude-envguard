@@ -266,6 +266,105 @@ impl Drop for BusyLease {
 struct CommandOutcome {
     output: String,
     exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restarting: Option<bool>,
+}
+
+/// Test hooks that must never reach the core script (or the relaunched app) from a
+/// release build.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+const RELEASE_SCRUBBED_ENV: &[&str] = &[
+    "ENVGUARD_CORE_SCRIPT",
+    "ENVGUARD_GITHUB_REPO",
+    "ENVGUARD_STATE_DIR",
+    "CLAUDE_SWITCHER_CHROME",
+    "CLAUDE_SWITCHER_SKIP_NET_CHECK",
+];
+
+#[cfg(not(debug_assertions))]
+fn scrub_release_env(cmd: &mut Command) {
+    for key in RELEASE_SCRUBBED_ENV {
+        cmd.env_remove(key);
+    }
+}
+
+/// `%USERPROFILE%\.claude-switcher`. Debug and test builds may redirect it with
+/// `ENVGUARD_STATE_DIR`; release builds ignore that variable.
+fn envguard_state_dir() -> Option<PathBuf> {
+    #[cfg(any(debug_assertions, test))]
+    {
+        if let Ok(dir) = std::env::var("ENVGUARD_STATE_DIR") {
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed));
+            }
+        }
+    }
+    let profile = std::env::var("USERPROFILE").ok()?;
+    Some(PathBuf::from(profile).join(".claude-switcher"))
+}
+
+/// Rollback manifest written by `stage-app-update` before it touches any file.
+#[derive(Deserialize)]
+struct UpdateBackupManifest {
+    backup_dir: String,
+    base_dir: String,
+    app_res_dir: String,
+    #[serde(default)]
+    backed_base: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    backed_app_res: std::collections::HashMap<String, bool>,
+}
+
+fn is_allowed_update_backup_name(name: &str) -> bool {
+    matches!(
+        name,
+        "claude-switch.ps1" | "claude-bodyguard.ps1" | "version.txt" | "build-info.json"
+    )
+}
+
+/// Puts every script the staging step replaced back from its backup, deletes files it
+/// newly created, then removes the manifest. Only whitelisted file names are touched.
+fn rollback_staged_update_manifest(manifest_path: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let raw = raw.trim_start_matches('\u{feff}');
+    let Ok(manifest) = serde_json::from_str::<UpdateBackupManifest>(raw) else {
+        let _ = std::fs::remove_file(manifest_path);
+        return false;
+    };
+    let backup_dir = PathBuf::from(&manifest.backup_dir);
+    let groups = [
+        (PathBuf::from(&manifest.base_dir), &manifest.backed_base, "base-"),
+        (PathBuf::from(&manifest.app_res_dir), &manifest.backed_app_res, "res-"),
+    ];
+    for (target_dir, entries, prefix) in groups {
+        for (name, existed) in entries.iter() {
+            if !is_allowed_update_backup_name(name) {
+                continue;
+            }
+            let dst = target_dir.join(name);
+            if *existed {
+                let bak = backup_dir.join(format!("{prefix}{name}"));
+                if bak.is_file() {
+                    let _ = std::fs::copy(&bak, &dst);
+                }
+            } else {
+                let _ = std::fs::remove_file(&dst);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(manifest_path);
+    true
+}
+
+fn rollback_staged_update() {
+    if let Some(path) = envguard_state_dir().map(|d| d.join("last-update-backup.json")) {
+        if path.is_file() {
+            rollback_staged_update_manifest(&path);
+        }
+    }
 }
 
 fn validate_launch_target(target: &str) -> Result<&'static str, String> {
@@ -410,6 +509,9 @@ fn execute_core_blocking(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(not(debug_assertions))]
+    scrub_release_env(&mut cmd);
+
     if stdin_payload.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -448,6 +550,7 @@ fn execute_core_blocking(
     Ok(CommandOutcome {
         output: combined,
         exit_code: out.status.code().unwrap_or(1),
+        restarting: None,
     })
 }
 
@@ -484,6 +587,9 @@ fn execute_core_streaming(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    #[cfg(not(debug_assertions))]
+    scrub_release_env(&mut cmd);
 
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -541,6 +647,7 @@ fn execute_core_streaming(
     Ok(CommandOutcome {
         output: combined,
         exit_code: status.code().unwrap_or(1),
+        restarting: None,
     })
 }
 
@@ -760,6 +867,10 @@ fn cleanup_stale_old_exe() {
             let _ = std::fs::remove_file(dir.join("claude-envguard.exe.new"));
         }
     }
+    // A manifest left after a successful restart is stale: the new version is running.
+    if let Some(manifest) = envguard_state_dir().map(|d| d.join("last-update-backup.json")) {
+        let _ = std::fs::remove_file(manifest);
+    }
 }
 
 #[tauri::command]
@@ -794,7 +905,7 @@ async fn apply_app_update(
         exe_dir.to_string_lossy().into_owned(),
     ];
     let progress_app = app.clone();
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
+    let mut outcome = tauri::async_runtime::spawn_blocking(move || {
         execute_core_streaming(script, args, app_version, |stage, pct| {
             let _ = progress_app.emit(
                 "app-update-progress",
@@ -808,28 +919,32 @@ async fn apply_app_update(
     if outcome.exit_code != 0 {
         return Ok(outcome);
     }
+
+    // No staged binary means there was nothing to install (already up to date).
+    let staged_exe = exe_dir.join("claude-envguard.exe.new");
+    if !staged_exe.is_file() {
+        outcome.restarting = Some(false);
+        return Ok(outcome);
+    }
     let _ = app.emit(
         "app-update-progress",
         serde_json::json!({ "stage": "swap", "percent": 98 }),
     );
 
-    let staged_exe = exe_dir.join("claude-envguard.exe.new");
-    if !staged_exe.is_file() {
-        return Ok(outcome);
-    }
-
     let old_exe = sibling_path_with_suffix(&current_exe, ".old");
     let _ = std::fs::remove_file(&old_exe);
 
-    std::fs::rename(&current_exe, &old_exe).map_err(|e| {
+    if let Err(e) = std::fs::rename(&current_exe, &old_exe) {
         let _ = std::fs::remove_file(&staged_exe);
-        format!("重命名当前运行程序失败: {e}")
-    })?;
+        rollback_staged_update();
+        return Err(format!("重命名当前运行程序失败(已回滚程序与脚本): {e}"));
+    }
 
     if let Err(e) = std::fs::rename(&staged_exe, &current_exe) {
         let _ = std::fs::rename(&old_exe, &current_exe);
         let _ = std::fs::remove_file(&staged_exe);
-        return Err(format!("替换新版可执行文件失败(已回滚): {e}"));
+        rollback_staged_update();
+        return Err(format!("替换新版可执行文件失败(已回滚程序与脚本): {e}"));
     }
 
     let mut relaunch = Command::new("powershell.exe");
@@ -848,6 +963,9 @@ async fn apply_app_update(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    #[cfg(not(debug_assertions))]
+    scrub_release_env(&mut relaunch);
+
     #[cfg(target_os = "windows")]
     relaunch.creation_flags(CREATE_NO_WINDOW);
 
@@ -855,7 +973,8 @@ async fn apply_app_update(
         // Restore original executable name if helper process could not spawn
         let _ = std::fs::remove_file(&current_exe);
         let _ = std::fs::rename(&old_exe, &current_exe);
-        return Err(format!("启动热更新重启助手失败(已回滚): {e}"));
+        rollback_staged_update();
+        return Err(format!("启动热更新重启助手失败(已回滚程序与脚本): {e}"));
     }
     let _ = app.emit(
         "app-update-progress",
@@ -870,6 +989,7 @@ async fn apply_app_update(
         app_for_exit.exit(0);
     });
 
+    outcome.restarting = Some(true);
     Ok(outcome)
 }
 
@@ -1290,18 +1410,7 @@ fn has_adjacent_monitor_beyond_edge(
 }
 
 fn dock_state_file_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("ENVGUARD_STATE_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join("window-dock.json"));
-        }
-    }
-    let profile = std::env::var("USERPROFILE").ok()?;
-    Some(
-        PathBuf::from(profile)
-            .join(".claude-switcher")
-            .join("window-dock.json"),
-    )
+    envguard_state_dir().map(|d| d.join("window-dock.json"))
 }
 
 fn load_saved_dock() -> Option<SavedDock> {
@@ -2341,6 +2450,65 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_update_rollback_restores_backups_and_removes_new_files() {
+        let root = std::env::temp_dir().join(format!(
+            "envguard-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = root.join("base");
+        let res = root.join("res");
+        let backup = root.join("backup");
+        for d in [&base, &res, &backup] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(base.join("claude-switch.ps1"), "new-core").unwrap();
+        std::fs::write(backup.join("base-claude-switch.ps1"), "old-core").unwrap();
+        std::fs::write(base.join("version.txt"), "9.9.9").unwrap();
+        std::fs::write(res.join("claude-bodyguard.ps1"), "new-guard").unwrap();
+        std::fs::write(backup.join("res-claude-bodyguard.ps1"), "old-guard").unwrap();
+        std::fs::write(base.join("evil.txt"), "keep").unwrap();
+
+        let manifest = serde_json::json!({
+            "backup_dir": backup,
+            "base_dir": base,
+            "app_res_dir": res,
+            "backed_base": { "claude-switch.ps1": true, "version.txt": false, "evil.txt": false },
+            "backed_app_res": { "claude-bodyguard.ps1": true }
+        });
+        let manifest_path = root.join("last-update-backup.json");
+        std::fs::write(&manifest_path, format!("\u{feff}{manifest}")).unwrap();
+
+        assert!(rollback_staged_update_manifest(&manifest_path));
+        assert_eq!(std::fs::read_to_string(base.join("claude-switch.ps1")).unwrap(), "old-core");
+        assert_eq!(std::fs::read_to_string(res.join("claude-bodyguard.ps1")).unwrap(), "old-guard");
+        assert!(!base.join("version.txt").exists(), "file created by the update must be removed");
+        assert!(base.join("evil.txt").exists(), "non-whitelisted names must never be touched");
+        assert!(!manifest_path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn release_scrub_list_covers_every_test_hook() {
+        for key in [
+            "ENVGUARD_CORE_SCRIPT",
+            "ENVGUARD_GITHUB_REPO",
+            "ENVGUARD_STATE_DIR",
+            "CLAUDE_SWITCHER_CHROME",
+            "CLAUDE_SWITCHER_SKIP_NET_CHECK",
+        ] {
+            assert!(RELEASE_SCRUBBED_ENV.contains(&key), "{key} must be scrubbed in release");
+        }
+        // Values the host sets on purpose must never be stripped.
+        for key in ["ENVGUARD_APP_VERSION", "ENVGUARD_APP_COMMIT", "ENVGUARD_PROGRESS"] {
+            assert!(!RELEASE_SCRUBBED_ENV.contains(&key));
+        }
+    }
 
     #[test]
     fn launch_target_whitelist() {

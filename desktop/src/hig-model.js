@@ -4,6 +4,17 @@
 export const POD_WIDTH = 480;
 export const POD_COMPACT_HEIGHT = 64;
 
+/**
+ * Must match Get-CheckConfig in windows/claude-switch.ps1 when checks.json is absent:
+ * every check runs, optional failures stay red, logging on. A "skip" may only come
+ * from an explicit user choice, never from the recommended defaults.
+ */
+export const DEFAULT_CHECK_CONFIG = Object.freeze({
+  disabled: Object.freeze([]),
+  allowOptionalFailures: false,
+  logging: true
+});
+
 export const FIXABLE_OPTIONAL = new Set(['时区', '地区', 'DNS', 'WebRTC', '生态可达性']);
 export const HARD_FIXABLE = new Set(['代理内核', 'TUN网卡', 'IPv6', '保镖', '规则置顶']);
 
@@ -45,6 +56,15 @@ export const CLIENT_NAMES = {
   other: '其他 TUN',
   auto: '自动识别'
 };
+
+export function escapeHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 export function maskDisplayIp(text) {
   return String(text || '').replace(
@@ -274,13 +294,27 @@ export function describeCheckGuidance(spec, st, rawDetail, countryTarget) {
     };
   }
   if (spec.key === 'WebRTC') {
-    if (st === 'warn' && /未收到|不可达|超时|timeout/i.test(detail)) {
+    if (st === 'warn' && /无响应|未收到|不可达|超时|timeout/i.test(detail)) {
       return {
-        hint: `${detail}。当前代理节点可能拦截或未转发 UDP STUN，无本机 IP 暴露；可换支持 UDP 的节点或设为免检。`,
+        hint: `${detail}。当前代理节点可能拦截或未转发 UDP STUN，未确认 UDP 出口（不等于零暴露）；可换支持 UDP 的节点或设为免检。`,
         actionType: 'mute',
         actionLabel: '设为免检'
       };
     }
+    if (st === 'warn' && /UDP 出口与 HTTP 出口不同/.test(detail)) {
+      return {
+        hint: `${detail}。当前节点 TCP 与 UDP 出口不一致但均位于海外；追求双栈同出口可换节点，或设为免检。`,
+        actionType: 'mute',
+        actionLabel: '设为免检'
+      };
+    }
+  }
+  if (spec.key === 'DNS' && st === 'warn' && /SMHNR|多宿主/.test(detail)) {
+    return {
+      hint: `${detail}。建议点击右侧「一键修复」关闭 Windows 多宿主名称解析旁路。`,
+      actionType: 'fix',
+      actionLabel: '一键修复'
+    };
   }
   if (HARD_FIXABLE.has(spec.key) || FIXABLE_OPTIONAL.has(spec.key)) {
     const fixableNow = st === 'fail' || String(rawDetail || '').startsWith('非关键失败已忽略');
@@ -539,6 +573,18 @@ const UPDATE_STAGE_LABELS = {
  * Maps a progress report from the updater to what the bar shows. The bar never moves
  * backwards, even if reports arrive out of order.
  */
+/**
+ * Maps the apply_app_update result to what the UI should show.
+ * Only an explicit `restarting: true` may claim the app is about to relaunch;
+ * a successful run that staged nothing means the install is already current.
+ */
+export function classifyUpdateOutcome(res) {
+  if (!res || res.exit_code !== 0) return 'failed';
+  if (/^FAIL:/m.test(String(res.output || ''))) return 'failed';
+  if (res.restarting === true) return 'restarting';
+  return 'up_to_date';
+}
+
 export function describeUpdateProgress(stage, percent, previousPercent = 0) {
   const raw = Math.round(Number(percent));
   const clamped = Number.isFinite(raw) ? Math.min(100, Math.max(0, raw)) : 0;

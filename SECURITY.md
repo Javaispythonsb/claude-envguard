@@ -21,6 +21,13 @@
 
 ## 安全变更记录
 
+### 2026-11-20（Windows 桌面版热更新与撤防加固）
+
+1. **测试钩子不进入发布版**：Release 构建派生 PowerShell 核心脚本和热更新重启助手时剥离 `ENVGUARD_CORE_SCRIPT`、`ENVGUARD_GITHUB_REPO`、`ENVGUARD_STATE_DIR`、`CLAUDE_SWITCHER_CHROME`、`CLAUDE_SWITCHER_SKIP_NET_CHECK`，防止被预置环境变量改写更新源、状态目录、隔离浏览器路径或跳过出网门禁
+2. **热更新原子回滚**：脚本替换前写入回滚清单；可执行文件替换或重启助手失败时按白名单文件名回滚脚本与版本文件，避免“新脚本 + 旧程序”的半更新状态
+3. **撤防时序**：保镖只在网络/时区恢复全部成功后停止；按心跳 PID 强杀前核对 PowerShell 进程名与 `claude-bodyguard.ps1` 命令行，读不到命令行时宁可不杀
+4. **DNS / WebRTC 防漏**：Clash Verge 规则模式下自动选择真实代理组并拒绝指向 `DIRECT` 的置顶规则；`Script.js` 同时覆写 DNS（`respect-rules`、清空 `fallback`、清理命中策略、`dns-hijack`）；STUN 响应校验事务 ID，探测绕过系统代理以免假通过
+
 ### 2026-11-01（CLI 多账号联动边界）
 
 1. **保镖急停范围扩展**：代理离线时除桌面版外，同时终止安装用户的 Claude Code CLI 进程（native `claude`/`claude.exe` 及 npm/bun 的 `@anthropic-ai/claude-code`）；进程匹配仍限定安装用户，不按名字扫全系统

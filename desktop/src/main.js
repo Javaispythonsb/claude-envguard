@@ -9,6 +9,7 @@ import {
   CHECK_SPECS,
   OPTIONAL_ITEMS,
   CLIENT_NAMES,
+  escapeHtml,
   maskDisplayIp,
   conciseCheckValue,
   buildPlatterTiles,
@@ -18,7 +19,9 @@ import {
   normalizeSafeUrl,
   computePrimaryIslandAction,
   formatUpdateCheckReport,
-  describeUpdateProgress
+  describeUpdateProgress,
+  classifyUpdateOutcome,
+  DEFAULT_CHECK_CONFIG
 } from './hig-model.js';
 
 const EASE_OUT = 'cubic-bezier(0.23, 1, 0.32, 1)';
@@ -59,6 +62,8 @@ let lastPodHeight = 0;
 let isPinned = false;
 let isTucked = false;
 let hasFocusWithin = false;
+// Held for the whole hot update; independent of focus tracking so focusout cannot release it.
+let updateHold = false;
 let popupOpen = false;
 let shieldArmed = false;
 
@@ -110,7 +115,7 @@ function setStandbyTone(tone) {
 
 function syncDockHold() {
   if (!isTauri) return;
-  const shouldHold = hasFocusWithin || popupOpen || shieldArmed || configDirty;
+  const shouldHold = hasFocusWithin || updateHold || popupOpen || shieldArmed || configDirty;
   invoke('set_dock_hold', { hold: shouldHold }).catch(() => {});
 }
 
@@ -529,8 +534,8 @@ function initProxyPopup() {
   if (!sel || !trig || !menu) return;
 
   menu.innerHTML = Array.from(sel.options).map((opt) => `
-    <button type="button" class="apple-popup-item" role="option" data-val="${opt.value}" aria-selected="${opt.selected}">
-      ${opt.textContent}
+    <button type="button" class="apple-popup-item" role="option" data-val="${escapeHtml(opt.value)}" aria-selected="${opt.selected}">
+      ${escapeHtml(opt.textContent)}
     </button>
   `).join('');
 
@@ -758,8 +763,8 @@ function renderOptionalSwitches(disabledList = []) {
   box.innerHTML = OPTIONAL_ITEMS.map((item) => {
     const on = !disabled.has(item.key);
     return `
-      <button type="button" class="switch-cell ${on ? 'on' : ''}" role="switch" aria-checked="${on}" data-opt-key="${item.key}">
-        <span>${item.title}</span>
+      <button type="button" class="switch-cell ${on ? 'on' : ''}" role="switch" aria-checked="${on}" data-opt-key="${escapeHtml(item.key)}">
+        <span>${escapeHtml(item.title)}</span>
         <i class="ios-switch" aria-hidden="true"><b class="ios-thumb"></b></i>
       </button>
     `;
@@ -815,15 +820,15 @@ function renderAnomalyCallouts(data, checkMap) {
   }
   listEl.hidden = false;
   listEl.innerHTML = callouts.slice(0, 3).map((item) => `
-    <div class="anomaly-card is-${item.state}">
+    <div class="anomaly-card is-${escapeHtml(item.state)}">
       <div class="anomaly-body">
         <div class="anomaly-head">
-          <i class="sdot ${item.state}"></i>
-          <span>${item.label} · ${item.badge}</span>
+          <i class="sdot ${escapeHtml(item.state)}"></i>
+          <span>${escapeHtml(item.label)} · ${escapeHtml(item.badge)}</span>
         </div>
-        <p class="anomaly-hint">${item.hint}</p>
+        <p class="anomaly-hint">${escapeHtml(item.hint)}</p>
       </div>
-      ${item.actionType ? `<button type="button" class="mini-pill" data-anomaly-act="${item.actionType}" data-anomaly-key="${item.key}">${item.actionLabel}</button>` : ''}
+      ${item.actionType ? `<button type="button" class="mini-pill" data-anomaly-act="${escapeHtml(item.actionType)}" data-anomaly-key="${escapeHtml(item.key)}">${escapeHtml(item.actionLabel)}</button>` : ''}
     </div>
   `).join('');
 
@@ -871,11 +876,11 @@ function renderCheckMatrix() {
       const isSel = selectedCheckKey === spec.key;
       const evenCls = colIdx === 1 ? 'col-even' : '';
       htmlParts.push(`
-        <button type="button" class="check-row is-${st} ${evenCls} ${isSel ? 'is-selected' : ''}" data-ck="${spec.key}" aria-expanded="${isSel}">
-          <span class="cname">${spec.label}</span>
+        <button type="button" class="check-row is-${escapeHtml(st)} ${evenCls} ${isSel ? 'is-selected' : ''}" data-ck="${escapeHtml(spec.key)}" aria-expanded="${isSel}">
+          <span class="cname">${escapeHtml(spec.label)}</span>
           <span class="check-right">
-            <b class="cval">${val}</b>
-            <i class="sdot ${st === 'ok' ? '' : st}"></i>
+            <b class="cval">${escapeHtml(val)}</b>
+            <i class="sdot ${st === 'ok' ? '' : escapeHtml(st)}"></i>
           </span>
         </button>
       `);
@@ -888,8 +893,8 @@ function renderCheckMatrix() {
       const guide = describeCheckGuidance(selectedInPair, st, found?.detail || '', cc);
       htmlParts.push(`
         <div class="check-inline-detail">
-          <span class="check-inline-text"><b>${selectedInPair.label}：</b>${guide.hint}</span>
-          ${guide.actionType ? `<button type="button" class="mini-pill" data-inline-act="${guide.actionType}" data-inline-key="${selectedInPair.key}">${guide.actionLabel}</button>` : ''}
+          <span class="check-inline-text"><b>${escapeHtml(selectedInPair.label)}：</b>${escapeHtml(guide.hint)}</span>
+          ${guide.actionType ? `<button type="button" class="mini-pill" data-inline-act="${escapeHtml(guide.actionType)}" data-inline-key="${escapeHtml(selectedInPair.key)}">${escapeHtml(guide.actionLabel)}</button>` : ''}
         </div>
       `);
     }
@@ -1448,9 +1453,9 @@ function wireDesktopEvents() {
   });
 
   document.getElementById('btnResetDefaults').onclick = () => {
-    setSwitchCell('tgAllowOptional', false);
-    setSwitchCell('tgLogging', true);
-    renderOptionalSwitches(['时区', '地区']);
+    setSwitchCell('tgAllowOptional', DEFAULT_CHECK_CONFIG.allowOptionalFailures);
+    setSwitchCell('tgLogging', DEFAULT_CHECK_CONFIG.logging);
+    renderOptionalSwitches([...DEFAULT_CHECK_CONFIG.disabled]);
     scheduleCheckConfigAutoSave();
   };
 
@@ -1614,7 +1619,7 @@ function wireDesktopEvents() {
         progressBox.removeAttribute('data-state');
       }
       showProgress('prepare', 0);
-      hasFocusWithin = true;
+      updateHold = true;
       syncDockHold();
       requestAnimationFrame(syncPodHeight);
 
@@ -1628,13 +1633,25 @@ function wireDesktopEvents() {
         if (typeof unlisten === 'function') unlisten();
       }
 
-      if (res?.exit_code === 0) {
+      const outcome = classifyUpdateOutcome(res);
+      const cleanOutput = (text) => maskDisplayIp(String(text || '').replace(/^(OK|WARN|FAIL|INFO):/gm, '').trim());
+      if (outcome === 'restarting') {
+        // Keep updateHold: the app exits and relaunches on its own.
         hotUpdateBtn.hidden = true;
         showProgress('restart', 100);
         if (outTitle) outTitle.textContent = '更新完成';
         if (outPre) outPre.textContent = '即将自动重启到新版本…';
+      } else if (outcome === 'up_to_date') {
+        updateHold = false;
+        syncDockHold();
+        hotUpdateBtn.hidden = true;
+        hotUpdateBtn.disabled = false;
+        hotUpdateBtn.textContent = '立即更新';
+        if (progressBox) progressBox.hidden = true;
+        if (outTitle) outTitle.textContent = '无需更新';
+        if (outPre) outPre.textContent = cleanOutput(res?.output) || '当前已是最新版本。';
       } else {
-        hasFocusWithin = false;
+        updateHold = false;
         syncDockHold();
         hotUpdateBtn.disabled = false;
         hotUpdateBtn.textContent = '重试更新';
@@ -1642,7 +1659,7 @@ function wireDesktopEvents() {
         if (progressLabel) progressLabel.textContent = '更新未完成，已恢复原版本';
         if (outTitle) outTitle.textContent = '更新未完成';
         if (outPre && res) {
-          outPre.textContent = maskDisplayIp(String(res.output || '更新失败').replace(/^(OK|WARN|FAIL|INFO):/gm, ''));
+          outPre.textContent = cleanOutput(res.output) || '更新失败';
         }
       }
       requestAnimationFrame(syncPodHeight);

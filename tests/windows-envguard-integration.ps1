@@ -268,6 +268,29 @@ try {
     Assert '只结束本会话的 Claude Code CLI' (($script:stopped -notcontains 4103) -and ($script:stopped -notcontains 4104) -and ((@($script:procs | ForEach-Object { $_.Id }) -join ',') -eq '4103,4104'))
     Assert '提权脚本恢复 IPv6 并还原原时区' ($elevated.Count -eq 1 -and $elevated[0].Script -match 'Enable-NetAdapterBinding' -and $elevated[0].Script.Contains("Set-TimeZone -Id 'China Standard Time'"))
     Assert '撤防时停止保镖任务' ($script:taskStops -ge 1)
+    $elevScript = [string]$elevated[0].Script
+    $stopIdx = $elevScript.IndexOf("Stop-ScheduledTask -TaskName 'ClaudeBodyguard'")
+    Assert '提权脚本在所有恢复步骤之后才停止保镖' ($stopIdx -gt $elevScript.IndexOf('Set-TimeZone') -and $stopIdx -gt $elevScript.IndexOf('Clear-DnsClientCache')) "脚本=$elevScript"
+
+    # 4a. UAC 取消/恢复失败时保镖必须保持运行,心跳文件也不得清理
+    $hbPath = Join-Path $BASE 'bodyguard-heartbeat.txt'
+    [System.IO.File]::WriteAllText($hbPath, "4101 $([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())", [System.Text.Encoding]::ASCII)
+    $script:elevatedExit = 1
+    $script:exitCode = 0
+    $script:started = @()
+    $script:taskStops = 0
+    $script:stopped = @()
+    $out = (@(Invoke-ShieldRestore) -join "`n")
+    Assert '提权失败时撤防报错且不停保镖' ($script:exitCode -eq 1 -and $out -match '(?m)^FAIL:管理员授权未完成' -and $script:taskStops -eq 0 -and (Test-Path -LiteralPath $hbPath)) "输出=$out"
+    $script:elevatedExit = 0
+
+    # 4a'. 心跳 PID 被非保镖 PowerShell 复用时不得强杀
+    $script:procs = @([pscustomobject]@{ Id = 4101; Name = 'powershell'; Session = 1; CommandLine = 'powershell -File C:\work\build.ps1' })
+    Assert 'PID 复用的非保镖进程不被识别为保镖' (-not (Test-BodyguardProcess 4101))
+    $script:procs = @([pscustomobject]@{ Id = 4101; Name = 'powershell'; Session = 1; CommandLine = 'powershell -WindowStyle Hidden -File "C:\Users\u\.claude-switcher\claude-bodyguard.ps1"' })
+    Assert '命令行指向保镖脚本时识别为保镖' (Test-BodyguardProcess 4101)
+    $script:procs = @()
+    Remove-Item -LiteralPath $hbPath -Force -ErrorAction SilentlyContinue
 
     # 4b. 按快照逐块恢复各网卡 IPv6 + 无 home-tz.txt 时明确告警且不乱改时区
     $script:MockBindings = @(

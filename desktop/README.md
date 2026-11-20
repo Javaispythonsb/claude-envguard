@@ -5,10 +5,11 @@
 - **PC 桌面端（Tauri 原生可执行文件）**：14 项启动前审计门禁（6 项硬性防漏红线必须全部为 `ok`，含无警告要求）+ **受检安全启动 Claude / CLI** + 一键修复 + **运行期进程级急停保镖**（10s 巡检，无 72h/电池限制；存在巡检周期窗口，非防火墙级阻断）+ **系统托盘常驻与单实例防多开** + 实用工具 + 收工护盾还原。
   - 关闭窗口自动隐藏驻留至系统托盘（不停止后台保镖），左键托盘或再次启动可执行文件会唤醒已有窗口；右键托盘菜单可直接启动 Claude / CLI、重新检查、触发退出护盾或退出控制台。
   - **时区与区域格式交由开关控制**：在「护盾与设置」中开启时严格核验并随「一键修复」自动同步（收工点「退出护盾」按快照还原）；关闭时如实显示 `[SKIP]`，且「一键修复 / 重锁地区」保留本机系统时钟与日常日期数字格式不作修改。
-  - 「退出护盾」需 5 秒内二次确认：先关闭 Claude 桌面版与所有 Claude Code CLI（含 npm/bun 版），任一未退出则不撤防。
+  - 「退出护盾」需 5 秒内二次确认：先关闭 Claude 桌面版与所有 Claude Code CLI（含 npm/bun 版），任一未退出则不撤防；网络与时区恢复全部成功后才停止保镖，UAC 取消或恢复失败时防护保持不变。
+  - 「恢复推荐默认」与未生成 `checks.json` 时的后端默认完全一致：14 项全部启用、非关键失败不降级、日志开启；任何 `[SKIP]` 都只来自用户显式关闭。
 - **浏览器侧自检页（静态 Web / PWA）**：评估当前设备浏览器的 **5 项防漏信号**（出口 IP 归属、浏览器时区与 UTC 偏移、WebRTC 候选含 IPv6、IPv6 双栈暴露、经 ipleak.net 查验实际 DNS 解析器归属）与 **1 项硬件渲染摘要**（WebGL/Canvas，仅作参考不计入泄漏计数）；不替代桌面端 14 项进程与系统级审计。
 - **待机形态只有贴边光条**：胶囊拖到屏幕上、左、右边缘会吸附，鼠标离开约 1.2 秒后收成 9px 光条，鼠标移到光条上即展开；不贴边时停在原处并半透明。拖动由 Rust 侧移动窗口本身，系统关闭「拖动时显示窗口内容」时也不会出现黑色线框。旧版本保存的「陶瓷盾球」设置会自动按光条处理。
-- **GitHub 一键热更新**：推送至 `main` 分支后，GitHub Actions 自动跑通三端测试并发布带 `SHA256SUMS-release.txt` 与 `BUILD_INFO.json` 的 `latest` Release；桌面端在「工具 → 检查更新」中可直接拉取最新构建、核验 SHA-256、保留本机配置后原地热替换可执行文件与脚本并自动重启，更新过程显示分阶段进度条。检查结果只显示版本号与中文更新说明，不显示提交哈希、提交标题或仓库地址。
+- **GitHub 一键热更新**：推送至 `main` 分支后，GitHub Actions 自动跑通三端测试并发布带 `SHA256SUMS-release.txt` 与 `BUILD_INFO.json` 的 `latest` Release；桌面端在「工具 → 检查更新」中可直接拉取最新构建、核验 SHA-256、保留本机配置后原地热替换可执行文件与脚本并自动重启，更新过程显示分阶段进度条。写入任何脚本前会先探测安装目录可写性（安装在 `Program Files` 等受保护目录时直接提示改用安装包升级，不半途改动），并记录 `last-update-backup.json` 回滚清单；若随后替换可执行文件或启动重启助手失败，宿主会按清单把脚本与版本文件一并回滚。已是最新时如实提示「无需更新」，不会显示假的 100% 与重启。检查结果只显示版本号与中文更新说明，不显示提交哈希、提交标题或仓库地址。
 
 ### 发版约定
 
@@ -28,7 +29,7 @@ desktop\src-tauri\target\release\bundle\nsis\Claude 环境卫士_2.1.1_x64-setup
 desktop\src-tauri\target\release\bundle\msi\Claude 环境卫士_2.1.1_x64_zh-CN.msi      # MSI 安装包
 ```
 
-> 安全说明：发布版只执行随包的 `resources\claude-switch.ps1`（打包时直接取自仓库 `windows\`，不再另存副本）。它只读继承本机已有 `%USERPROFILE%\.claude-switcher\claude-switch.ps1` 的 5 项锁定配置，新增的客户端/地区设置写入 `envguard-config.json`，检查策略写入 `checks.json`，不会覆盖旧版脚本或触碰账号目录。只有调试构建（`pnpm tauri dev`）才会改用工作区 `windows\claude-switch.ps1` 或环境变量 `ENVGUARD_CORE_SCRIPT` 指定的脚本。
+> 安全说明：发布版只执行随包的 `resources\claude-switch.ps1`（打包时直接取自仓库 `windows\`，不再另存副本）。它只读继承本机已有 `%USERPROFILE%\.claude-switcher\claude-switch.ps1` 的 5 项锁定配置，新增的客户端/地区设置写入 `envguard-config.json`，检查策略写入 `checks.json`，不会覆盖旧版脚本或触碰账号目录。只有调试构建（`pnpm tauri dev`）才会改用工作区 `windows\claude-switch.ps1` 或环境变量 `ENVGUARD_CORE_SCRIPT` 指定的脚本。发布版派生核心脚本与热更新重启助手时会剥离 `ENVGUARD_CORE_SCRIPT`、`ENVGUARD_GITHUB_REPO`、`ENVGUARD_STATE_DIR`、`CLAUDE_SWITCHER_CHROME`、`CLAUDE_SWITCHER_SKIP_NET_CHECK` 等测试钩子，宿主自身也不再读取 `ENVGUARD_STATE_DIR`。
 
 ---
 

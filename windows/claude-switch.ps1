@@ -497,7 +497,7 @@ function Invoke-ProbeText {
     }
     $body = ''
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        $body = (& curl.exe -s --max-time $TimeoutSec $Url 2>$null) -join "`n"
+        $body = (& curl.exe -s --noproxy '*' --max-time $TimeoutSec $Url 2>$null) -join "`n"
         if ((& $Valid $body)) { return $body }
         if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
     }
@@ -517,7 +517,7 @@ function Invoke-ProbeCode {
     }
     $code = '000'
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        $code = ((& curl.exe -s --max-time $TimeoutSec -o NUL -w '%{http_code}' $Url 2>$null) -join '').Trim()
+        $code = ((& curl.exe -s --noproxy '*' --max-time $TimeoutSec -o NUL -w '%{http_code}' $Url 2>$null) -join '').Trim()
         if ($code -and $code -ne '000') { return $code }
         if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds (400 * $attempt) }
     }
@@ -989,8 +989,16 @@ function Invoke-SetRegion {
     if ($tzFromDefault) { "INFO:时区使用国家默认(可手动改)" }
 }
 
-# 从 STUN Binding 响应中取 (XOR-)MAPPED-ADDRESS 的 IPv4
-function ConvertFrom-StunResponse([byte[]]$Response) {
+# 从 STUN Binding 响应中取 (XOR-)MAPPED-ADDRESS 的 IPv4;校验报文类型、Magic Cookie 与 Transaction ID
+function ConvertFrom-StunResponse([byte[]]$Response, [byte[]]$ExpectedTxn = $null) {
+    if ($null -eq $Response -or $Response.Length -lt 20) { return $null }
+    if ($Response[0] -ne 0x01 -or $Response[1] -ne 0x01) { return $null }
+    if ($Response[4] -ne 0x21 -or $Response[5] -ne 0x12 -or $Response[6] -ne 0xA4 -or $Response[7] -ne 0x42) { return $null }
+    if ($null -ne $ExpectedTxn -and $ExpectedTxn.Length -eq 12) {
+        for ($i = 0; $i -lt 12; $i++) {
+            if ($Response[8 + $i] -ne $ExpectedTxn[$i]) { return $null }
+        }
+    }
     $pos = 20
     while ($pos + 4 -le $Response.Length) {
         $atype = ([int]$Response[$pos] -shl 8) -bor $Response[$pos + 1]
@@ -1008,23 +1016,51 @@ function ConvertFrom-StunResponse([byte[]]$Response) {
     return $null
 }
 
-# STUN 探针(纯 .NET UDP,手工构造 RFC5389 报文):所有服务器同时发出、共用一个超时窗口,按服务器顺序去重返回
+# STUN 探针(纯 .NET UDP,手工构造 RFC5389 报文):并行解析域名、所有服务器同时发出、共用一个超时窗口,按服务器顺序去重返回
 function Get-StunPublicIPs([object[]]$Servers, [int]$TimeoutMs = 2000) {
     $probes = @()
-    foreach ($s in $Servers) {
-        $addr = $null
-        try { $addr = [System.Net.Dns]::GetHostAddresses([string]$s[0]) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1 } catch {}
-        if (-not $addr) { continue }
-        $udp = New-Object System.Net.Sockets.UdpClient
-        try {
-            $txn = New-Object byte[] 12; (New-Object Random).NextBytes($txn)
-            $req = [byte[]](0x00, 0x01, 0x00, 0x00) + [byte[]](0x21, 0x12, 0xA4, 0x42) + $txn
-            $udp.Connect($addr, [int]$s[1])
-            [void]$udp.Send($req, $req.Length)
-            $probes += @{ Udp = $udp; Receive = $udp.ReceiveAsync() }
-        } catch { $udp.Close() }
-    }
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try {
+        $resolved = New-Object System.Collections.Generic.List[object]
+        $dnsJobs = @()
+        foreach ($s in $Servers) {
+            $hostName = [string]$s[0]
+            $port = [int]$s[1]
+            $literalIp = $null
+            if ([System.Net.IPAddress]::TryParse($hostName, [ref]$literalIp) -and $literalIp.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                $resolved.Add(@{ Addr = $literalIp; Port = $port })
+            } else {
+                try {
+                    $dnsTask = [System.Net.Dns]::GetHostAddressesAsync($hostName)
+                    $dnsJobs += @{ Task = $dnsTask; Port = $port; Done = $false }
+                } catch {}
+            }
+        }
+        if ($dnsJobs.Count -gt 0) {
+            $dnsDeadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Min(1000, [Math]::Max(200, [int]($TimeoutMs / 2))))
+            while ($true) {
+                $pendingDns = @($dnsJobs | Where-Object { -not $_.Task.IsCompleted } | ForEach-Object { $_.Task })
+                $dnsLeft = [int]($dnsDeadline - [DateTime]::UtcNow).TotalMilliseconds
+                if ($pendingDns.Count -eq 0 -or $dnsLeft -le 0) { break }
+                try { [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$pendingDns, $dnsLeft) } catch { break }
+            }
+            foreach ($j in $dnsJobs) {
+                if ($j.Task.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { continue }
+                $addr = $j.Task.Result | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } | Select-Object -First 1
+                if ($addr) { $resolved.Add(@{ Addr = $addr; Port = $j.Port }) }
+            }
+        }
+        foreach ($item in $resolved) {
+            $udp = New-Object System.Net.Sockets.UdpClient
+            try {
+                $txn = New-Object byte[] 12
+                $rng.GetBytes($txn)
+                $req = [byte[]](0x00, 0x01, 0x00, 0x00) + [byte[]](0x21, 0x12, 0xA4, 0x42) + $txn
+                $udp.Connect($item.Addr, $item.Port)
+                [void]$udp.Send($req, $req.Length)
+                $probes += @{ Udp = $udp; Receive = $udp.ReceiveAsync(); Txn = $txn }
+            } catch { $udp.Close() }
+        }
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
         while ($true) {
             $pending = @($probes | Where-Object { -not $_.Receive.IsCompleted } | ForEach-Object { $_.Receive })
@@ -1035,35 +1071,76 @@ function Get-StunPublicIPs([object[]]$Servers, [int]$TimeoutMs = 2000) {
         $found = @()
         foreach ($p in $probes) {
             if ($p.Receive.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { continue }
-            $ip = ConvertFrom-StunResponse $p.Receive.Result.Buffer
+            $ip = ConvertFrom-StunResponse $p.Receive.Result.Buffer $p.Txn
             if ($ip -and ($found -notcontains $ip)) { $found += $ip }
         }
         return $found
     } finally {
+        if ($rng) { $rng.Dispose() }
         foreach ($p in $probes) { $p.Udp.Close() }
     }
 }
 
 function Test-WebRTC($exitIp) {
+    if (-not (Test-ProxyPathAlive)) {
+        return @{ code = 'fail'; detail = '代理路径失效,已跳过 STUN 探测(避免真实 IP 出网)' }
+    }
     $servers = @(@("stun.miwifi.com", 3478), @("stun.chat.bilibili.com", 3478), @("stun.l.google.com", 19302), @("stun.cloudflare.com", 3478))
     $found = @(Get-StunPublicIPs $servers)
     # STUN 无响应不等于没有泄漏:可能只是节点不支持 UDP,或规则拦了探测目标却漏了别的 UDP 出口
     if ($found.Count -eq 0) { return @{ code = 'warn'; detail = 'STUN 无响应,未确认 UDP 出口(不等于零暴露)' } }
-    $leak = $found | Where-Object { $_ -ne $exitIp }
-    if ($leak) { return @{ code = 'fail'; detail = "暴露非代理IP: $($leak -join ',')" } }
-    return @{ code = 'ok'; detail = '仅暴露代理IP' }
+    $others = @($found | Where-Object { $_ -ne $exitIp })
+    if ($others.Count -eq 0) { return @{ code = 'ok'; detail = '仅暴露代理IP' } }
+    $masked = (@($others | ForEach-Object { Format-MaskedIp $_ })) -join ','
+    $countries = @()
+    $allResolved = $true
+    foreach ($ip in @($others | Select-Object -First 3)) {
+        if (-not (Test-ProxyPathAlive)) {
+            return @{ code = 'fail'; detail = "代理路径失效,暴露非代理IP: $masked" }
+        }
+        $cc = ''
+        try {
+            $raw = Invoke-ProbeText -Url "https://ipinfo.io/$([Uri]::EscapeDataString([string]$ip))/json" -Attempts 1 -TimeoutSec 4
+            if ($raw) {
+                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($obj -and $obj.country) {
+                    $c = ([string]$obj.country).Trim().ToUpperInvariant()
+                    if ($c -match '^[A-Z]{2}$') { $cc = $c }
+                }
+            }
+        } catch {}
+        if (-not $cc) { $allResolved = $false } else { $countries += $cc }
+    }
+    if ($countries -contains 'CN') {
+        return @{ code = 'fail'; detail = "暴露国内 UDP 出口: $masked" }
+    }
+    if ($allResolved -and $countries.Count -gt 0 -and $others.Count -le 3) {
+        $ccStr = (@($countries | Select-Object -Unique)) -join '/'
+        return @{ code = 'warn'; detail = "UDP 出口与 HTTP 出口不同($ccStr · $masked)" }
+    }
+    return @{ code = 'fail'; detail = "暴露非代理IP(归属未知): $masked" }
 }
 
 function Find-ClashVerge {
-    # 优先取正在运行进程的真实路径(最可靠),再回退到常见安装目录
+    # 优先取正在运行进程的真实路径(最可靠),再查常见安装目录与递归搜索(同时兼容 clash-verge.exe 与 Clash Verge*.exe)
     $running = Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue |
         Where-Object { $_.Path } | Select-Object -First 1
     if ($running) { return $running.Path }
+    $directCandidates = @(
+        "$env:LOCALAPPDATA\Programs\Clash Verge\clash-verge.exe",
+        "$env:ProgramFiles\Clash Verge\clash-verge.exe",
+        "$([Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))\Clash Verge\clash-verge.exe",
+        "$env:LOCALAPPDATA\Programs\Clash Verge\Clash Verge.exe",
+        "$env:ProgramFiles\Clash Verge\Clash Verge.exe"
+    )
+    foreach ($cand in $directCandidates) {
+        if ($cand -and (Test-Path -LiteralPath $cand -PathType Leaf)) { return $cand }
+    }
     $roots = @("$env:LOCALAPPDATA\Programs", $env:ProgramFiles,
                [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))
     foreach ($root in $roots) {
-        if (-not $root) { continue }
-        $hit = Get-ChildItem $root -Recurse -Filter "Clash Verge*.exe" -ErrorAction SilentlyContinue |
+        if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+        $hit = Get-ChildItem $root -Recurse -File -Include 'clash-verge.exe','Clash Verge*.exe' -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
@@ -1422,17 +1499,99 @@ function Get-ClashRules {
     return @{ available = $true; rules = @($probe.data.rules); reason = '' }
 }
 
-# 内核前 16 条必须包含 13 个域名 + 3 个端口;兼容 DOMAIN-SUFFIX/DomainSuffix 与 AND(...DST-PORT...) 形式
+function Test-SafeProxyGroupName([string]$Name) {
+    return (-not [string]::IsNullOrWhiteSpace($Name)) -and ($Name -notmatch '["`$,\r\n\x00-\x1f]')
+}
+
+# 自动探测非 GLOBAL/DIRECT 的 Clash 代理组:优先查内核 /proxies,再回退 clash-verge.yaml/config.yaml 的 proxy-groups
+function Resolve-ClashProxyGroup([switch]$Persist) {
+    $resolved = ''
+    $apiRes = Invoke-ClashApi '/proxies' 4
+    if ($apiRes.ok -and $apiRes.data -and $apiRes.data.proxies) {
+        $proxies = $apiRes.data.proxies
+        $curProp = $proxies.PSObject.Properties[$PROXY_GROUP]
+        if ($PROXY_GROUP -and $PROXY_GROUP -ne 'GLOBAL' -and (Test-SafeProxyGroupName $PROXY_GROUP) -and $curProp -and $curProp.Value) {
+            if ($curProp.Value.type -ne 'Selector' -or [string]$curProp.Value.now -notmatch '^(?i)(DIRECT|REJECT|REJECT-DROP)$') {
+                return $PROXY_GROUP
+            }
+        }
+        $selectors = @($proxies.PSObject.Properties | Where-Object {
+            $_.Name -ne 'GLOBAL' -and (Test-SafeProxyGroupName $_.Name) -and $_.Value -and ([string]$_.Value.type -eq 'Selector')
+        })
+        $activeSel = $selectors | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_.Value.now) -and
+            ([string]$_.Value.now -notmatch '^(?i)(DIRECT|REJECT|REJECT-DROP)$')
+        } | Select-Object -First 1
+        if ($activeSel) {
+            $resolved = [string]$activeSel.Name
+        } elseif ($selectors.Count -gt 0) {
+            $resolved = [string]$selectors[0].Name
+        } else {
+            $globalProp = $proxies.PSObject.Properties['GLOBAL']
+            if ($globalProp -and $globalProp.Value -and ([string]$globalProp.Value.now -notmatch '^(?i)(DIRECT|REJECT|REJECT-DROP)$')) {
+                $resolved = 'GLOBAL'
+            }
+        }
+    }
+    if (-not $resolved) {
+        foreach ($cfgName in @('clash-verge.yaml', 'config.yaml')) {
+            $cfgPath = Join-Path $CLASH_DIR $cfgName
+            if (-not (Test-Path -LiteralPath $cfgPath -PathType Leaf)) { continue }
+            $inGroups = $false; $curName = $null; $curType = $null
+            foreach ($line in Get-Content -LiteralPath $cfgPath -Encoding UTF8 -ErrorAction SilentlyContinue) {
+                if ($line -match '^proxy-groups:\s*(#.*)?$') { $inGroups = $true; $curName = $null; $curType = $null; continue }
+                if ($inGroups -and $line -match '^[a-zA-Z]') { break }
+                if (-not $inGroups) { continue }
+                if ($line -match '^\s*-\s+') { $curName = $null; $curType = $null }
+                if ($line -match 'name:\s*(.+)$') {
+                    $curName = ($Matches[1] -replace '\s+#.*$', '').Trim('"', "'", ' ')
+                }
+                if ($line -match 'type:\s*([^\s#]+)') {
+                    $curType = $Matches[1].Trim('"', "'", ' ')
+                }
+                if ($curType -eq 'select' -and $curName -and $curName -ne 'GLOBAL' -and (Test-SafeProxyGroupName $curName)) {
+                    $resolved = $curName
+                    break
+                }
+            }
+            if ($resolved) { break }
+        }
+    }
+    if ($resolved -and (Test-SafeProxyGroupName $resolved) -and $resolved -ne $script:PROXY_GROUP) {
+        $script:PROXY_GROUP = $resolved
+        if ($Persist) {
+            try {
+                $selfPath = $PSCommandPath
+                if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+                if ($selfPath -and (Test-SelfInBase $selfPath) -and (Test-Path -LiteralPath $selfPath -PathType Leaf)) {
+                    $oldText = [System.IO.File]::ReadAllText($selfPath)
+                    $newText = Set-ScriptConfigValue $oldText 'PROXY_GROUP' $resolved
+                    if ($newText -ne $oldText) {
+                        [System.IO.File]::WriteAllText($selfPath, $newText, (New-Object System.Text.UTF8Encoding($true)))
+                    }
+                } else {
+                    Save-RuntimeConfig @{ proxy_group = $resolved }
+                }
+            } catch {}
+        }
+    }
+    return $script:PROXY_GROUP
+}
+
+# 内核前 16 条必须包含 13 个域名 + 3 个端口;兼容 DOMAIN-SUFFIX/DomainSuffix 与 AND(...DST-PORT...) 形式;拒绝指向 DIRECT
 function Test-PinnedRules($rules) {
     $head = @($rules | Select-Object -First 16)
     if ($head.Count -lt 16) { return $false }
     $domainHits = @($head | Where-Object {
         (([string]$_.type).ToLowerInvariant() -replace '[-_]', '') -eq 'domainsuffix' -and
-        ($CLAUDE_DOMAINS -contains [string]$_.payload)
+        ($CLAUDE_DOMAINS -contains [string]$_.payload) -and
+        ([string]$_.proxy -notmatch '^(?i)(DIRECT|REJECT|REJECT-DROP)$')
     } | ForEach-Object { ([string]$_.payload).ToLowerInvariant() } | Sort-Object -Unique).Count
     $portHits = @($head | ForEach-Object {
         $type = ([string]$_.type).ToLowerInvariant() -replace '[-_]', ''
         $payload = [string]$_.payload
+        $proxy = [string]$_.proxy
+        if ($proxy -match '^(?i)DIRECT$') { return }
         if ($type -eq 'dstport' -and ($CLAUDE_PORTS -contains $payload)) { $payload }
         elseif ($payload -match ('DST-PORT,(' + ($CLAUDE_PORTS -join '|') + ')(?:[,)]|$)')) {
             foreach ($p in $CLAUDE_PORTS) {
@@ -1443,39 +1602,66 @@ function Test-PinnedRules($rules) {
     return ($domainHits -eq $CLAUDE_DOMAINS.Count -and $portHits -eq $CLAUDE_PORTS.Count)
 }
 
-# 规则模式只写 profiles\Script.js 托管块,不再碰 Merge.yaml
-function Write-ClashScriptRules {
+# 只写 profiles\Script.js 托管块,不再碰 Merge.yaml
+function Write-ClashScriptRules([string]$ProxyGroup = $PROXY_GROUP) {
     $result = @{ ok = $false; changed = $false; existed = $false; backup = ''; message = '' }
     $scriptPath = Join-Path $CLASH_DIR 'profiles\Script.js'
     $backup = ''
     $existed = Test-Path -LiteralPath $scriptPath
     $result.existed = $existed
     try {
-        if ([string]::IsNullOrWhiteSpace($PROXY_GROUP) -or $PROXY_GROUP -match '[,\r\n]') {
-            $result.message = '代理组名为空或包含逗号/换行'
+        if (-not (Test-SafeProxyGroupName $ProxyGroup)) {
+            $result.message = '代理组名为空或包含不安全字符'
             return $result
         }
         $rules = @()
-        foreach ($d in $CLAUDE_DOMAINS) { $rules += "DOMAIN-SUFFIX,$d,$PROXY_GROUP" }
-        foreach ($p in $CLAUDE_PORTS) { $rules += "DST-PORT,$p,$PROXY_GROUP" }
+        foreach ($d in $CLAUDE_DOMAINS) { $rules += "DOMAIN-SUFFIX,$d,$ProxyGroup" }
+        foreach ($p in $CLAUDE_PORTS) { $rules += "DST-PORT,$p,$ProxyGroup" }
+        $dnsProxyRules = @(
+            "IP-CIDR,8.8.8.8/32,$ProxyGroup,no-resolve",
+            "IP-CIDR,1.1.1.1/32,$ProxyGroup,no-resolve",
+            "DOMAIN-SUFFIX,ipleak.net,$ProxyGroup"
+        )
         $json = ConvertTo-Json -InputObject @($rules) -Compress
-        $domainsJs = ($CLAUDE_DOMAINS | ForEach-Object { "'$_'" }) -join ','
+        $dnsJson = ConvertTo-Json -InputObject @($dnsProxyRules) -Compress
+        $allFilterDomains = @($CLAUDE_DOMAINS) + @('ipleak.net', 'stun.miwifi.com', 'stun.chat.bilibili.com', 'stun.l.google.com', 'stun.cloudflare.com')
+        $domainsJs = ($allFilterDomains | ForEach-Object { "'$_'" }) -join ','
         $managed = "// >>> claude-switcher managed rules >>>`r`n" +
             "  const pinnedRules = $json;`r`n" +
-            "  config.rules = pinnedRules.concat((config.rules||[]).filter(r=>!pinnedRules.includes(r)));`r`n" +
+            "  const dnsProxyRules = $dnsJson;`r`n" +
+            "  const managedRules = pinnedRules.concat(dnsProxyRules);`r`n" +
+            "  config.rules = managedRules.concat((Array.isArray(config.rules)?config.rules:[]).filter(function(r){ return !managedRules.includes(r); }));`r`n" +
             "  config.ipv6 = false;`r`n" +
             "  if (!config.dns || typeof config.dns !== 'object') { config.dns = {}; }`r`n" +
             "  config.dns.enable = true;`r`n" +
             "  config.dns.ipv6 = false;`r`n" +
             "  config.dns['enhanced-mode'] = 'fake-ip';`r`n" +
             "  config.dns['fake-ip-range'] = '198.18.0.1/16';`r`n" +
+            "  config.dns['respect-rules'] = true;`r`n" +
+            "  if (!Array.isArray(config.dns['proxy-server-nameserver']) || config.dns['proxy-server-nameserver'].length === 0) {`r`n" +
+            "    config.dns['proxy-server-nameserver'] = (Array.isArray(config.dns['default-nameserver']) && config.dns['default-nameserver'].length > 0) ? config.dns['default-nameserver'].slice() : ['223.5.5.5','119.29.29.29'];`r`n" +
+            "  }`r`n" +
             "  config.dns.nameserver = ['tls://8.8.8.8','tls://1.1.1.1'];`r`n" +
+            "  config.dns.fallback = [];`r`n" +
             "  var _cd = [$domainsJs];`r`n" +
-            "  config.dns['fake-ip-filter'] = (config.dns['fake-ip-filter']||[]).filter(function(f){`r`n" +
-            "    var s = f.replace(/^[+*]\./,'');`r`n" +
-            "    return !_cd.some(function(d){ return s === d || s.endsWith('.'+d); });`r`n" +
-            "  });`r`n" +
-            "  if (config.tun && typeof config.tun === 'object') { config.tun['strict-route'] = true; }`r`n" +
+            "  if (config.dns['nameserver-policy'] && typeof config.dns['nameserver-policy'] === 'object' && !Array.isArray(config.dns['nameserver-policy'])) {`r`n" +
+            "    var _pol = config.dns['nameserver-policy'];`r`n" +
+            "    Object.keys(_pol).forEach(function(k){`r`n" +
+            "      var kl = String(k).trim().toLowerCase();`r`n" +
+            "      var ks = kl.replace(/^[+*]+\./,'');`r`n" +
+            "      if (kl === '*' || kl === '+' || kl === '+.*' || kl === '*.*' || kl.indexOf('claude') !== -1 || kl.indexOf('anthropic') !== -1 || kl.indexOf('ipleak') !== -1 || _cd.some(function(d){ return ks === d || ks.endsWith('.'+d) || (ks.indexOf('.') !== -1 && d.endsWith('.'+ks)); })) {`r`n" +
+            "        delete _pol[k];`r`n" +
+            "      }`r`n" +
+            "    });`r`n" +
+            "  }`r`n" +
+            "  if (config.dns['fake-ip-filter-mode'] !== 'whitelist' && Array.isArray(config.dns['fake-ip-filter'])) {`r`n" +
+            "    config.dns['fake-ip-filter'] = config.dns['fake-ip-filter'].filter(function(f){`r`n" +
+            "      if (typeof f !== 'string') return true;`r`n" +
+            "      var s = f.trim().replace(/^[+*]+\./,'').toLowerCase();`r`n" +
+            "      return !_cd.some(function(d){ return s === d || s.endsWith('.'+d) || (s.indexOf('.') !== -1 && d.endsWith('.'+s)); });`r`n" +
+            "    });`r`n" +
+            "  }`r`n" +
+            "  if (config.tun && typeof config.tun === 'object') { config.tun['strict-route'] = true; config.tun['dns-hijack'] = ['any:53','tcp://any:53']; }`r`n" +
             "// <<< claude-switcher managed rules <<<"
 
         if (-not $existed) {
@@ -1721,8 +1907,8 @@ function Get-RulesStatus {
             if ($defRoute.Count -gt 0) { return '规则置顶=ok:WireGuard 全局路由已接管' }
             return '规则置顶=warn:WireGuard 未检测到全局默认路由(0.0.0.0/0),无法核验分流'
         }
-        $d1 = (Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
-        $d2 = (Resolve-DnsName api.anthropic.com -Type A -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress
+        $d1 = (@(Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue) | Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
+        $d2 = (@(Resolve-DnsName api.anthropic.com -Type A -ErrorAction SilentlyContinue) | Where-Object { $_.IPAddress } | Select-Object -First 1).IPAddress
         if ($d1 -match '^198\.1[89]\.' -and $d2 -match '^198\.1[89]\.') {
             return '规则置顶=ok:Fake-IP 已接管 Claude 域名(非 Mihomo 客户端,STUN 规则请自行确认)'
         }
@@ -1734,7 +1920,16 @@ function Get-RulesStatus {
     if ($mode -eq 'unknown') { return '规则置顶=warn:无法确认 Clash 模式,未检查规则' }
     $rulesInfo = Get-ClashRules
     if ($rulesInfo.available) {
-        if (Test-PinnedRules $rulesInfo.rules) { return '规则置顶=ok' }
+        if (Test-PinnedRules $rulesInfo.rules) {
+            $head = @($rulesInfo.rules | Select-Object -First 16)
+            if (@($head | Where-Object { [string]$_.proxy -eq 'GLOBAL' }).Count -gt 0) {
+                $g = Invoke-ClashApi '/proxies/GLOBAL' 3
+                if ($g.ok -and [string]$g.data.now -match '^(?i)(DIRECT|REJECT)') {
+                    return '规则置顶=fail:置顶规则指向 GLOBAL 但 GLOBAL 当前为 DIRECT(点一键修复改用代理组)'
+                }
+            }
+            return '规则置顶=ok'
+        }
         return '规则置顶=fail:内核未加载置顶规则'
     }
     if (Test-ClashScriptManaged) { return "规则置顶=warn:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))" }
@@ -1775,7 +1970,7 @@ function Test-DnsResolverVerdict([string]$LocalIp, [bool]$IsFakeIp, [object[]]$R
 }
 
 function Test-DnsCheck {
-    $rec = Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue | Select-Object -First 1
+    $rec = @(Resolve-DnsName claude.ai -Type A -ErrorAction SilentlyContinue) | Where-Object { $_.IPAddress } | Select-Object -First 1
     $dns = if ($rec -and $rec.IPAddress) { ([string]$rec.IPAddress).Trim() } else { '' }
     if (-not $dns) { return @{ state = 'fail'; detail = '域名解析失败(claude.ai)' } }
     if ($dns -match '^(0\.|127\.)') { return @{ state = 'fail'; detail = "异常解析地址($dns)" } }
@@ -1791,7 +1986,11 @@ function Test-DnsCheck {
     $detectReachable = $false
     $resolvers = @()
     try {
-        $detectRaw = Invoke-ProbeText -Url "https://$token.ipleak.net/dnsdetection/" -Attempts 2 -TimeoutSec 6
+        $detectUrl = "https://$token.ipleak.net/dnsdetection/"
+        $detectRaw = Invoke-ProbeText -Url $detectUrl -Attempts 2 -TimeoutSec 6
+        if ([string]::IsNullOrWhiteSpace($detectRaw) -and (Test-ProxyPathAlive)) {
+            $detectRaw = Invoke-ProbeText -Url $detectUrl -Attempts 1 -TimeoutSec 6
+        }
         $detectObj = $detectRaw | ConvertFrom-Json -ErrorAction Stop
         if ($null -ne $detectObj -and $null -ne $detectObj.ip -and $detectObj.ip -is [pscustomobject]) {
             $detectReachable = $true
@@ -1806,7 +2005,11 @@ function Test-DnsCheck {
             }
         }
     } catch {}
-    return (Test-DnsResolverVerdict $dns $isFakeIp $resolvers $detectReachable)
+    $verdict = Test-DnsResolverVerdict $dns $isFakeIp $resolvers $detectReachable
+    if ($verdict.state -eq 'ok' -and -not (Test-SmhnrDisabled)) {
+        return @{ state = 'warn'; detail = "$($verdict.detail) · Windows 多宿主 DNS 旁路(SMHNR)尚未关闭,建议一键修复" }
+    }
+    return $verdict
 }
 
 function Add-IpHistory([string]$Ip) {
@@ -2002,9 +2205,15 @@ function Invoke-Check {
 
 function Invoke-Fix {
     "FIX:开始一键修复"
+    $fixFailures = @()
+    $isClashVerge = ($PROXY_MODE -eq 'clash-verge') -or (
+        $PROXY_MODE -eq 'auto' -and
+        -not (Test-FlClashClientSelected) -and
+        ((Test-Path -LiteralPath $CLASH_DIR) -or [bool](Get-Process -Name 'verge-mihomo','clash-verge','Clash Verge' -ErrorAction SilentlyContinue))
+    )
 
     # A. 拉起代理客户端并等待内核+TUN(仅 Clash Verge 可自动拉起)
-    if ($PROXY_MODE -eq 'clash-verge') {
+    if ($isClashVerge) {
         if (-not (Test-ProxyAlive)) {
             "FIX:正在启动 Clash Verge..."
             $cv = Find-ClashVerge
@@ -2012,42 +2221,81 @@ function Invoke-Fix {
         }
         $ok = $false
         for ($i = 0; $i -lt 40; $i++) { if ((Test-ProxyAlive) -and (Test-TunUp)) { $ok = $true; break }; Start-Sleep 1 }
-        if ($ok) { "FIX:代理内核+TUN ✓" } else { "FIX:代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路及 TUN 开关)" }
+        if ($ok) {
+            "FIX:代理内核+TUN ✓"
+        } else {
+            "FIX:代理内核/TUN ✗(请打开 Clash Verge 检查节点/线路及 TUN 开关)"
+            $fixFailures += '代理内核或TUN未就绪'
+        }
     } else {
         $pname = Get-ProxyName
         if ((Test-ProxyAlive) -and (Test-TunUp)) { "FIX:代理客户端($pname)+TUN ✓" }
-        elseif (-not (Test-ProxyAlive)) { "FIX:代理客户端($pname)未运行,请手动启动并开启 TUN 模式" }
-        else { "FIX:TUN 未在线($pname),请检查客户端 TUN 开关" }
+        elseif (-not (Test-ProxyAlive)) {
+            "FIX:代理客户端($pname)未运行,请手动启动并开启 TUN 模式"
+            $fixFailures += "代理客户端($pname)未运行"
+        } else {
+            "FIX:TUN 未在线($pname),请检查客户端 TUN 开关"
+            $fixFailures += "TUN未在线($pname)"
+        }
     }
 
-    # A2. 置顶规则(优先于管理员 UAC 步骤:Clash Verge 重启会重建 TUN 网卡并默认开启其 ms_tcpip6,放在前面可一次 UAC 一并关闭)
-    if ($PROXY_MODE -ne 'clash-verge') {
+    # A2. 置顶规则与 DNS/IPv6/WebRTC 防漏脚本(优先于管理员 UAC 步骤:Clash Verge 重启会重建 TUN 网卡并默认开启其 ms_tcpip6,放在前面可一次 UAC 一并关闭)
+    if (-not $isClashVerge) {
         "FIX:请在 $(Get-ProxyName) 中自行添加 Claude 域名置顶/直连规则"
     } else {
+        $resolvedGroup = Resolve-ClashProxyGroup -Persist
+        "FIX:使用 Clash 代理组=$resolvedGroup"
         $clashMode = Get-ClashMode
         if ($clashMode -eq 'unknown') {
             "FIX:无法确认 Clash 模式，已跳过规则修改"
-        } elseif ($clashMode -eq 'global' -or $clashMode -eq 'direct') {
-            $modeLabel = if ($clashMode -eq 'global') { '全局模式' } else { '直连模式' }
-            "FIX:Clash 模式=$clashMode"
+            $fixFailures += '无法确认Clash模式'
+        } elseif ($clashMode -eq 'direct') {
+            "FIX:Clash 模式=direct"
             $legacy = Remove-LegacyMergeRules
             if ($legacy.message -and -not $legacy.changed) {
                 "FIX:Merge.yaml 清理提示: $($legacy.message)"
             }
             if ($legacy.changed) {
                 "FIX:发现历史遗留 Merge 规则,已清理并备份: $($legacy.backup)"
+                if (Restart-ClashVerge) { "FIX:已重启 Clash Verge 以重新加载配置" }
+                else { "FIX:未找到 Clash Verge 可执行文件,请手动重启以完成清理" }
+            }
+            "FIX:直连模式(direct)不走代理,请先在 Clash Verge 切回 rule 或 global 模式"
+            $fixFailures += 'Clash处于direct直连模式'
+        } elseif ($clashMode -eq 'global') {
+            "FIX:Clash 模式=global"
+            $legacy = Remove-LegacyMergeRules
+            if ($legacy.message -and -not $legacy.changed) {
+                "FIX:Merge.yaml 清理提示: $($legacy.message)"
+            }
+            if ($legacy.changed) {
+                "FIX:发现历史遗留 Merge 规则,已清理并备份: $($legacy.backup)"
+            }
+            $write = Write-ClashScriptRules $resolvedGroup
+            if (-not $write.ok) {
+                "FIX:防漏脚本写入 FAIL: $($write.message)"
+                $fixFailures += "Script.js写入失败($($write.message))"
+            }
+            if ($legacy.changed -or $write.changed) {
+                if ($write.changed) {
+                    $bakNote = if ($write.backup) { "并备份: $($write.backup)" } else { '' }
+                    "FIX:已写入 Script.js 防漏配置(DNS/IPv6/TUN)$bakNote"
+                }
                 if (Restart-ClashVerge) {
                     "FIX:已重启 Clash Verge 以重新加载配置"
-                    if ($clashMode -eq 'global') {
-                        $tunOk = Wait-Tun 40
-                        if ((Test-ProxyAlive) -and $tunOk) { "FIX:代理/TUN 已恢复 ✓" } else { "FIX:代理/TUN 未完全恢复,请手动检查 Clash 和 TUN 开关" }
+                    $tunOk = Wait-Tun 40
+                    if ((Test-ProxyAlive) -and $tunOk) {
+                        "FIX:全局模式防漏配置已应用,代理/TUN 已恢复 ✓"
+                    } else {
+                        "FIX:代理/TUN 未完全恢复,请手动检查 Clash 和 TUN 开关"
+                        $fixFailures += 'Clash重启后TUN未恢复'
                     }
                 } else {
-                    "FIX:未找到 Clash Verge 可执行文件,请手动重启以完成清理"
+                    "FIX:未找到 Clash Verge 可执行文件,请手动重启以应用防漏配置"
+                    $fixFailures += '未找到Clash Verge可执行文件'
                 }
-                "FIX:$modeLabel,规则不适用,未写入任何规则,已清理历史遗留配置 ✓"
             } else {
-                "FIX:$modeLabel,规则不适用,未改动任何配置 ✓"
+                "FIX:全局模式防漏脚本已是最新 ✓"
             }
         } else {
             "FIX:Clash 模式=rule"
@@ -2059,9 +2307,10 @@ function Invoke-Fix {
                 "FIX:已清理历史遗留 Merge 规则并备份: $($legacy.backup)"
             }
 
-            $write = Write-ClashScriptRules
+            $write = Write-ClashScriptRules $resolvedGroup
             if (-not $write.ok) {
                 "FIX:置顶规则 FAIL: $($write.message)"
+                $fixFailures += "置顶规则写入失败($($write.message))"
                 if ($legacy.changed) {
                     if (Restart-ClashVerge) {
                         Wait-Tun 20 | Out-Null
@@ -2072,29 +2321,53 @@ function Invoke-Fix {
                 }
             } else {
                 $current = Get-ClashRules
-                $alreadyOk = $current.available -and (Test-PinnedRules $current.rules)
+                $alreadyOk = $false
+                if ($current.available -and (Test-PinnedRules $current.rules)) {
+                    $alreadyOk = $true
+                    $headCur = @($current.rules | Select-Object -First 16)
+                    if (@($headCur | Where-Object { [string]$_.proxy -eq 'GLOBAL' }).Count -gt 0) {
+                        $g = Invoke-ClashApi '/proxies/GLOBAL' 3
+                        if ($g.ok -and [string]$g.data.now -match '^(?i)(DIRECT|REJECT)') { $alreadyOk = $false }
+                    }
+                }
                 if (-not $write.changed -and -not $legacy.changed -and $alreadyOk) {
-                    "FIX:置顶规则已是当前版本,内核已加载 ✓"
+                    "FIX:置顶规则与 DNS 防漏配置已是当前版本,内核已加载 ✓"
                 } else {
                     if ($write.changed) {
-                        "FIX:已写入 Script.js 规则并备份: $($write.backup)"
+                        $bakNote = if ($write.backup) { "并备份: $($write.backup)" } else { '' }
+                        "FIX:已写入 Script.js 规则$bakNote"
                     }
                     if (Restart-ClashVerge) {
                         $rulesInfo = Wait-ClashRules 40
                         if (-not $rulesInfo.available) {
-                            "FIX:规则已写入但无法验证内核加载($(Get-ClashApiHint $rulesInfo.reason))"
+                            $apiHint = Get-ClashApiHint $rulesInfo.reason
+                            "FIX:规则已写入但无法验证内核加载($apiHint)"
+                            $fixFailures += "无法验证规则加载($apiHint)"
                         } elseif (Test-PinnedRules $rulesInfo.rules) {
-                            "FIX:置顶规则 ✓"
-                            Wait-Tun 20 | Out-Null
+                            $headNew = @($rulesInfo.rules | Select-Object -First 16)
+                            $globalDirect = $false
+                            if (@($headNew | Where-Object { [string]$_.proxy -eq 'GLOBAL' }).Count -gt 0) {
+                                $g2 = Invoke-ClashApi '/proxies/GLOBAL' 3
+                                if ($g2.ok -and [string]$g2.data.now -match '^(?i)(DIRECT|REJECT)') { $globalDirect = $true }
+                            }
+                            if ($globalDirect) {
+                                "FIX:置顶规则指向 GLOBAL 且当前为 DIRECT,请在 Clash Verge 切换代理组后重试"
+                                $fixFailures += '置顶规则指向GLOBAL(DIRECT)'
+                            } else {
+                                "FIX:置顶规则与 DNS 防漏配置 ✓"
+                                Wait-Tun 20 | Out-Null
+                            }
                         } else {
                             "FIX:置顶规则验证失败,正在回滚 Script.js..."
                             Restore-ClashScriptChange $write
                             Restart-ClashVerge | Out-Null
                             Wait-Tun 20 | Out-Null
                             "FIX:置顶规则 FAIL: 验证失败,已回滚 Script.js,请确认 Clash Verge 已启用全局扩展脚本"
+                            $fixFailures += 'Clash未启用全局扩展脚本,置顶规则未生效'
                         }
                     } else {
                         "FIX:规则已写入但未找到 Clash Verge 可执行文件,请手动重启后验证"
+                        $fixFailures += '未找到Clash Verge可执行文件'
                     }
                 }
             }
@@ -2112,6 +2385,7 @@ function Invoke-Fix {
             "FIX:区域格式已同步为 $LOCALE_TARGET ✓"
         } catch {
             "FIX:区域格式未同步,请手动在系统「区域格式」中修改"
+            $fixFailures += '区域格式同步失败'
         }
     }
     $adminScript = @()
@@ -2154,9 +2428,18 @@ function Invoke-Fix {
         "FIX:修复时区/IPv6/DNS防漏/保镖(需要管理员授权)..."
         $tmp = "$env:TEMP\claude-fix-$([guid]::NewGuid().Guid).ps1"
         [System.IO.File]::WriteAllText($tmp, ($adminScript -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
-        try { Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`"" } catch { "FIX:管理员授权被取消" }
+        $adminOk = $false
+        try {
+            $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
+            if ($proc -and $proc.ExitCode -eq 0) { $adminOk = $true }
+        } catch {}
         Remove-Item $tmp -ErrorAction SilentlyContinue
-        "FIX:时区/IPv6/DNS防漏/保镖 ✓"
+        if ($adminOk) {
+            "FIX:时区/IPv6/DNS防漏/保镖 ✓"
+        } else {
+            "FIX:管理员授权被取消或执行失败"
+            $fixFailures += '管理员授权未完成'
+        }
     } else {
         try { Clear-DnsClientCache -ErrorAction SilentlyContinue } catch {}
         "FIX:时区/IPv6/DNS防漏/保镖 无需修复 ✓"
@@ -2165,10 +2448,21 @@ function Invoke-Fix {
     # C. 出口IP最终验证
     Start-Sleep 2
     $e = Get-Egress
-    if ($e.skipped) { "FIX:出口IP ✗ 代理路径失效,已跳过探测 — 请先恢复代理/TUN 再复验" }
-    elseif ($e.loc -eq $COUNTRY_TARGET) { "FIX:出口IP ✓ ($($e.ip))" }
-    else { "FIX:出口IP ✗ ($($e.ip)/$($e.loc),期望$COUNTRY_TARGET) — 请换节点/线路" }
-    "FIX:修复流程结束"
+    if ($e.skipped) {
+        "FIX:出口IP ✗ 代理路径失效,已跳过探测 — 请先恢复代理/TUN 再复验"
+        $fixFailures += '代理路径失效'
+    } elseif ($e.loc -eq $COUNTRY_TARGET) {
+        "FIX:出口IP ✓ ($($e.ip))"
+    } else {
+        "FIX:出口IP ✗ ($($e.ip)/$($e.loc),期望$COUNTRY_TARGET) — 请换节点/线路"
+        $fixFailures += '出口国家不匹配'
+    }
+    if ($fixFailures.Count -gt 0) {
+        $script:exitCode = 1
+        "FAIL:修复未完全生效($($fixFailures -join '；'))"
+    } else {
+        'FIX:修复流程结束'
+    }
 }
 
 function Format-AccountSize([double]$Bytes) {
@@ -2766,9 +3060,9 @@ function Open-SafeUrl([string]$Url) {
         'FAIL:只允许有效的 http/https 链接'
         return
     }
-    if ($env:CLAUDE_SWITCHER_SKIP_NET_CHECK -ne '1' -and -not (Test-TunUp) -and -not (Test-ProxyAlive)) {
+    if ($env:CLAUDE_SWITCHER_SKIP_NET_CHECK -ne '1' -and -not (Test-ProxyPathAlive)) {
         $script:exitCode = 1
-        'FAIL:代理未就绪(TUN 未接管且客户端未运行),拒绝打开以免直连'
+        'FAIL:代理路径未就绪(内核或 TUN 离线),拒绝打开以免直连'
         return
     }
     $browser = [string]$env:CLAUDE_SWITCHER_CHROME
@@ -3482,7 +3776,7 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
         Remove-Item -LiteralPath $writeProbe -Force -ErrorAction SilentlyContinue
     } catch {
         $script:exitCode = 1
-        "FAIL:当前应用目录无写入权限($appDirFull)，请下载安装包覆盖升级或移至用户目录运行"
+        "FAIL:当前安装目录($appDirFull)需要管理员权限（如 MSI 安装在 Program Files），无法原地热更新；请前往 GitHub Release 下载最新安装包覆盖升级，或使用免安装 zip/NSIS 用户版"
         return
     }
 
@@ -3592,6 +3886,16 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
             }
         }
 
+        $manifestPath = Join-Path $BASE 'last-update-backup.json'
+        $backupManifest = [ordered]@{
+            backup_dir     = $backupDir
+            base_dir       = $BASE
+            app_res_dir    = $appResDir
+            backed_base    = $backedBase
+            backed_app_res = $backedAppRes
+        }
+        [System.IO.File]::WriteAllText($manifestPath, ($backupManifest | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+
         if ($task) { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue }
 
         # 1) 暂存新版可执行文件 claude-envguard.exe.new 供 Rust 宿主原子替换(从临时解压目录移动,少写一遍)
@@ -3640,9 +3944,12 @@ function Invoke-StageAppUpdate([string]$TargetAppDir) {
                 $bak = Join-Path $backupDir "res-$fn"
                 if ($backedAppRes[$fn] -and (Test-Path -LiteralPath $bak)) {
                     Copy-Item -LiteralPath $bak -Destination $dst -Force -ErrorAction SilentlyContinue
+                } elseif ($backedAppRes.ContainsKey($fn) -and -not $backedAppRes[$fn]) {
+                    Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
                 }
             }
         }
+        Remove-Item -LiteralPath (Join-Path $BASE 'last-update-backup.json') -Force -ErrorAction SilentlyContinue
         if ($task) {
             try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
         }
@@ -3817,6 +4124,7 @@ function Invoke-RulesStatus {
     }
     $api = Get-ClashApi
     "mode=$(Get-ClashMode)"
+    "proxy_group=$PROXY_GROUP"
     if ($api) {
         $auth = if ($api.headers.Count -gt 0) { 'configured' } else { 'none' }
         "api=source=$($api.source) endpoint=$($api.base) auth=$auth"
@@ -3825,7 +4133,11 @@ function Invoke-RulesStatus {
         else { 'api=未配置(检查 Clash Verge 的 external-controller)' }
     }
     $cfg = Invoke-ClashApi '/configs' 5
-    if ($cfg.ok) { "configs=ok mode=$(([string]$cfg.data.mode).ToLowerInvariant())" } else { "configs=fail:$($cfg.reason)" }
+    if ($cfg.ok) {
+        $tunObj = $cfg.data.tun
+        $tunInfo = if ($tunObj) { " tun_enable=$($tunObj.enable) tun_strict=$($tunObj.'strict-route')" } else { '' }
+        "configs=ok mode=$(([string]$cfg.data.mode).ToLowerInvariant()) ipv6=$($cfg.data.ipv6)$tunInfo"
+    } else { "configs=fail:$($cfg.reason)" }
     $info = Get-ClashRules
     if ($info.available) {
         $pinned = if (Test-PinnedRules $info.rules) { 'yes' } else { 'no' }
@@ -3930,6 +4242,21 @@ function Stop-ClaudeCliHosts {
     return $false
 }
 
+# 心跳文件里的 PID 可能已被系统复用:只有进程名是 PowerShell 且命令行确实指向保镖脚本时才允许强杀。
+# 命令行读不到(权限/WMI 不可用)时宁可不杀,计划任务已停止,残留进程下次登录前会自行退出巡检。
+function Test-BodyguardProcess([int]$ProcessId) {
+    if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return $false }
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ProcessName -notmatch '^(powershell|pwsh)$') { return $false }
+    $cmdLine = ''
+    try {
+        $cim = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop) |
+            Where-Object { [int]$_.ProcessId -eq $ProcessId } | Select-Object -First 1
+        if ($cim) { $cmdLine = [string]$cim.CommandLine }
+    } catch { return $false }
+    return ($cmdLine -match 'claude-bodyguard\.ps1')
+}
+
 function Invoke-ShieldRestore {
     # 撤防前必须先确保受保护进程已完全退出,绝不在运行中撤防
     if (-not (Stop-ClaudeApp)) {
@@ -3957,17 +4284,9 @@ function Invoke-ShieldRestore {
             }
         } catch {}
     }
-    try { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
-    $hbFile = Join-Path $BASE 'bodyguard-heartbeat.txt'
-    if (Test-Path -LiteralPath $hbFile) {
-        try {
-            $raw = ([System.IO.File]::ReadAllText($hbFile, [System.Text.Encoding]::ASCII)).Trim()
-            if ($raw -match '^(\d+)\s+') { Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue }
-        } catch {}
-        Remove-Item -LiteralPath $hbFile -Force -ErrorAction SilentlyContinue
-    }
+    # 保镖要等所有恢复步骤成功后才停止(见脚本末尾),UAC 取消或中途失败时防护保持不变
     $adminLines = @(
-        "Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue"
+        "`$ErrorActionPreference = 'Continue'"
     )
     $ipv6Summary = ''
     if ($null -ne $savedAdapters) {
@@ -4028,6 +4347,8 @@ function Invoke-ShieldRestore {
         }
     }
     $adminLines += "Clear-DnsClientCache"
+    $adminLines += "Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue"
+    $adminLines += "exit 0"
     $tmp = "$env:TEMP\claude-restore-$([guid]::NewGuid().Guid).ps1"
     try {
         [System.IO.File]::WriteAllText($tmp, ($adminLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
@@ -4043,6 +4364,20 @@ function Invoke-ShieldRestore {
         return
     } finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    try { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
+    $hbFile = Join-Path $BASE 'bodyguard-heartbeat.txt'
+    if (Test-Path -LiteralPath $hbFile -PathType Leaf) {
+        try {
+            $raw = ([System.IO.File]::ReadAllText($hbFile, [System.Text.Encoding]::ASCII)).Trim()
+            if ($raw -match '^(\d+)\s+') {
+                $hbPid = [int]$Matches[1]
+                if (Test-BodyguardProcess $hbPid) {
+                    Stop-Process -Id $hbPid -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+        Remove-Item -LiteralPath $hbFile -Force -ErrorAction SilentlyContinue
     }
     if ($null -ne $savedAdapters) {
         Remove-Item -LiteralPath $ipv6StateFile -Force -ErrorAction SilentlyContinue
